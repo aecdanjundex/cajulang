@@ -1,0 +1,10 @@
+import "std/os"
+import "std/strconv"
+
+fn fib(n: int) -> int {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+n, _ := strconv.atoi(os.args()[1])
+print(fib(n))
