@@ -1,0 +1,3 @@
+fn cmp(a, b) { return a < b }
+print(cmp(1, 2), cmp("a", "b"))
+print(cmp(1, "b"))

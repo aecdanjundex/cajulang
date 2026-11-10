@@ -1,0 +1,4 @@
+interface I { m() -> int }
+let i: I = nil
+print(i == nil)
+print(i.m())

@@ -1,0 +1,3 @@
+struct P { x: int }
+let p: *P
+print(p.x)

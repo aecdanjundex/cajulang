@@ -1,0 +1,25 @@
+fn seguro(f: fn()) -> (err: error) {
+  defer fn() {
+    if r := recover(); r != nil {
+      err = errors.New("recuperado: " + str(r))
+    }
+  }()
+  f()
+  return nil
+}
+print(seguro(fn() { panic("ai") }))
+print(seguro(fn() { let a = []int{1, 2}; print(a[5]) }))
+print(seguro(fn() { x := 0; print(10 / x) }))
+print(seguro(fn() { let mm: map[str]int = nil; mm["a"] = 1 }))
+print(seguro(fn() { print("nada de errado") }))
+fn ordem() {
+  for i := 0; i < 3; i++ { defer print("defer", i) }
+  print("corpo")
+}
+ordem()
+fn dupla() -> (int, str) {
+  defer fn() { recover() }()
+  panic(42)
+}
+a, b := dupla()
+print(a, b == "")

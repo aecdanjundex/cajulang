@@ -1,0 +1,82 @@
+fn nivel(n: int) {
+  defer print("saindo do nível", n)
+  if n == 0 { panic("fundo") }
+  nivel(n - 1)
+}
+fn protege(nome: str, f: fn()) {
+  defer fn() {
+    r := recover()
+    print(nome, "recuperou:", r)
+  }()
+  f()
+  print(nome, "terminou normal")
+}
+protege("a", fn() { nivel(3) })
+protege("b", fn() { print("nada") })
+fn ajuda() -> any { return recover() }
+fn indireto() -> (r: str) {
+  defer fn() {
+    x := ajuda()
+    print("ajuda viu:", x)
+    y := recover()
+    r = "pegou " + str(y)
+  }()
+  panic("x")
+}
+print(indireto())
+fn duplo() -> (s: str) {
+  defer fn() { s = s + " | segundo: " + str(recover()) }()
+  defer fn() { panic("de novo") }()
+  panic("primeiro")
+}
+print(duplo())
+fn conta() -> (n: int) {
+  defer fn() { n *= 10 }()
+  defer fn() { n += 1 }()
+  n = 4
+  return n + 1
+}
+print(conta())
+struct Er { cod: int }
+fn falha() -> (e: any) {
+  defer fn() { e = recover() }()
+  panic(Er{7})
+}
+print(falha())
+fn fundo(n: int) -> int { return fundo(n + 1) + 1 }
+fn recursao() -> (msg: str) {
+  defer fn() { msg = str(recover()) }()
+  fundo(0)
+  return "não chega"
+}
+print(recursao())
+struct Cnt { v: int }
+fn (c: Cnt) mostra(tag: str) { print(tag, c.v) }
+fn metodo() {
+  c := Cnt{1}
+  defer c.mostra("adiado")
+  c.v = 99
+  print("agora", c.v)
+}
+metodo()
+fn laco() {
+  for i := 0; i < 3; i++ { defer fn() { print("closure", i) }() }
+}
+laco()
+print(recover())
+fn erros() {
+  defer fn() {
+    if r := recover(); r != nil {
+      if e, ok := r.(error); ok { print("erro:", e.Error()) }
+    }
+  }()
+  let m: map[str]int = nil
+  m["x"] = 1
+}
+erros()
+fn sem_recover() -> int {
+  defer print("defer roda antes do fim")
+  let p: *Cnt = nil
+  return p.v
+}
+print(sem_recover())

@@ -1,0 +1,58 @@
+interface Forma { area() -> num }
+interface Nomeado { nome() -> str }
+interface FormaNomeada { Forma; Nomeado }
+struct Quadrado { lado: num }
+struct Circulo { r: num }
+fn (q: Quadrado) area() -> num { return q.lado * q.lado }
+fn (q: Quadrado) nome() -> str { return "quadrado" }
+fn (c: *Circulo) area() -> num { return 3 * c.r * c.r }
+fn (c: *Circulo) nome() -> str { return "círculo" }
+fn descreve(f: FormaNomeada) { print(f.nome(), f.area()) }
+descreve(Quadrado{2})
+descreve(&Circulo{1})
+fn tipo(x: any) -> str {
+  switch v := x.(type) {
+  case int: return "int " + str(v + 1)
+  case num: return "num " + str(v)
+  case str: return "str " + v
+  case int8: return "int8"
+  case Quadrado: return "quadrado de lado " + str(v.lado)
+  case *Circulo: return "ponteiro para círculo " + str(v.r)
+  case []int: return "slice de " + str(len(v))
+  case nil: return "nil"
+  case error: return "erro: " + v.Error()
+  default: return "outro"
+  }
+}
+print(tipo(3))
+print(tipo(2.5))
+print(tipo(4.0))
+print(tipo("oi"))
+print(tipo(int8(5)))
+print(tipo(Quadrado{3}))
+print(tipo(&Circulo{7}))
+print(tipo([]int{1, 2}))
+print(tipo(nil))
+print(tipo(errors.New("falhou")))
+print(tipo(true))
+let f: Forma = Quadrado{4}
+q, ok := f.(Quadrado)
+print(q, ok)
+c, ok2 := f.(*Circulo)
+print(c, ok2)
+n := f.(Nomeado)
+print(n.nome())
+struct Motor { potencia: int }
+fn (m: Motor) liga() -> str { return "vrum " + str(m.potencia) }
+fn (m: *Motor) turbina() { m.potencia *= 2 }
+struct Carro { Motor; modelo: str }
+car := Carro{Motor{100}, "fusca"}
+print(car.potencia, car.liga())
+car.turbina()
+print(car.potencia, car.Motor.potencia)
+interface Ligavel { liga() -> str }
+let l: Ligavel = car
+print(l.liga())
+g := car.liga
+car.potencia = 1
+print(g())

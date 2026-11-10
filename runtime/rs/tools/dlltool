@@ -1,0 +1,5 @@
+#!/bin/sh
+# dlltool do zig (llvm-dlltool), para as funções do Windows que o std do Rust importa por raw-dylib
+log=${TMPDIR:-/tmp}/caju-dlltool.log
+echo "$@" >> $log
+exec python3 -m ziglang dlltool "$@"

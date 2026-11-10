@@ -1,0 +1,70 @@
+# Runtime nativo, fase 5: defer, panic e recover.
+#
+# Uma função com defer guarda no seu quadro um registro de 6 palavras:
+# [0] registro anterior, [8] lista de defers, [16] RBP da função, [24] endereço de "recuperado",
+# [32] profundidade de chamadas, [40] livre. rt_dtop aponta para o registro mais recente.
+# Cada defer é um nó [próximo, closure, n, argumentos...] (a closure é chamada com os argumentos
+# já avaliados, por __calldefer).
+#
+# Um panic (ou um erro ao rodar) roda os defers dos registros, do mais novo para o mais antigo.
+# Se um deles chama recover(), o programa salta para o "recuperado" daquela função, que devolve
+# os resultados (zeros, ou os com nome) depois de rodar os defers que sobraram.
+
+let rt_depth: int = 0          # chamadas de função abertas (para "Recursão demais")
+let rt_dtop: int = 0
+let rt_pactive: bool = false
+let rt_precovered: bool = false
+let rt_pval: int = 0           # o valor do panic (um any)
+let rt_ponde: str = ""
+let rt_pmsg: str = ""
+let rt_pdepth: int = -1        # profundidade em que o recover vale (a da função adiada)
+
+# defers de uma função que está voltando normalmente
+fn rt_run_defers(rec: int) {
+  while __load64(rec + 8) != 0 {
+    nd := __load64(rec + 8)
+    __store64(rec + 8, __load64(nd))
+    __calldefer(nd)
+  }
+  rt_dtop = __load64(rec)
+}
+fn rt_panic(onde: str, v: int, msg: str) {
+  rt_pactive = true
+  rt_precovered = false
+  rt_pval = v
+  rt_ponde = onde
+  rt_pmsg = msg
+  while rt_dtop != 0 {
+    rec := rt_dtop
+    while __load64(rec + 8) != 0 {
+      nd := __load64(rec + 8)
+      __store64(rec + 8, __load64(nd))
+      rt_depth = __load64(rec + 32)
+      rt_pdepth = rt_depth
+      __calldefer(nd)
+      if rt_precovered {
+        rt_pactive = false
+        rt_precovered = false
+        rt_pdepth = -1
+        __jump(__load64(rec + 16), __load64(rec + 24))
+      }
+    }
+    rt_dtop = __load64(rec)
+  }
+  rt_fatal(rt_ponde, rt_pmsg)
+}
+# erro ao rodar: vira um panic cujo valor é um erro com a mensagem
+fn rt_fail(onde: str, msg: str) {
+  rt_panic(onde, rt_box(__strp(msg), rt_d_err), msg)
+}
+fn rt_panic_val(onde: str, v: int) {
+  rt_panic(onde, v, "panic: " + rt_val_str(v, rt_d_any))
+}
+fn rt_recover() -> int {
+  if rt_pactive and not rt_precovered and rt_depth == rt_pdepth {
+    rt_precovered = true
+    return rt_pval
+  }
+  return 0
+}
+fn rt_defer_nil(onde: str) { rt_fail(onde, "defer e go precisam de uma função") }

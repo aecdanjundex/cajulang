@@ -1,0 +1,30 @@
+# o coletor roda várias vezes enquanto estes valores continuam em uso
+struct Arv { v: int, esq: *Arv, dir: *Arv }
+fn monta(d: int, v: int) -> *Arv {
+  if d == 0 { return nil }
+  lixo := []int{1, 2, 3, 4, 5, 6, 7, 8}
+  a := &Arv{v: v + lixo[0] - 1}
+  a.esq = monta(d - 1, 2 * v)
+  a.dir = monta(d - 1, 2 * v + 1)
+  return a
+}
+fn soma(a: *Arv) -> int {
+  if a == nil { return 0 }
+  return a.v + soma(a.esq) + soma(a.dir)
+}
+fixa := monta(12, 1)
+nomes := map[str]any{}
+fs := []fn() -> str{}
+total := 0
+for r := 0; r < 40; r++ {
+  t := monta(10, r)
+  total += soma(t)
+  k := "chave" + str(r)
+  nomes[k] = []any{r, k, 2.5 * num(r)}
+  fs = append(fs, fn() -> str { return k + "!" })
+  if r % 7 == 0 { delete(nomes, "chave" + str(r - 7)) }
+}
+print(total, soma(fixa), len(nomes), nomes["chave39"], fs[0](), fs[39]())
+txt := ""
+for i := 0; i < 3000; i++ { txt = txt + str(i % 10) }
+print(len(txt), txt[2990:])

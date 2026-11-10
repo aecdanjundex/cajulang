@@ -1,0 +1,4 @@
+c := make(chan int)
+go fn() { c <- 1 }()
+print(<-c)
+print(<-c)

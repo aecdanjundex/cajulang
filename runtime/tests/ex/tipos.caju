@@ -1,0 +1,30 @@
+# Uma interface aceita qualquer tipo que tenha os métodos dela.
+interface Forma { area() -> num; nome() -> str }
+struct Retangulo { l: num, a: num }
+struct Circulo { r: num }
+fn (r: Retangulo) area() -> num { return r.l * r.a }
+fn (r: Retangulo) nome() -> str { return "retângulo" }
+fn (c: *Circulo) area() -> num { return 3.14159 * c.r * c.r }
+fn (c: *Circulo) nome() -> str { return "círculo" }
+
+formas := []Forma{Retangulo{2, 3}, &Circulo{1}}
+for _, f := range formas { print(f.nome(), f.area()) }
+
+# x.(T) pega o tipo guardado; com ", ok" não dá panic
+if c, ok := formas[1].(*Circulo); ok { print("raio", c.r) }
+_, ok := formas[0].(*Circulo)
+print("o primeiro é círculo?", ok)
+
+# switch de tipos
+fn descreve(x: any) -> str {
+  switch v := x.(type) {
+  case int: return "inteiro " + str(v)
+  case num: return "número " + str(v)
+  case str: return "texto de " + str(len(v)) + " bytes"
+  case []int: return "slice com " + str(len(v)) + " itens"
+  case error: return "erro: " + v.Error()
+  case nil: return "nil"
+  default: return "outra coisa"
+  }
+}
+for _, x := range []any{7, 2.5, "olá", []int{1, 2}, errors.New("ops"), nil, true} { print(descreve(x)) }

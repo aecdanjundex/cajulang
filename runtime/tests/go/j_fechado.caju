@@ -1,0 +1,9 @@
+c := make(chan int, 2)
+c <- 1
+close(c)
+v, ok := <-c
+print(v, ok)
+v, ok = <-c
+print(v, ok)
+for x := range c { print("nunca", x) }
+c <- 5

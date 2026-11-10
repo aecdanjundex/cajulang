@@ -1,0 +1,37 @@
+# Slices são janelas sobre um vetor: fatiar não copia, e append
+# cria um vetor maior quando a capacidade acaba.
+notas := []int{7, 9, 4}
+notas = append(notas, 10, 6)
+print(notas, "tamanho", len(notas), "capacidade", cap(notas))
+
+meio := notas[1:3]
+meio[0] = 99                   # muda também notas[1]
+print(notas, meio)
+
+# range devolve a posição e o valor
+soma := 0
+for _, n := range notas { soma += n }
+print("média", soma / len(notas), "ou", float64(soma) / float64(len(notas)))
+
+# map: chave → valor
+estoque := map[str]int{"banana": 12, "caju": 30}
+estoque["manga"] = 5
+estoque["banana"] -= 2
+delete(estoque, "caju")
+if qtd, ok := estoque["caju"]; !ok { print("caju acabou:", qtd) }
+for fruta, qtd := range estoque { print(fruta, qtd) }
+print(estoque)
+
+# arrays têm tamanho fixo e são copiados ao atribuir
+a := [3]str{"x", "y", "z"}
+b := a
+b[0] = "mudou"
+print(a, b)
+
+# matriz: slice de slices
+tab := make([][]int, 3)
+for i := range tab {
+  tab[i] = make([]int, 3)
+  for j := range tab[i] { tab[i][j] = (i + 1) * (j + 1) }
+}
+print(tab)

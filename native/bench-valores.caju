@@ -1,0 +1,11 @@
+struct P { x: int, y: int }
+let s: []int = []int{}
+for i := 0; i < 1000000; i++ { s = append(s, i * 7 % 1000) }
+m := make(map[int]int)
+for _, v := range s { m[v] += 1 }
+ps := make([]P, 1000)
+total := 0
+for r := 0; r < 300; r++ {
+  for i := range ps { ps[i].x += i; total += ps[i].x % 7 }
+}
+print(len(m), m[7], total)

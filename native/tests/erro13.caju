@@ -1,0 +1,3 @@
+let f: fn(int) -> int = nil
+print(f == nil)
+print(f(1))

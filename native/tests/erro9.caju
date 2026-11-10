@@ -1,0 +1,4 @@
+n := -1
+s := make([]int, 2, n + 2)
+print(s)
+t := make([]int, 3, 1)
