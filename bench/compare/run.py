@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Caju x Go x Rust x Python: the same CPU-heavy programs, at several sizes.
 
-    python3 bench/compare/run.py [--runs=3] [challenge ...]
+    python3 bench/compare/run.py [--runs=3] [--langs=caju,go] [challenge ...]
+    (with --langs the results are only printed, not saved)
 
 Builds every program (caju build, go build, rustc -C opt-level=3; Python runs as is), runs each
 one at each size (best wall time of up to --runs runs; a run over 5 s is not repeated), checks
@@ -38,24 +39,31 @@ def version(cmd):
     return subprocess.run(cmd, capture_output=True, text=True).stdout.strip().splitlines()[0]
 
 
+CAJU = os.path.join(ROOT, "build", "caju")
+
+
 def build(name):
     os.makedirs(OUT, exist_ok=True)
     src = lambda ext: os.path.join(HERE, f"{name}.{ext}")
     exe = lambda lang: os.path.join(OUT, f"{name}-{lang}")
     cmds = {
-        "caju": [os.path.join(ROOT, "build", "caju"), "build", "-o", exe("caju"), src("caju")],
+        "caju": [CAJU, "build", "-o", exe("caju"), src("caju")],
         "go": [tool("go"), "build", "-o", exe("go"), src("go")],
         "rust": [tool("rustc"), "-C", "opt-level=3", "-o", exe("rust"), src("rs")],
     }
     info = {}
-    for lang, cmd in cmds.items():
+    for lang, cmd in list(cmds.items()):
+        if lang not in LANGS:
+            del cmds[lang]
+            continue
         t = time.perf_counter()
         r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "GO111MODULE": "off"})
         if r.returncode != 0:
             sys.exit(f"build {name} ({lang}) failed:\n{r.stdout}{r.stderr}")
         info[lang] = {"compile_s": time.perf_counter() - t, "size": os.path.getsize(exe(lang))}
     run = {lang: [exe(lang)] for lang in cmds}
-    run["python"] = [sys.executable, src("py")]
+    if "python" in LANGS:
+        run["python"] = [sys.executable, src("py")]
     return run, info
 
 
@@ -93,15 +101,28 @@ def fmt_n(n):
 
 
 def main():
+    global LANGS, CAJU
     runs = 3
     only = []
+    save = True
+    save_to = None
+    caju_bin = None
     for a in sys.argv[1:]:
+        if a.startswith("--save="):
+            save_to = a[7:]
+            continue
+        if a.startswith("--caju="):
+            CAJU = os.path.abspath(a[7:])
+            continue
         if a.startswith("--runs="):
             runs = int(a[7:])
+        elif a.startswith("--langs="):
+            LANGS = a[8:].split(",")
+            save = False
         else:
             only.append(a)
     results = {"date": time.strftime("%Y-%m-%d %H:%M"), "machine": platform.processor() or platform.machine(),
-               "versions": {"caju": version([os.path.join(ROOT, "build", "caju"), "version"]),
+               "versions": {"caju": version([CAJU, "version"]),
                             "go": version([tool("go"), "version"]), "rust": version([tool("rustc"), "--version"]),
                             "python": "Python " + platform.python_version()},
                "challenges": []}
@@ -123,7 +144,7 @@ def main():
                 t, mem, out = measure(run[lang], n, runs)
                 row[lang] = {"time": t, "mem_kb": mem}
                 outs[lang] = out
-            row["output"] = outs["rust"]
+            row["output"] = outs[LANGS[0]]
             row["agree"] = len(set(outs.values())) == 1
             if not row["agree"]:
                 print(f"  OUTPUTS DIFFER {name} n={n}: {outs}")
@@ -131,6 +152,11 @@ def main():
             print(f"{name:11} n={fmt_n(n):>5}  " + "  ".join(f"{l}={fmt_time(row[l]['time']):>9}" for l in LANGS)
                   + ("" if row["agree"] else "  (outputs differ!)"), flush=True)
         results["challenges"].append(ch)
+    if save_to:
+        with open(save_to, "w") as f:
+            json.dump(results, f, indent=1)
+    if not save:
+        return
     with open(os.path.join(HERE, "results.json"), "w") as f:
         json.dump(results, f, indent=1)
     write_markdown(results)

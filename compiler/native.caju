@@ -973,7 +973,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   A.bind(label)
   A.push(RBP)
   A.mov(RBP, RSP)
-  A.sub_imm(RSP, 0)
+  A.sub_imm32(RSP, 0)
   frame_at := A.pos() - 4
   # celled parameters (address taken with &): the cell replaces the value
   for _, v := range f.locals {
@@ -1035,7 +1035,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     # recovered from a panic: unnamed results return the zero value
     A.bind(f.landing)
     A.mov(RSP, RBP)
-    A.sub_imm(RSP, 0)
+    A.sub_imm32(RSP, 0)
     land_at = A.pos() - 4
     f.rec_addr(RCX)
     A.store_sym("r.g.rt_dtop", RCX)
@@ -1156,6 +1156,126 @@ fn (f: *Fn) expr_to(n: *ast.Node, t: str) {
   f.expr(n)
   f.g.coerce(n.ty, t, n)
 }
+# loads a simple expression (a number literal, a variable) into register r without touching
+# any other register; false (and no code) if n is not that simple
+fn (f: *Fn) simple_to(n: *ast.Node, r: int) -> bool {
+  A := f.a
+  if n.kind == "Number" {
+    if f.g.cls(n.ty, n) == "f" {
+      A.mov_imm(r, math.bits(n.num_value))
+    } else if n.raw != "" {
+      A.mov_imm(r, parse_raw(n.raw))
+    } else {
+      A.mov_imm(r, int(n.num_value))
+    }
+    return true
+  }
+  if n.kind == "Var" && !n.fn_ref {
+    v := f.lookup(n.name, n)
+    f.load_slot_r(v, r)
+    if v.celled { A.load(r, r, 0) }
+    return true
+  }
+  if n.kind == "Bool" {
+    if n.bool_value { A.mov_imm(r, 1) } else { A.mov_imm(r, 0) }
+    return true
+  }
+  return false
+}
+
+# the value of an integer literal that fits in a sign-extended 32-bit immediate
+fn (f: *Fn) imm32(n: *ast.Node) -> (int, bool) {
+  if n.kind != "Number" || f.g.cls(n.ty, n) == "f" { return 0, false }
+  v := 0
+  if n.raw != "" { v = parse_raw(n.raw) } else { v = int(n.num_value) }
+  if v >= -2147483648 && v <= 2147483647 { return v, true }
+  return 0, false
+}
+
+# RAX = left, RCX = right (left evaluated first)
+fn (f: *Fn) operands(left: *ast.Node, right: *ast.Node) {
+  f.expr(left)
+  if f.simple_to(right, RCX) { return }
+  f.a.push(RAX)
+  f.expr(right)
+  f.a.mov(RCX, RAX)
+  f.a.pop(RAX)
+}
+
+# true for a comparison of two integers (or pointers, booleans...) that compare() does with cmp
+fn (f: *Fn) int_compare(n: *ast.Node) -> bool {
+  if n.kind != "Binary" { return false }
+  op := n.op
+  if !(op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") { return false }
+  g := f.g
+  lt := n.left.ty
+  rtt := n.right.ty
+  if g.is_iface_t(lt) || g.is_iface_t(rtt) { return false }
+  lc := g.cls(lt, n)
+  rc := g.cls(rtt, n)
+  if lc == "s" || rc == "s" || lc == "f" || rc == "f" { return false }
+  if g.is_value_type(lt) || g.is_value_type(rtt) { return false }
+  return true
+}
+
+fn (f: *Fn) int_compare_cc(n: *ast.Node) -> int {
+  if is_unsigned(n.left.ty) || is_unsigned(n.right.ty) { return cc_unsigned(n.op) }
+  return cc_signed(n.op)
+}
+
+# jumps to dest when the condition (a bool) is false / true, without making a 0/1 value when
+# the condition is a comparison, !, && or ||
+fn (f: *Fn) jump_if(cond: *ast.Node, want: bool, dest: str) {
+  A := f.a
+  if cond.ty == "bool" {
+    if cond.kind == "Paren" && cond.expr.ty == "bool" {
+      f.jump_if(cond.expr, want, dest)
+      return
+    }
+    if cond.kind == "Not" && cond.arg.ty == "bool" {
+      f.jump_if(cond.arg, !want, dest)
+      return
+    }
+    if cond.kind == "Logical" && cond.left.ty == "bool" && cond.right.ty == "bool" {
+      # and: false if either is false; or: true if either is true
+      is_and := cond.op == "and"
+      if is_and != want {
+        f.jump_if(cond.left, want, dest)
+        f.jump_if(cond.right, want, dest)
+      } else {
+        skip := A.label()
+        f.jump_if(cond.left, !want, skip)
+        f.jump_if(cond.right, want, dest)
+        A.bind(skip)
+      }
+      return
+    }
+    if cond.kind == "Bool" {
+      if cond.bool_value == want { A.jmp(dest) }
+      return
+    }
+  }
+  if f.int_compare(cond) {
+    imm, is_imm := f.imm32(cond.right)
+    if is_imm {
+      f.expr(cond.left)
+      A.cmp_imm(RAX, imm)
+    } else {
+      f.operands(cond.left, cond.right)
+      A.alu("cmp", RAX, RCX)
+    }
+    cc := f.int_compare_cc(cond)
+    if !want { cc = cc ^ 1 }               # the opposite condition
+    A.jcc(cc, dest)
+    return
+  }
+  f.expr(cond)
+  c := f.g.cls(cond.ty, cond)
+  if f.g.is_iface_t(cond.ty) || c == "f" || c == "s" { f.truthy(cond.ty, cond) }
+  A.alu("test", RAX, RAX)
+  if want { A.jcc(CC_NE, dest) } else { A.jcc(CC_E, dest) }
+}
+
 fn fresh(n: *ast.Node) -> bool {
   if n.kind == "Paren" { return fresh(n.expr) }
   k := n.kind
@@ -1401,11 +1521,7 @@ fn (f: *Fn) compare(n: *ast.Node) {
     if op == "!=" { A.byte4(0x48, 0x83, 0xF0, 0x01) }
     return
   }
-  f.expr(n.left)
-  A.push(RAX)
-  f.expr(n.right)
-  A.mov(RCX, RAX)
-  A.pop(RAX)
+  f.operands(n.left, n.right)
   A.alu("cmp", RAX, RCX)
   if is_unsigned(lt) || is_unsigned(rtt) { A.setcc(cc_unsigned(op), RAX) } else { A.setcc(cc_signed(op), RAX) }
   A.movzxb(RAX, RAX)
@@ -1434,11 +1550,21 @@ fn (f: *Fn) binary(n: *ast.Node) {
     return
   }
   if n.ik != ast.NONE && op != "**" {
-    f.expr(n.left)
-    A.push(RAX)
-    f.expr(n.right)
-    A.mov(RCX, RAX)
-    A.pop(RAX)
+    imm, is_imm := f.imm32(n.right)
+    if is_imm && (op == "+" || op == "-" || op == "&" || op == "|" || op == "^") {
+      f.expr(n.left)
+      ext := 0
+      switch op {
+      case "-": ext = 5
+      case "&": ext = 4
+      case "|": ext = 1
+      case "^": ext = 6
+      }
+      A.alu_imm(ext, RAX, imm)
+      g.wrap_kind(n.ik)
+      return
+    }
+    f.operands(n.left, n.right)
     f.int_op(op, n.ik, n)
     return
   }
@@ -1492,14 +1618,21 @@ fn (f: *Fn) nil_check(n: *ast.Node, msg: str) {
 }
 # address of element obj[i] (slice, array or string) in RAX, bounds-checked
 fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
+  f.elem_check(n, write)
+  f.a.byte4(0x48, 0x8D, 0x04, 0xC8)               # lea rax, [rax + rcx*8]
+}
+# RAX = the elements (array object or the slice's data), RCX = the index, checked
+fn (f: *Fn) elem_check(n: *ast.Node, write: bool) {
   A := f.a
   ot := strip_ptr(types.dflt(n.obj.ty))
   k := f.g.kind_of_t(ot)
   f.expr(n.obj)
-  A.push(RAX)
-  f.expr_to(n.index, "int")
-  A.mov(RCX, RAX)
-  A.pop(RAX)
+  if n.index.ty != "int" || !f.simple_to(n.index, RCX) {
+    A.push(RAX)
+    f.expr_to(n.index, "int")
+    A.mov(RCX, RAX)
+    A.pop(RAX)
+  }
   ok := A.label()
   if k == "array" {
     A.mov_imm(RDX, types.tinfo(ot).n)
@@ -1530,7 +1663,6 @@ fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
     A.bind(ok)
     A.load(RAX, RAX, 0)
   }
-  A.byte4(0x48, 0x8D, 0x04, 0xC8)                 # lea rax, [rax + rcx*8]
 }
 fn (f: *Fn) str_index(n: *ast.Node) {
   A := f.a
@@ -1586,8 +1718,8 @@ fn (f: *Fn) index(n: *ast.Node) {
     A.bind(done)
     return                                        # rax = value, rcx = found
   }
-  f.elem_addr(n, false)
-  A.load(RAX, RAX, 0)
+  f.elem_check(n, false)
+  A.byte4(0x48, 0x8B, 0x04, 0xC8)                 # mov rax, [rax + rcx*8]
 }
 # address of a target (&x, &s.f, &a[i]) in RAX
 fn (f: *Fn) address(a: *ast.Node, n: *ast.Node) {
@@ -2654,6 +2786,7 @@ fn (f: *Fn) unpack_call(v: *ast.Node) -> []*Var {
 # a, b = b, a and v, ok := m[k]: evaluates everything before storing, as in Go
 fn (f: *Fn) multi(targets: []*ast.Node, values: []*ast.Node, decl: bool, n: *ast.Node) {
   A := f.a
+  if len(targets) == 1 && len(values) == 1 && f.single_assign(targets[0], values[0], decl, n) { return }
   prep := []*Target{}
   for _, t := range targets { prep = append(prep, f.prep_target(t)) }
   vals := []*Var{}
@@ -2694,6 +2827,34 @@ fn (f: *Fn) multi(targets: []*ast.Node, values: []*ast.Node, decl: bool, n: *ast
     f.load_slot(vals[i])
     f.store_target(p, decl, n)
   }
+}
+# x = v and a[i] = v without the temporaries of multi; false if this assignment needs them
+fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) -> bool {
+  A := f.a
+  g := f.g
+  if t.kind == "Var" {
+    if t.name == "_" { return false }
+    tt := f.lookup(t.name, n).t
+    if g.is_value_type(tt) { return false }
+    p := f.prep_target(t)
+    f.bind_value(v, tt)
+    f.store_target(p, decl, n)
+    return true
+  }
+  if t.kind == "Index" && g.kind_of_t(types.dflt(t.obj.ty)) != "map" && !g.is_value_type(t.ty) && !g.is_value_type(v.ty) {
+    # the index operands are evaluated before the value, as in multi
+    f.elem_addr(t, true)
+    if v.ty == t.ty && f.simple_to(v, RCX) {
+      A.store(RAX, 0, RCX)
+      return true
+    }
+    A.push(RAX)
+    f.bind_value(v, t.ty)
+    A.pop(RCX)
+    A.store(RCX, 0, RAX)
+    return true
+  }
+  return false
 }
 fn (f: *Fn) keep(parts: []*Var) -> []*Var {
   h := f.hidden()
@@ -2879,12 +3040,7 @@ fn (f: *Fn) find_loop(n: *ast.Node) -> *Loop {
 }
 fn (f: *Fn) push_loop(brk: str, cont: str, label: str) { f.loops = append(f.loops, &Loop{brk: brk, cont: cont, label: label}) }
 fn (f: *Fn) pop_loop() { f.loops = f.loops[:len(f.loops) - 1] }
-fn (f: *Fn) cond_jump_false(cond: *ast.Node, dest: str) {
-  f.expr(cond)
-  f.truthy(cond.ty, cond)
-  f.a.alu("test", RAX, RAX)
-  f.a.jcc(CC_E, dest)
-}
+fn (f: *Fn) cond_jump_false(cond: *ast.Node, dest: str) { f.jump_if(cond, false, dest) }
 fn (f: *Fn) stmt(n: *ast.Node) {
   A := f.a
   g := f.g

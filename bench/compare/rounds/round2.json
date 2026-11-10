@@ -1,0 +1,166 @@
+{
+ "note": "partial: only the largest sizes were recorded",
+ "challenges": [
+  {
+   "name": "fib",
+   "sizes": [
+    {
+     "n": 25,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 30,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 35,
+     "caju": {
+      "time": 0.094
+     }
+    }
+   ]
+  },
+  {
+   "name": "sieve",
+   "sizes": [
+    {
+     "n": 100000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 1000000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 10000000,
+     "caju": {
+      "time": 0.37
+     }
+    }
+   ]
+  },
+  {
+   "name": "nbody",
+   "sizes": [
+    {
+     "n": 10000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 100000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 1000000,
+     "caju": {
+      "time": 0.725
+     }
+    }
+   ]
+  },
+  {
+   "name": "mandelbrot",
+   "sizes": [
+    {
+     "n": 250,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 500,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 1000,
+     "caju": {
+      "time": 0.251
+     }
+    }
+   ]
+  },
+  {
+   "name": "matmul",
+   "sizes": [
+    {
+     "n": 100,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 200,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 300,
+     "caju": {
+      "time": 0.209
+     }
+    }
+   ]
+  },
+  {
+   "name": "sort",
+   "sizes": [
+    {
+     "n": 100000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 500000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 2000000,
+     "caju": {
+      "time": 0.484
+     }
+    }
+   ]
+  },
+  {
+   "name": "maps",
+   "sizes": [
+    {
+     "n": 100000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 1000000,
+     "caju": {
+      "time": null
+     }
+    },
+    {
+     "n": 3000000,
+     "caju": {
+      "time": 1.65
+     }
+    }
+   ]
+  }
+ ]
+}

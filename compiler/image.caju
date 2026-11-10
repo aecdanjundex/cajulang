@@ -2,6 +2,8 @@
 # writeELF and writePE of bootstrap/native.js.
 
 import "std/bytes"
+import "std/os"
+import "std/strconv"
 import "x64"
 
 # the 64-bit words of the data section that hold the absolute address of a symbol
@@ -26,7 +28,20 @@ fn resolve_fixups(a: *x64.X64, text_va: int, data_va: int, data: *bytes.Buffer, 
   for i := 0; i < len(relocs.off); i++ {
     data.set_u64(relocs.off[i], sym_addr(a, relocs.sym[i], text_va, data_va))
   }
+  dump_syms(a, text_va, data_va)
   return sym_addr(a, "start", text_va, data_va)
+}
+
+# with CAJU_SYMS=file, writes "address symbol" for every code symbol (for objdump / gdb)
+fn dump_syms(a: *x64.X64, text_va: int, data_va: int) {
+  file := os.getenv("CAJU_SYMS")
+  if file == "" { return }
+  out := bytes.new_buffer(1 << 16)
+  for name, s := range a.syms {
+    if (s & 1) != x64.SEC_TEXT { continue }
+    out.write("0x" + strconv.format_int(text_va + (s >> 1), 16) + " " + name + "\n")
+  }
+  os.write_file(file, out.string(), 0o644)
 }
 
 fn align_up(n: int, a: int) -> int { return (n + a - 1) / a * a }

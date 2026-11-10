@@ -91,11 +91,17 @@ export fn (a: *X64) rrx(op: int, reg: int, rm: int, w: int, pre: int) {
 }
 export fn (a: *X64) rr(op: int, reg: int, rm: int) { a.rrx(op, reg, rm, 1, 0) }
 export fn (a: *X64) rr32(op: int, reg: int, rm: int) { a.rrx(op, reg, rm, 0, 0) }
-# register with [base + disp32]
+# register with [base + disp] (disp8 when it fits, else disp32)
 export fn (a: *X64) rmx(op: int, reg: int, base: int, disp: int, w: int, pre: int) {
   a.pre(pre)
   a.rex(w, reg, base, false)
   a.op(op)
+  if disp >= -128 && disp <= 127 {
+    a.b.byte(0x40 | ((reg & 7) << 3) | (base & 7))
+    if (base & 7) == 4 { a.b.byte(0x24) }
+    a.b.byte(disp & 255)
+    return
+  }
   a.b.byte(0x80 | ((reg & 7) << 3) | (base & 7))
   if (base & 7) == 4 { a.b.byte(0x24) }
   a.b.u32(disp)
@@ -188,24 +194,31 @@ export fn (a: *X64) alu(op: str, dst: int, src: int) {
   a.rr(c, src, dst)
 }
 export fn (a: *X64) imul(dst: int, src: int) { a.rr(0x0FAF, dst, src) }
-export fn (a: *X64) add_imm(r: int, v: int) {
-  a.rex(1, 0, r, false)
-  a.b.byte(0x81)
-  a.b.byte(0xC0 | (r & 7))
-  a.b.u32(v)
-}
-export fn (a: *X64) sub_imm(r: int, v: int) {
+export fn (a: *X64) add_imm(r: int, v: int) { a.alu_imm(0, r, v) }
+export fn (a: *X64) sub_imm(r: int, v: int) { a.alu_imm(5, r, v) }
+# sub r, imm32 always (its immediate is patched later: the frame size)
+export fn (a: *X64) sub_imm32(r: int, v: int) {
   a.rex(1, 0, r, false)
   a.b.byte(0x81)
   a.b.byte(0xE8 | (r & 7))
   a.b.u32(v)
 }
-export fn (a: *X64) cmp_imm(r: int, v: int) {
+export fn (a: *X64) cmp_imm(r: int, v: int) { a.alu_imm(7, r, v) }
+# 0 add, 1 or, 4 and, 5 sub, 6 xor, 7 cmp: r op= v (v must fit in 32 bits, sign-extended)
+export fn (a: *X64) alu_imm(ext: int, r: int, v: int) {
   a.rex(1, 0, r, false)
+  if v >= -128 && v <= 127 {
+    a.b.byte(0x83)
+    a.b.byte(0xC0 | (ext << 3) | (r & 7))
+    a.b.byte(v & 255)
+    return
+  }
   a.b.byte(0x81)
-  a.b.byte(0xF8 | (r & 7))
+  a.b.byte(0xC0 | (ext << 3) | (r & 7))
   a.b.u32(v)
 }
+# r op= [base + disp] (op: 0x03 add, 0x2B sub, 0x23 and, 0x0B or, 0x33 xor, 0x3B cmp)
+export fn (a: *X64) alu_mem(op: int, r: int, base: int, disp: int) { a.rmx(op, r, base, disp, 1, 0) }
 # 2 not, 3 neg, 6 div, 7 idiv
 export fn (a: *X64) unary(ext: int, r: int) {
   a.rex(1, 0, r, false)
