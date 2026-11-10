@@ -1,0 +1,12 @@
+import "std/strings"
+print(strings.has_prefix("caju", "ca"), strings.has_suffix("caju", "ju"), strings.index("banana", "na"), strings.last_index("banana", "na"))
+print(strings.split("a,b,,c", ","), len(strings.split("a,b,,c", ",")))
+print(strings.join([]str{"x", "y", "z"}, "-"), strings.repeat("ab", 3), strings.replace_all("a.b.c", ".", "::"))
+print("[" + strings.trim_space("  hi there \n") + "]", strings.to_upper("Caju!"), strings.to_lower("CAJU"))
+print(strings.fields("  one two\tthree  "), strings.count("cheese", "e"), strings.contains("seafood", "foo"))
+b := strings.Builder{}
+for i := 0; i < 1000; i++ { b.write(str(i % 10)) }
+b.write_rune(0xE9)
+b.write_rune(0x1F600)
+s := b.string()
+print(len(s), s[0:12], s[1000:])

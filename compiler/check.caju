@@ -1,0 +1,734 @@
+# The compile-time checks of the old bytecode compiler: port of bootstrap/compiler.js without
+# the bytecode. check(prog) does what compile(ast) does, in the same order: collects the
+# functions (duplicate, built-in and type names), runs the type checker, collects the global
+# constants, then walks the program and every function exactly like the bytecode generator did
+# (main program first, then the functions in order, closures and defer/go wrappers queued as they
+# are found), reporting the same errors (undeclared variables, constant reassignment, break and
+# continue targets, captures...), and finally checks the dllexport functions.
+# The first error wins, so the walk keeps the order of the original.
+
+import "ast"
+import "types"
+
+# Functions marked with dllexport: what the DLL offers to other languages
+const MAX_EXPORTS = 64
+let RESERVED_EXPORTS = []str{"caju_last_error"}
+# C, C++ and C# words that cannot become a function name in the .h header or in the C# example
+let C_KEYWORDS = word_set("auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while bool true false class delete new this throw try catch namespace template typename public private protected virtual operator friend using asm explicit mutable export nullptr base object string decimal checked fixed lock out ref params sealed event implicit internal is as in foreach readonly stackalloc typeof uint ulong ushort sbyte byte def lambda pass None True False yield with global nonlocal assert del elif except finally from import raise not and or")
+
+fn word_set(s: str) -> map[str]bool {
+  m := map[str]bool{}
+  start := 0
+  for i := 0; i <= len(s); i++ {
+    if i == len(s) || int(s[i]) == 32 {
+      if i > start { m[s[start:i]] = true }
+      start = i + 1
+    }
+  }
+  return m
+}
+
+struct CFunc {
+  node: *ast.Node
+  name: str
+  params: []str
+  local_names: []str
+  upvals: []str
+}
+# function being walked: its locals, its local constants and the names it captures
+struct FnCtx {
+  f: *CFunc
+  locals: map[str]bool
+  consts: map[str]*ast.Node
+  upvals: map[str]bool
+}
+struct Loop {
+  label: str
+  is_loop: bool
+}
+struct Compiler {
+  funcs: []*CFunc
+  func_index: map[str]int
+  extern_index: map[str]*ast.Node
+  types: *types.Result
+  const_decl: map[str]*ast.Node
+  declared: map[str]bool
+  fn_: *FnCtx
+  loops: []*Loop
+  line: int
+}
+
+fn (c: *Compiler) err(msg: str, n: *ast.Node) {
+  ast.fail("compile", msg, n.line, n.col)
+}
+
+fn (c: *Compiler) add_func(st: *ast.Node) -> int {
+  c.func_index[st.name] = len(c.funcs)
+  c.funcs = append(c.funcs, &CFunc{node: st, name: st.name, params: st.params, local_names: types.local_names_of(st), upvals: st.captures})
+  return len(c.funcs) - 1
+}
+
+export fn check(prog: *ast.Node) -> *types.Result {
+  c := &Compiler{func_index: map[str]int{}, extern_index: map[str]*ast.Node{}, const_decl: map[str]*ast.Node{}, declared: map[str]bool{}, loops: []*Loop{}, line: 1}
+  # Functions and externs can be called before their declaration: they are collected first
+  for _, st := range types.top_stmts(prog.stmts) {
+    if st.kind != "Func" && st.kind != "Extern" { continue }
+    if types.contains_str(types.BUILTINS, st.name) || types.contains_str(types.CONVERSIONS, st.name) || types.contains_str(types.SPECIAL_BUILTINS, st.name) {
+      c.err("\"" + st.name + "\" is already a built-in function; choose another name", st)
+    }
+    if types.is_type_word(st.name) { c.err("\"" + st.name + "\" is the name of a type; choose another name for the function", st) }
+    let prev: *ast.Node = nil
+    fi, hf := c.func_index[st.name]
+    if hf {
+      prev = c.funcs[fi].node
+    } else {
+      ex, he := c.extern_index[st.name]
+      if he { prev = ex }
+    }
+    if prev != nil {
+      if st.recv != nil { c.err(types.bare(st.recv.type) + " already has a method named " + st.method + " (line " + str(ast.loc_line(prev.line)) + ")", st) }
+      c.err("There is already a function named \"" + st.name + "\" (line " + str(ast.loc_line(prev.line)) + ")", st)
+    }
+    if st.kind == "Func" {
+      c.add_func(st)
+    } else {
+      words := 0
+      nan := false
+      for _, pt := range st.ptypes {
+        w, ok := types.FFI_WORDS[pt]
+        if !ok { nan = true }
+        words += w
+      }
+      if !nan && words > types.MAX_FFI_WORDS { c.err("The parameters of " + st.symbol + " exceed the limit of " + str(types.MAX_FFI_WORDS) + " 32-bit words (i64, u64 and f64 take two)", st) }
+      c.extern_index[st.name] = st
+    }
+  }
+
+  # Types: checked before generating code, which uses what they find out
+  c.types = types.typecheck(prog, false)
+
+  # Semantic analysis of global variables (function bodies have their own scope)
+  c.collect(prog)
+
+  for _, st := range prog.stmts { c.stmt(st) }
+  # each function's code comes after the main program (anonymous ones are queued as they are found)
+  for i := 0; i < len(c.funcs); i++ { c.compile_func(c.funcs[i]) }
+  c.dll_exports()
+  return c.types
+}
+
+fn (c: *Compiler) collect(n: *ast.Node) {
+  if n == nil { return }
+  k := n.kind
+  if k == "FuncLit" || k == "Func" { return }
+  if k == "Assign" {
+    if n.decl == "const" {
+      prev, has := c.const_decl[n.name]
+      if has { c.err("The constant \"" + n.name + "\" was already declared on line " + str(ast.loc_line(prev.line)), n) }
+      c.const_decl[n.name] = n
+    }
+    if n.decl != "" { c.declared[n.name] = true }
+    return
+  }
+  if k == "VarDecl" {
+    for _, nm := range n.names { c.declared[nm] = true }
+    return
+  }
+  if k == "ForTo" { c.declared[n.name] = true }
+  if k == "Range" && n.define {
+    for _, v := range n.vars { c.declared[v.name] = true }
+  }
+  if k == "TypeSwitch" && n.bind != "" { c.declared[n.bind] = true }
+  if k == "Select" {
+    for _, cs := range n.cases {
+      if cs.define {
+        for _, v := range cs.vars { c.declared[v.name] = true }
+      }
+    }
+  }
+  for _, s := range n.stmts { c.collect(s) }
+  c.collect(n.body)
+  c.collect(n.then)
+  c.collect(n.otherwise)
+  c.collect(n.init)
+  c.collect(n.post)
+  for _, cs := range n.cases { c.collect(cs) }
+}
+
+fn (c: *Compiler) is_local(name: str) -> bool { return c.fn_ != nil && c.fn_.locals[name] }
+fn (c: *Compiler) is_upval(name: str) -> bool { return c.fn_ != nil && c.fn_.upvals[name] }
+fn (c: *Compiler) known(name: str) -> bool { return c.is_local(name) || c.is_upval(name) || c.declared[name] }
+fn (c: *Compiler) not_const(name: str, n: *ast.Node, what: str) {
+  let k: *ast.Node = nil
+  if c.is_local(name) {
+    x, ok := c.fn_.consts[name]
+    if ok { k = x }
+  } else {
+    x, ok := c.const_decl[name]
+    if ok { k = x }
+  }
+  if k != nil && k != n { c.err("\"" + name + "\" is a constant (line " + str(ast.loc_line(k.line)) + ") and cannot " + what, n) }
+}
+fn (c: *Compiler) is_value_type(t: str) -> bool {
+  if t == "" { return false }
+  _, ok := c.types.struct_table[t]
+  return ok || types.kind_of(t) == "array"
+}
+
+# ---- anonymous functions and calls ----
+fn (c: *Compiler) make_closure(fnode: *ast.Node) {
+  fi := c.add_func(fnode)
+  f := c.funcs[fi]
+  for _, nm := range f.upvals {
+    if !(c.is_local(nm) || c.is_upval(nm) || c.types.global_celled[nm]) { c.err("\"" + nm + "\" could not be captured by the function", fnode) }
+  }
+}
+# function value + arguments on the stack, for defer and go
+fn (c: *Compiler) callee(cl: *ast.Node) {
+  if cl.kind == "Call" && cl.call_kind == "func" {
+    for _, a := range cl.args { c.expr(a) }
+    return
+  }
+  if cl.kind == "Call" && cl.call_kind == "value" {
+    for _, a := range cl.args { c.expr(a) }
+    return
+  }
+  if cl.kind == "CallValue" {
+    c.expr(cl.fn_)
+    for _, a := range cl.args { c.expr(a) }
+    return
+  }
+  if cl.kind == "MethodCall" && (cl.target_name != "" || cl.field_call || cl.call_kind != "errnew") {
+    c.expr(cl.obj)
+    for _, a := range cl.args { c.expr(a) }
+    return
+  }
+  # built-in function (print, close, panic...): becomes a wrapper function with the arguments already evaluated
+  params := []str{}
+  ptypes := []str{}
+  args := []*ast.Node{}
+  for i, a := range cl.args {
+    p := "·a" + str(i)
+    params = append(params, p)
+    ptypes = append(ptypes, a.ty)
+    v := ast.new_node("Var", cl.line, cl.col)
+    v.name = p
+    v.ty = a.ty
+    args = append(args, v)
+  }
+  call := new(ast.Node)
+  *call = *cl
+  call.args = args
+  call.args_spread = false
+  wrapper := ast.new_node("Func", cl.line, cl.col)
+  wrapper.name = "·wrapper@" + str(ast.loc_line(cl.line)) + ":" + str(cl.col)
+  wrapper.params = params
+  wrapper.ptypes = ptypes
+  es := ast.new_node("ExprStmt", cl.line, cl.col)
+  es.expr = call
+  body := ast.new_node("Block", 0, 0)
+  body.stmts = []*ast.Node{es}
+  wrapper.body = body
+  call.discard = cl.discard
+  c.add_func(wrapper)
+  for _, a := range cl.args { c.expr(a) }
+}
+
+fn (c: *Compiler) expr(n: *ast.Node) {
+  if n.line != 0 { c.line = n.line }
+  c.expr_inner(n)
+}
+fn (c: *Compiler) expr_inner(n: *ast.Node) {
+  k := n.kind
+  if k == "Number" || k == "String" || k == "Bool" || k == "Nil" { return }
+  if k == "Paren" { c.expr(n.expr); return }
+  if k == "Var" {
+    if n.fn_ref { return }
+    if !c.known(n.name) { c.err("The variable \"" + n.name + "\" is not created anywhere in the program. Use let " + n.name + " = ... or " + n.name + " := ...", n) }
+    return
+  }
+  if k == "Neg" || k == "BitNot" || k == "Not" { c.expr(n.arg); return }
+  if k == "Logical" {
+    c.expr(n.left)
+    c.expr(n.right)
+    return
+  }
+  if k == "Binary" {
+    c.expr(n.left)
+    c.expr(n.right)
+    c.line = n.line
+    return
+  }
+  if k == "Call" { c.call_expr(n); return }
+  if k == "StructLit" || k == "CompositeLit" { c.composite(n); return }
+  if k == "Field" {
+    c.expr(n.obj)
+    c.line = n.line
+    return
+  }
+  if k == "MethodCall" {
+    if n.call_kind == "errnew" {
+      c.expr(n.args[0])
+      c.line = n.line
+      return
+    }
+    c.expr(n.obj)
+    for _, a := range n.args { c.expr(a) }
+    c.line = n.line
+    return
+  }
+  if k == "CallValue" {
+    c.expr(n.fn_)
+    for _, a := range n.args { c.expr(a) }
+    c.line = n.line
+    return
+  }
+  if k == "FuncLit" { c.make_closure(n.fn_); return }
+  if k == "Index" {
+    c.expr(n.obj)
+    c.expr(n.index)
+    c.line = n.line
+    return
+  }
+  if k == "SliceExpr" {
+    c.expr(n.obj)
+    if n.lo != nil { c.expr(n.lo) }
+    if n.hi != nil { c.expr(n.hi) }
+    c.line = n.line
+    return
+  }
+  if k == "AddrOf" { c.address(n.arg, n); return }
+  if k == "Deref" || k == "Recv" {
+    c.expr(n.arg)
+    c.line = n.line
+    return
+  }
+  if k == "TypeAssert" {
+    c.expr(n.obj)
+    c.line = n.line
+    return
+  }
+  if k == "Conversion" { c.conversion(n, n.args[0]); return }
+  c.err("Unknown expression: " + n.kind, n)
+}
+fn (c: *Compiler) address(a: *ast.Node, n: *ast.Node) {
+  if a.kind == "Paren" { c.address(a.expr, n); return }
+  if a.kind == "StructLit" || a.kind == "CompositeLit" { c.expr(a); return }
+  if a.kind == "Deref" { c.expr(a.arg); return }
+  # structs and arrays are already objects: the pointer is the object itself
+  if c.is_value_type(a.ty) { c.expr(a); return }
+  c.line = n.line
+  if a.kind == "Var" { return }
+  if a.kind == "Field" { c.expr(a.obj); return }
+  if a.kind == "Index" {
+    c.expr(a.obj)
+    c.expr(a.index)
+    return
+  }
+  c.err("Cannot take the address of this expression", n)
+}
+fn (c: *Compiler) conversion(n: *ast.Node, a: *ast.Node) {
+  c.line = n.line
+  m := n.conv_mode
+  c.expr(a)
+  if m == "num" || m == "fmt" { c.line = n.line }
+}
+fn (c: *Compiler) composite(n: *ast.Node) {
+  if n.stype != "" {
+    S := c.types.struct_table[n.stype]
+    for _, d := range S.node.fields {
+      for _, f := range n.sfields {
+        if f.name == d.name {
+          c.expr(f.value)
+          break
+        }
+      }
+    }
+    c.line = n.line
+    return
+  }
+  ti := types.tinfo(n.type)
+  if ti.k == "slice" || ti.k == "array" {
+    for _, e := range n.elems { c.expr(e.value) }
+    c.line = n.line
+    return
+  }
+  if ti.k == "map" {
+    for _, e := range n.elems {
+      c.expr(e.key)
+      c.expr(e.value)
+    }
+    c.line = n.line
+    return
+  }
+  c.err("Unknown literal", n)
+}
+fn (c: *Compiler) call_expr(n: *ast.Node) {
+  count := len(n.args)
+  ck := n.call_kind
+  if ck == "conv" { c.conversion(n, n.args[0]); return }
+  if ck == "value" || ck == "extern" {
+    for _, a := range n.args { c.expr(a) }
+    c.line = n.line
+    return
+  }
+  if ck == "func" {
+    f := c.funcs[c.func_index[n.name]]
+    if count != len(f.params) { c.err("The function \"" + n.name + "\" expects " + types.plural(len(f.params), "argument") + ", but got " + str(count), n) }
+    for _, a := range n.args { c.expr(a) }
+    c.line = n.line
+    return
+  }
+  if ck == "builtin" { c.builtin_call(n); return }
+  _, has := c.func_index[n.name]
+  if has {
+    n.call_kind = "func"
+    c.call_expr(n)
+    return
+  }
+  c.err("The function \"" + n.name + "\" does not exist", n)
+}
+fn (c: *Compiler) builtin_call(n: *ast.Node) {
+  a := n.args
+  count := len(a)
+  if types.contains_str(types.BUILTINS, n.name) {
+    want := types.BUILTIN_ARITY[n.name]
+    if want >= 0 && count != want {
+      if want == 0 { c.err(n.name + "() takes no arguments", n) }
+      c.err(n.name + " expects " + types.plural(want, "argument"), n)
+    }
+    for _, x := range a { c.expr(x) }
+    c.line = n.line
+    return
+  }
+  c.line = n.line
+  nm := n.name
+  if nm == "len" || nm == "cap" || nm == "panic" || nm == "close" { c.expr(a[0]); return }
+  if nm == "append" {
+    c.expr(a[0])
+    if n.args_spread {
+      c.expr(a[1])
+      c.line = n.line
+      return
+    }
+    for _, x := range a[1:] { c.expr(x) }
+    c.line = n.line
+    return
+  }
+  if nm == "copy" || nm == "delete" {
+    c.expr(a[0])
+    c.expr(a[1])
+    return
+  }
+  if nm == "make" {
+    for _, x := range a { c.expr(x) }
+    c.line = n.line
+    return
+  }
+  if nm == "new" || nm == "recover" { return }
+  # low-level operations of the standard library exist only in native code; here they are checked
+  if n.privileged && len(nm) > 2 && nm[0:2] == "__" {
+    for _, x := range a { c.expr(x) }
+    return
+  }
+  c.err("Unknown function " + n.name, n)
+}
+
+# conditions emitted as jumps: the same order as expr, without visiting the and/or/not/paren nodes
+fn (c: *Compiler) jump_cond(n: *ast.Node) {
+  if n.kind == "Paren" { c.jump_cond(n.expr); return }
+  if n.kind == "Not" { c.jump_cond(n.arg); return }
+  if n.kind == "Logical" && (n.op == "and" || n.op == "or") {
+    c.jump_cond(n.left)
+    c.jump_cond(n.right)
+    return
+  }
+  c.expr(n)
+}
+
+# ---- break and continue ----
+fn (c: *Compiler) jump_target(n: *ast.Node, want_loop: bool) {
+  for i := len(c.loops) - 1; i >= 0; i-- {
+    L := c.loops[i]
+    hit := false
+    if n.label != "" { hit = L.label == n.label } else { hit = !want_loop || L.is_loop }
+    if hit {
+      if want_loop && !L.is_loop { c.err("continue " + n.label + " must refer to a loop", n) }
+      return
+    }
+  }
+  if n.label != "" { c.err("There is no enclosing loop, switch or select with the label " + n.label, n) }
+  if want_loop { c.err("continue outside a loop", n) }
+  c.err("break outside a loop, switch or select", n)
+}
+fn (c: *Compiler) push_loop(n: *ast.Node, is_loop: bool) {
+  c.loops = append(c.loops, &Loop{label: n.label, is_loop: is_loop})
+}
+fn (c: *Compiler) pop_loop() { c.loops = c.loops[0:len(c.loops) - 1] }
+# stores into the targets, from last to first
+fn (c: *Compiler) store_names(names: []str) {
+  for i := len(names) - 1; i >= 0; i-- {
+    at := ast.new_node("Var", c.line, 0)
+    c.not_const(names[i], at, "be reassigned")
+  }
+}
+fn (c: *Compiler) store_targets(targets: []*ast.Node) {
+  for i := len(targets) - 1; i >= 0; i-- {
+    t := targets[i]
+    if t.kind == "Var" {
+      c.not_const(t.name, t, "be reassigned")
+      continue
+    }
+    c.err("unexpected target", t)
+  }
+}
+
+fn (c: *Compiler) stmt(n: *ast.Node) {
+  if n == nil { return }
+  if n.line != 0 { c.line = n.line }
+  k := n.kind
+  if k == "ExprStmt" { c.expr(n.expr); return }
+  if k == "Block" || k == "Module" {
+    for _, s := range n.stmts { c.stmt(s) }
+    return
+  }
+  if k == "Func" || k == "Extern" || k == "Struct" || k == "Interface" || k == "Fallthrough" { return }
+  if k == "FieldAssign" {
+    c.expr(n.obj)
+    c.expr(n.value)
+    c.line = n.line
+    return
+  }
+  if k == "Return" {
+    f := c.fn_.f
+    if len(f.node.rnames) > 0 {
+      if len(n.values) > 0 {
+        for _, v := range n.values { c.expr(v) }
+        c.store_names(f.node.rnames)
+      }
+      c.line = n.line
+      return
+    }
+    if len(n.values) == 0 { return }
+    for _, v := range n.values { c.expr(v) }
+    c.line = n.line
+    return
+  }
+  if k == "Assign" {
+    c.not_const(n.name, n, "be reassigned")
+    if n.decl == "" && !c.known(n.name) { c.err("The variable \"" + n.name + "\" does not exist. Use let " + n.name + " = ... or " + n.name + " := ... the first time", n) }
+    if c.fn_ != nil && n.decl == "const" && c.is_local(n.name) {
+      prev, has := c.fn_.consts[n.name]
+      if has && prev != n { c.err("The constant \"" + n.name + "\" was already declared on line " + str(ast.loc_line(prev.line)), n) }
+      c.fn_.consts[n.name] = n
+    }
+    if n.value != nil { c.expr(n.value) }
+    c.line = n.line
+    return
+  }
+  if k == "VarDecl" {
+    if len(n.values) == len(n.names) {
+      for _, v := range n.values { c.expr(v) }
+    } else {
+      c.expr(n.values[0])
+    }
+    c.line = n.line
+    c.store_names(n.names)
+    return
+  }
+  if k == "MultiAssign" { c.multi_assign(n); return }
+  if k == "OpAssign" {
+    t := n.target
+    if t.kind == "Var" {
+      c.not_const(t.name, n, "be reassigned")
+      c.expr(n.value)
+      c.line = n.line
+    } else if t.kind == "Index" {
+      c.expr(t.obj)
+      c.expr(t.index)
+      c.expr(n.value)
+      c.line = n.line
+    } else if t.kind == "Field" {
+      c.expr(t.obj)
+      c.expr(n.value)
+      c.line = n.line
+    } else if t.kind == "Deref" {
+      c.expr(t.arg)
+      c.expr(n.value)
+      c.line = n.line
+    }
+    return
+  }
+  if k == "If" {
+    if n.init != nil { c.stmt(n.init) }
+    c.expr(n.cond)
+    c.stmt(n.then)
+    if n.otherwise != nil {
+      c.line = n.line
+      c.stmt(n.otherwise)
+    }
+    return
+  }
+  if k == "While" {
+    c.push_loop(n, true)
+    c.expr(n.cond)
+    c.stmt(n.body)
+    c.line = n.line
+    c.pop_loop()
+    return
+  }
+  if k == "ForTo" {
+    c.not_const(n.name, n, "be the for variable")
+    c.expr(n.from_)
+    c.expr(n.to_)
+    c.line = n.line
+    c.push_loop(n, true)
+    c.stmt(n.body)
+    c.pop_loop()
+    c.line = n.line
+    return
+  }
+  if k == "ForC" {
+    if n.init != nil { c.stmt(n.init) }
+    if n.cond != nil { c.jump_cond(n.cond) }
+    c.push_loop(n, true)
+    c.stmt(n.body)
+    c.pop_loop()
+    if n.post != nil { c.stmt(n.post) }
+    c.line = n.line
+    return
+  }
+  if k == "Range" {
+    c.expr(n.subject)
+    c.line = n.line
+    if len(n.vars) > 1 && n.vars[1].name != "_" { c.store_targets([]*ast.Node{n.vars[1]}) }
+    if len(n.vars) > 0 && n.vars[0].name != "_" { c.store_targets([]*ast.Node{n.vars[0]}) }
+    c.push_loop(n, true)
+    c.stmt(n.body)
+    c.pop_loop()
+    c.line = n.line
+    return
+  }
+  if k == "Switch" {
+    if n.init != nil { c.stmt(n.init) }
+    if n.tag != nil { c.expr(n.tag) }
+    for _, cs := range n.cases {
+      for _, e := range cs.exprs {
+        if n.tag == nil {
+          c.jump_cond(e)
+          continue
+        }
+        c.expr(e)
+        c.line = cs.line
+      }
+    }
+    c.push_loop(n, false)
+    for _, cs := range n.cases {
+      for _, s := range cs.stmts { c.stmt(s) }
+    }
+    c.pop_loop()
+    return
+  }
+  if k == "TypeSwitch" {
+    if n.init != nil { c.stmt(n.init) }
+    c.expr(n.subject)
+    c.push_loop(n, false)
+    for _, cs := range n.cases {
+      for _, s := range cs.stmts { c.stmt(s) }
+    }
+    c.pop_loop()
+    return
+  }
+  if k == "Select" {
+    for _, cs := range n.cases {
+      if cs.kind == "default" { continue }
+      c.expr(cs.ch)
+      if cs.kind == "send" { c.expr(cs.value) }
+    }
+    c.line = n.line
+    c.push_loop(n, false)
+    for _, cs := range n.cases {
+      if cs.kind == "recv" && len(cs.vars) > 0 { c.store_targets(cs.vars) }
+      for _, s := range cs.stmts { c.stmt(s) }
+    }
+    c.pop_loop()
+    return
+  }
+  if k == "Break" { c.jump_target(n, false); return }
+  if k == "Continue" { c.jump_target(n, true); return }
+  if k == "Send" {
+    c.expr(n.ch)
+    c.expr(n.value)
+    c.line = n.line
+    return
+  }
+  if k == "Defer" || k == "Go" {
+    c.callee(n.call)
+    c.line = n.line
+    return
+  }
+  c.err("Unknown statement: " + n.kind, n)
+}
+# a, b = b, a: evaluates everything before storing, as in Go
+fn (c: *Compiler) multi_assign(n: *ast.Node) {
+  for _, t := range n.targets {
+    if t.kind == "Var" { continue }
+    if t.kind == "Index" {
+      c.expr(t.obj)
+      c.expr(t.index)
+      continue
+    }
+    if t.kind == "Field" { c.expr(t.obj); continue }
+    if t.kind == "Deref" { c.expr(t.arg); continue }
+    c.err("Invalid target", t)
+  }
+  if len(n.values) == len(n.targets) {
+    for _, v := range n.values { c.expr(v) }
+  } else {
+    c.expr(n.values[0])
+  }
+  for _, t := range n.targets {
+    if t.kind == "Var" {
+      if t.name == "_" { continue }
+      c.not_const(t.name, t, "be reassigned")
+      if !c.known(t.name) { c.err("The variable \"" + t.name + "\" does not exist", t) }
+    }
+  }
+}
+
+# a function's body: walked after the main program, with its own locals and loops
+fn (c: *Compiler) compile_func(f: *CFunc) {
+  # the type checker marked what is captured by closures (it runs after functions are collected)
+  if len(f.upvals) == 0 && f.node.captures != nil { f.upvals = f.node.captures }
+  parent := c.fn_
+  locals := map[str]bool{}
+  for _, nm := range f.local_names { locals[nm] = true }
+  ups := map[str]bool{}
+  for _, nm := range f.upvals { ups[nm] = true }
+  c.fn_ = &FnCtx{f: f, locals: locals, consts: map[str]*ast.Node{}, upvals: ups}
+  saved := c.loops
+  c.loops = []*Loop{}
+  c.line = f.node.line
+  c.stmt(f.node.body)
+  if f.node.end_line != 0 { c.line = f.node.end_line } else { c.line = f.node.line }
+  c.loops = saved
+  c.fn_ = parent
+}
+
+fn (c: *Compiler) dll_exports() {
+  seen := map[str]*ast.Node{}
+  count := 0
+  let first: *ast.Node = nil
+  for _, f := range c.funcs {
+    if f.node.dll_name == "" { continue }
+    d := f.node.dll_name
+    if types.contains_str(RESERVED_EXPORTS, d) { c.err("\"" + d + "\" is a reserved DLL name; choose another one", f.node) }
+    if C_KEYWORDS[d] { c.err("\"" + d + "\" is a reserved word in C, C# or Python; choose another name for the exported function", f.node) }
+    prev, has := seen[d]
+    if has { c.err("There is already an exported function named \"" + d + "\" (line " + str(ast.loc_line(prev.line)) + ")", f.node) }
+    seen[d] = f.node
+    if first == nil { first = f.node }
+    count++
+  }
+  if count > MAX_EXPORTS { c.err("A Caju DLL exports at most " + str(MAX_EXPORTS) + " functions", first) }
+}

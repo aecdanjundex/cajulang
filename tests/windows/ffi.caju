@@ -1,0 +1,25 @@
+extern "kernel32.dll" fn MulDiv(a: i32, b: i32, c: i32) -> i32
+extern "kernel32.dll" fn lstrlenW(s: wstr) -> i32
+extern "kernel32.dll" fn lstrlenA(s: str) -> i32
+extern "kernel32.dll" fn GetCurrentProcessId() -> u32
+extern "msvcrt.dll" cdecl fn abs(x: i32) -> i32
+extern "msvcrt.dll" cdecl fn pow(a: f64, b: f64) -> f64
+extern "msvcrt.dll" cdecl fn _atoi64(s: str) -> i64
+extern "msvcrt.dll" cdecl fn strlen(s: str) -> u32
+extern "msvcrt.dll" cdecl fn sqrt(x: f64) -> f64
+extern "msvcrt.dll" cdecl fn _wcsdup(s: wstr) -> ptr
+extern "msvcrt.dll" cdecl fn _strdup(s: str) -> str
+print("MulDiv", MulDiv(10, 20, 3))
+print("lstrlenW", lstrlenW("Héllo 😀"), "lstrlenA", lstrlenA("abc"))
+print("pid > 0", GetCurrentProcessId() > 0)
+print("abs", abs(-42), "pow", pow(2, 0.5), "sqrt", sqrt(81))
+print("atoi64", _atoi64("123456789012"), "strlen", strlen("çã"))
+let w = _wcsdup("café")
+print("wcsdup", readwstr(w))
+print("strdup", _strdup("echo"))
+let total = 0
+for i := 0; i < 5000; i++ { total += MulDiv(i, 2, 1) - abs(-i) }
+print("stress", total)
+c := make(chan int)
+go fn() { c <- abs(-7) }()
+print("goroutine", <-c)

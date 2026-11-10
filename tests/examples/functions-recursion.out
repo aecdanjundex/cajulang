@@ -1,0 +1,19 @@
+10! = 3628800
+fib(0) = 0
+fib(1) = 1
+fib(2) = 1
+fib(3) = 2
+fib(4) = 3
+fib(5) = 5
+fib(6) = 8
+fib(7) = 13
+fib(8) = 21
+fib(9) = 34
+fib(10) = 55
+  disk 1 from A to C
+  disk 2 from A to B
+  disk 1 from C to B
+  disk 1 from B to A
+  disk 2 from B to C
+  disk 1 from A to C
+Moves for 3 disks: 7

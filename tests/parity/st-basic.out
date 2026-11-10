@@ -1,0 +1,2 @@
+P{x: 1.5, y: 2, name: "one "a"", ok: false} P{x: 3, y: 4, name: "one "a"", ok: false} 3.5 7 false true
+text: P{x: 1.5, y: 2, name: "one "a"", ok: false}

@@ -1,0 +1,38 @@
+# go starts a goroutine; channels carry values between them.
+fn worker(id: int, jobs: chan int, results: chan str) {
+  for t := range jobs {
+    sleep(0.1)                  # pretends to work
+    results <- "worker " + str(id) + " did job " + str(t)
+  }
+}
+jobs := make(chan int, 10)
+results := make(chan str, 10)
+for w := 1; w <= 3; w++ { go worker(w, jobs, results) }
+for t := 1; t <= 6; t++ { jobs <- t }
+close(jobs)
+for i := 0; i < 6; i++ { print(<-results) }
+
+# select waits for the first channel that becomes ready
+ticker := make(chan int)
+done := make(chan bool)
+go fn() {
+  for i := 1; i <= 3; i++ {
+    sleep(0.2)
+    ticker <- i
+  }
+  done <- true
+}()
+outer:
+for {
+  select {
+  case n := <-ticker: print("tick", n)
+  case <-done:
+    print("finished")
+    break outer
+  }
+}
+
+# if every goroutine is left waiting, the program stops: deadlock
+c := make(chan int)
+print("waiting for a value that never comes...")
+print(<-c)

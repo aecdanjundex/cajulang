@@ -1,0 +1,24 @@
+# A number is perfect when it equals the sum of its proper divisors:
+# 6 = 1 + 2 + 3. Finds all of them up to 60 000, adding divisors in pairs up to the root.
+const LIMIT = 60_000
+let found = 0
+
+for n = 2 to LIMIT {
+  let sum = 1
+  let d = 2
+  while d * d <= n {
+    if n % d == 0 {
+      sum = sum + d
+      let pair = n / d
+      if pair != d {
+        sum = sum + pair
+      }
+    }
+    d = d + 1
+  }
+  if sum == n {
+    found = found + 1
+    print(n, "is perfect")
+  }
+}
+print("Total:", found, "perfect numbers up to", LIMIT)

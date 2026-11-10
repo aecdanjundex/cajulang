@@ -1,0 +1,11 @@
+nil
+nil
+nil
+HTTP/1.1 200 OK
+X-Caju: yes
+Content-Type: text/plain; charset=utf-8
+Content-Length: 20
+Connection: close
+
+hi name=caju hello x
+dial 127.0.0.1:1: connection refused

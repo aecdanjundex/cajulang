@@ -1,0 +1,9 @@
+# windows.caju hides the DLL details behind simple functions
+import { notify, ask, beep } from "windows.caju"
+
+if ask("Want to hear a beep?") {
+  beep(3)
+  notify("Done, three beeps.")
+} else {
+  notify("All right, maybe another time.")
+}

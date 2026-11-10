@@ -1,0 +1,23 @@
+leaving level 0
+leaving level 1
+leaving level 2
+leaving level 3
+a recovered: bottom
+nothing
+b finished normally
+b recovered: nil
+helper saw: nil
+caught x
+ | second: again
+60
+Err{code: 7}
+Too much recursion: more than 10,000 nested function calls
+now 99
+deferred 1
+closure 2
+closure 1
+closure 0
+nil
+error: Assignment to a nil map or slice
+defer runs before the end
+Runtime error in panic.caju, line 80: Access to field "v" through a nil pointer.

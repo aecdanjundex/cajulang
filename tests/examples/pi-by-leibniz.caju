@@ -1,0 +1,14 @@
+# π by the Leibniz series: π = 4 × (1 − 1/3 + 1/5 − 1/7 + ...)
+# It converges slowly, so it needs many iterations.
+# Here the optimizer helps less: the heavy work is a long expression
+# that no superinstruction covers. Compare with Free fall.
+const TERMS = 400_000
+let sum = 0
+let sign = 1
+
+for k = 0 to TERMS - 1 {
+  sum = sum + sign / (2 * k + 1)
+  sign = -sign
+}
+print("π ≈", 4 * sum)
+print("error:", 4 * sum - 3.14159265358979)

@@ -1,0 +1,46 @@
+# dllexport makes the function visible to other languages (C, C#, Python...).
+# In Build .exe / .dll, choose ".dll library". In the DLL tab, next to it,
+# you can call each function right here, as another program would.
+let calls: int = 0                # without ": int", it would be num, and total_calls could not return i32
+print("calculator loaded")        # runs once, on the first call into the DLL
+
+dllexport fn sum(a: i32, b: i32) -> i32 {
+  calls = calls + 1
+  return a + b
+}
+
+dllexport fn average(a: f64, b: f64) -> f64 {
+  calls = calls + 1
+  return (a + b) / 2
+}
+
+dllexport fn factorial(n: i32) -> f64 {
+  calls = calls + 1
+  let r = 1
+  let i = 2
+  while i <= n {
+    r = r * i
+    i = i + 1
+  }
+  return r
+}
+
+dllexport fn is_prime(n: i32) -> bool {
+  if n < 2 { return false }
+  let d = 2
+  while d * d <= n {
+    if n % d == 0 { return false }
+    d = d + 1
+  }
+  return true
+}
+
+dllexport fn greeting(name: str) -> str {
+  calls = calls + 1
+  return "Hello, " + name + "! This is call " + calls
+}
+
+dllexport fn total_calls() -> i32 { return calls }
+
+# no dllexport: only the DLL itself sees it
+fn double(x) { return x * 2 }

@@ -1,0 +1,38 @@
+# Types are optional. With them, compilation finds errors before running.
+# See the Types tab, and the types of each node in the Tree tab.
+#   int (integer) ⊂ num (any number)   str (text)   bool   any (untyped)
+
+const STUDENTS = 4          # const with an integer: int
+let sum = 0                 # let without a type infers num, to accept 0.5 later
+let count: int = 0          # with a type, it stays int
+
+fn average(total: num, n: int) -> num {
+  return total / n
+}
+
+fn letter(grade: num) -> str {
+  if grade >= 9 { return "A" }
+  if grade >= 7 { return "B" }
+  if grade >= 5 { return "C" }
+  return "D"
+}
+
+# without -> at the end, the return type is inferred: here, int
+fn square(x: int) { return x * x }
+
+for i = 1 to STUDENTS {     # i is int, because both bounds are int
+  let grade = 4 + i * 1.5
+  sum = sum + grade
+  count = count + 1
+  print("student " + str(i) + ": " + str(grade) + " (" + letter(grade) + ")")
+}
+
+let m = average(sum, count)
+print("average:", m, "letter", letter(m))
+print("without the decimal part:", int(m))
+print("square of 12:", square(12))
+
+# Remove the # from one line below to see the type error:
+# count = m                  int does not accept num; use int(m)
+# print(letter("ten"))       letter expects num
+# let x: str = square(3)     square returns int

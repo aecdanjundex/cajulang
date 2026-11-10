@@ -1,0 +1,348 @@
+# Native runtime, phase 3: dynamic values (any and interfaces), methods by name and errors.
+# An any or interface value is 0 (nil) or the address of a box [descriptor, value].
+# New descriptor kinds: 11 any, 12 interface, 13 error from errors.New, 14 function, 15 other.
+# [56] of the descriptor: method table (struct, *struct, error) or list of names (interface).
+# Method table: [n] and n entries [name, code, path, descriptor of the copy, by value?, result];
+# path: [n, field...] of the embedded fields down to the receiver.
+
+# descriptors the runtime uses (the compiler stores their addresses at startup)
+let rt_d_int: int = 0
+let rt_d_num: int = 0
+let rt_d_bool: int = 0
+let rt_d_str: int = 0
+let rt_d_any: int = 0
+let rt_d_err: int = 0
+let rt_ok: bool = false
+
+fn rt_box(v: int, d: int) -> int {
+  p := rt_alloc(16)
+  __store64(p, d)
+  __store64(p + 8, v)
+  return p
+}
+# prebuilt boxes for small integers and booleans (boxes never change)
+let rt_small: int = 0
+fn rt_box_int(v: int) -> int {
+  if v >= -128 and v < 1024 {
+    if rt_small == 0 {
+      rt_small = rt_alloc(16 * 1154)
+      i := 0
+      while i < 1152 {
+        __store64(rt_small + 16 * i, rt_d_int)
+        __store64(rt_small + 16 * i + 8, i - 128)
+        i++
+      }
+      __store64(rt_small + 16 * 1152, rt_d_bool)
+      __store64(rt_small + 16 * 1152 + 8, 0)
+      __store64(rt_small + 16 * 1153, rt_d_bool)
+      __store64(rt_small + 16 * 1153 + 8, 1)
+    }
+    return rt_small + 16 * (v + 128)
+  }
+  return rt_box(v, rt_d_int)
+}
+fn rt_box_bool(b: bool) -> int {
+  rt_box_int(0)
+  if b { return rt_small + 16 * 1153 }
+  return rt_small + 16 * 1152
+}
+fn rt_bdesc(b: int) -> int { return __load64(b) }
+fn rt_bval(b: int) -> int { return __load64(b + 8) }
+fn rt_dname(d: int) -> str { return __pstr(__load64(d + 32)) }
+
+# type name in error messages, as in the VM ("number", "string", "struct Point"...)
+fn rt_type_name(v: int) -> str {
+  if v == 0 { return "nil" }
+  d := __load64(v)
+  k := __load64(d)
+  if k == 1 or k == 2 or k == 3 { return "number" }
+  if k == 4 { return "boolean" }
+  if k == 5 { return "string" }
+  if k == 6 { return "slice" }
+  if k == 7 { return "array" }
+  if k == 8 { return "struct " + rt_dname(d) }
+  if k == 9 {
+    e := __load64(d + 16)
+    if __load64(e) == 8 { return "pointer *" + rt_dname(e) }
+    return "pointer"
+  }
+  if k == 10 { return "map" }
+  if k == 13 { return "error" }
+  if k == 14 { return "function" }
+  return "value"
+}
+# name of the stored type, as in x.(T)
+fn rt_dyn_name(v: int) -> str {
+  if v == 0 { return "nil" }
+  d := __load64(v)
+  if __load64(d) == 13 { return "*errors.errorString" }
+  return rt_dname(d)
+}
+
+fn rt_is_numk(k: int) -> bool { return k == 1 or k == 2 or k == 3 }
+fn rt_as_num(b: int) -> num {
+  k := __load64(__load64(b))
+  x := __load64(b + 8)
+  if k == 3 { return __bitsf(x) }
+  if k == 2 and x < 0 { return num(x >> 1) * 2.0 }
+  return num(x)
+}
+# result of arithmetic on any: an integer if it has no fractional part (like the VM)
+fn rt_num_box(x: num) -> int {
+  if x > -9223372036854775808.0 and x < 9223372036854775808.0 {
+    i := int(x)
+    if num(i) == x { return rt_box_int(i) }
+  }
+  return rt_box(__fbits(x), rt_d_num)
+}
+fn rt_truthy(v: int) -> bool {
+  if v == 0 { return false }
+  k := __load64(__load64(v))
+  x := __load64(v + 8)
+  # in the VM, int8, uint, integral num... live in a box, and a box counts as true
+  d := __load64(v)
+  if d == rt_d_int or k == 4 { return x != 0 }
+  if k == 5 { return __load64(x) != 0 }
+  return true
+}
+fn rt_dyn_eq(a: int, b: int) -> bool {
+  if a == b { return true }
+  if a == 0 or b == 0 { return false }
+  d := __load64(a)
+  if d != __load64(b) { return false }
+  k := __load64(d)
+  x := __load64(a + 8)
+  y := __load64(b + 8)
+  if k == 13 { return false }
+  if k == 9 {
+    e := __load64(d + 16)
+    if __load64(e) == 8 { return x == y or rt_eq(x, y, e) }
+    return x == y
+  }
+  return rt_eq(x, y, d)
+}
+fn rt_op_sym(op: int) -> str {
+  if op == 0 { return "+" }
+  if op == 1 { return "-" }
+  if op == 2 { return "*" }
+  if op == 3 { return "/" }
+  if op == 4 { return "%" }
+  if op == 5 { return "**" }
+  if op == 6 { return "<" }
+  if op == 7 { return ">" }
+  if op == 8 { return "<=" }
+  return ">="
+}
+# arithmetic on any values: 0 + 1 - 2 * 3 / 4 % 5 ** 6 < 7 > 8 <= 9 >=
+fn rt_dyn_op(where: str, op: int, a: int, b: int) -> int {
+  if op >= 6 { return rt_box_bool(rt_dyn_cmp(where, op, a, b)) }
+  # fast path: two integers (the result matches the VM's floating-point arithmetic up to 2^53)
+  if a != 0 and b != 0 and op <= 2 and __load64(a) == rt_d_int and __load64(b) == rt_d_int {
+    xi := __load64(a + 8)
+    yi := __load64(b + 8)
+    if op == 0 { return rt_box_int(xi + yi) }
+    if op == 1 { return rt_box_int(xi - yi) }
+    return rt_box_int(xi * yi)
+  }
+  ka := 0
+  kb := 0
+  if a != 0 { ka = __load64(__load64(a)) }
+  if b != 0 { kb = __load64(__load64(b)) }
+  if op == 0 and (ka == 5 or kb == 5) {
+    return rt_box(__strp(rt_val_str(a, rt_d_any) + rt_val_str(b, rt_d_any)), rt_d_str)
+  }
+  if not rt_is_numk(ka) or not rt_is_numk(kb) {
+    rt_fail(where, "The \"" + rt_op_sym(op) + "\" operator only works with numbers")
+  }
+  x := rt_as_num(a)
+  y := rt_as_num(b)
+  if op == 0 { return rt_num_box(x + y) }
+  if op == 1 { return rt_num_box(x - y) }
+  if op == 2 { return rt_num_box(x * y) }
+  if op == 3 {
+    if y == 0.0 { rt_fail(where, "Division by zero") }
+    return rt_num_box(x / y)
+  }
+  if op == 4 {
+    if y == 0.0 { rt_fail(where, "Remainder of division by zero") }
+    return rt_num_box(__fmod(x, y))
+  }
+  return rt_num_box(rt_pow(x, y))
+}
+fn rt_dyn_cmp(where: str, op: int, a: int, b: int) -> bool {
+  if a != 0 and b != 0 and __load64(a) == rt_d_int and __load64(b) == rt_d_int {
+    xi := __load64(a + 8)
+    yi := __load64(b + 8)
+    if op == 6 { return xi < yi }
+    if op == 7 { return xi > yi }
+    if op == 8 { return xi <= yi }
+    return xi >= yi
+  }
+  ka := 0
+  kb := 0
+  if a != 0 { ka = __load64(__load64(a)) }
+  if b != 0 { kb = __load64(__load64(b)) }
+  if true {
+    r := false
+    if rt_is_numk(ka) and rt_is_numk(kb) {
+      x := rt_as_num(a)
+      y := rt_as_num(b)
+      if op == 6 { r = x < y } else if op == 7 { r = x > y } else if op == 8 { r = x <= y } else { r = x >= y }
+    } else if ka == 5 and kb == 5 {
+      c := rt_strcmp(__pstr(__load64(a + 8)), __pstr(__load64(b + 8)))
+      if op == 6 { r = c < 0 } else if op == 7 { r = c > 0 } else if op == 8 { r = c <= 0 } else { r = c >= 0 }
+    } else {
+      rt_fail(where, "Cannot compare " + rt_type_name(a) + " with " + rt_type_name(b) + " using \"" + rt_op_sym(op) + "\"")
+    }
+    return r
+  }
+  return false
+}
+fn rt_dyn_neg(where: str, a: int) -> int {
+  if a == 0 or not rt_is_numk(__load64(__load64(a))) { rt_fail(where, "The \"-\" operator only works with numbers") }
+  return rt_num_box(0.0 - rt_as_num(a))
+}
+# any → concrete type (gradual typing lets an any go where a concrete type is expected)
+fn rt_unbox(where: str, v: int, d: int) -> int {
+  if v == 0 { return rt_zero(d) }
+  bd := __load64(v)
+  if bd == d { return __load64(v + 8) }
+  k := __load64(d)
+  if rt_is_numk(k) and rt_is_numk(__load64(bd)) {
+    x := rt_as_num(v)
+    if k == 3 { return __fbits(x) }
+    if x != x { return 0 }
+    return int(x)
+  }
+  rt_fail(where, "This value is " + rt_type_name(v) + ", but " + rt_dname(d) + " is expected here")
+  return 0
+}
+fn rt_unbox_num(where: str, v: int) -> num {
+  if v == 0 or not rt_is_numk(__load64(__load64(v))) {
+    rt_fail(where, "Only numbers can be converted to a number, and this value is " + rt_type_name(v))
+  }
+  return rt_as_num(v)
+}
+
+# ---------------------------------------------------------------- methods and types
+fn rt_find_method(tab: int, name: int) -> int {
+  n := __load64(tab)
+  i := 0
+  while i < n {
+    e := tab + 8 + 48 * i
+    if __load64(e) == name { return e }
+    i++
+  }
+  return 0
+}
+fn rt_has_methods(v: int, d: int) -> bool {
+  names := __load64(d + 56)
+  n := __load64(names)
+  bd := __load64(v)
+  tab := __load64(bd + 56)
+  if tab == 0 { return n == 0 }
+  all := __load64(bd) == 9
+  i := 0
+  while i < n {
+    e := rt_find_method(tab, __load64(names + 8 + 8 * i))
+    if e == 0 { return false }
+    if not all and __load64(e + 32) == 0 { return false }
+    i++
+  }
+  return true
+}
+fn rt_type_is(v: int, d: int) -> bool {
+  k := __load64(d)
+  if v == 0 { return false }
+  if k == 11 { return true }
+  if k == 12 { return rt_has_methods(v, d) }
+  return __load64(v) == d
+}
+# x.(T); with ok = true it does not fail: rt_ok tells whether it succeeded
+fn rt_assert(where: str, v: int, d: int, ok: bool) -> int {
+  k := __load64(d)
+  if rt_type_is(v, d) {
+    rt_ok = true
+    if k == 11 or k == 12 { return v }
+    return __load64(v + 8)
+  }
+  rt_ok = false
+  if not ok {
+    rt_fail(where, "x.(" + rt_dname(d) + "): the stored value is " + rt_dyn_name(v) + ", not " + rt_dname(d))
+  }
+  return rt_zero(d)
+}
+# method called through an interface: the table entry of the stored type
+fn rt_method(where: str, v: int, name: str) -> int {
+  if v == 0 { rt_fail(where, "Call of method \"" + name + "\" on a nil value") }
+  bd := __load64(v)
+  tab := __load64(bd + 56)
+  if tab == 0 { rt_fail(where, "Only structs have methods, and this value is " + rt_type_name(v)) }
+  e := rt_find_method(tab, __strp(name))
+  if e == 0 {
+    sd := bd
+    if __load64(bd) == 9 { sd = __load64(bd + 16) }
+    rt_fail(where, "struct " + rt_dname(sd) + " has no method \"" + name + "\"")
+  }
+  return e
+}
+# method receiver: follows the embedded fields; by value, a copy
+fn rt_method_recv(v: int, e: int) -> int {
+  r := __load64(v + 8)
+  path := __load64(e + 16)
+  if path != 0 {
+    n := __load64(path)
+    i := 0
+    while i < n {
+      r = __load64(r + 8 * __load64(path + 8 + 8 * i))
+      i++
+    }
+  }
+  cd := __load64(e + 24)
+  if cd != 0 { r = rt_copy_val(r, cd) }
+  return r
+}
+fn rt_err_error(s: str) -> str { return s }
+# captured variable that has no cell yet (closure created before the declaration)
+fn rt_cellref(slot: int) -> int {
+  c := __load64(slot)
+  if c == 0 {
+    c = rt_cell(0)
+    __store64(slot, c)
+  }
+  return c
+}
+fn rt_nil_call(where: str) { rt_fail(where, "Call of a nil function") }
+
+# v.name where v is an any holding a struct (or a pointer to one): the field, boxed as an any
+fn rt_dyn_field(where: str, v: int, name: str) -> int {
+  if v == 0 {
+    rt_fail(where, "Only structs have fields, and this value is nil")
+    return 0
+  }
+  d := __load64(v)
+  obj := __load64(v + 8)
+  if __load64(d) == 9 && __load64(__load64(d + 16)) == 8 {
+    d = __load64(d + 16)
+    if obj == 0 { rt_fail(where, "Nil pointer: it points to nothing") }
+  }
+  if __load64(d) != 8 {
+    rt_fail(where, "Only structs have fields, and this value is " + rt_type_name(v))
+    return 0
+  }
+  n := __load64(d + 8)
+  tab := __load64(d + 40)
+  i := 0
+  while i < n {
+    if rt_streq(__pstr(__load64(tab + 24 * i)), name) {
+      fd := __load64(tab + 24 * i + 8)
+      w := __load64(obj + 8 * i)
+      k := __load64(fd)
+      if k == 11 or k == 12 or k == 13 { return w }
+      return rt_box(w, fd)
+    }
+    i++
+  }
+  rt_fail(where, "struct " + rt_dname(d) + " has no field \"" + name + "\"")
+  return 0
+}

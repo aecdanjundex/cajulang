@@ -1,0 +1,343 @@
+# caju: the command line of the Caju compiler.
+#
+#   caju build [-o output] [--target linux|windows] file.caju
+#   caju run file.caju [arguments...]      compile in memory and run (nothing written to disk)
+#   caju test [--record] [filter]          run the test suite (tests/*)
+#   caju bench [--runs=N] [--note=text] [--history] [filter]
+#   caju version
+#
+# The installation root (CAJU_ROOT, default: the directory above the one holding this program)
+# has lib/ (the standard library), rt/ (the runtime, written in Caju) and tests/ and bench/.
+
+import "std/os"
+import "std/strings"
+import "std/strconv"
+import "std/bytes"
+import "ast"
+import "project"
+import "native"
+
+const VERSION = "0.1.0"
+
+fn usage() {
+  os.stderr("usage:\n  caju build [-o output] [--target linux|windows] file.caju\n  caju run file.caju [arguments...]\n  caju test [--record] [filter]\n  caju bench [--runs=N] [--note=text] [--history] [filter]\n  caju version\n")
+  os.exit(2)
+}
+
+fn root() -> str {
+  r := os.getenv("CAJU_ROOT")
+  if r != "" { return r }
+  exe := os.executable()
+  dir := exe[0:strings.last_index(exe, "/")]
+  return dir[0:strings.last_index(dir, "/")]
+}
+
+fn die(msg: str) {
+  os.eprintln("caju: " + msg)
+  os.exit(1)
+}
+
+fn read_or_die(path: str) -> str {
+  s, err := os.read_file(path)
+  if err != nil { die(err.Error()) }
+  return s
+}
+
+# the runtime sources, in the order the code generator expects
+fn rt_sources(target: str) -> []str {
+  dir := root() + "/rt/"
+  out := []str{}
+  for _, n := range []str{"core", "gc", "values", "dynamic", "panic", target} { out = append(out, read_or_die(dir + n + ".caju")) }
+  return out
+}
+
+# compiles a program; on a compile error returns the message (as the bootstrap prints it)
+fn compile(entry: str, target: str) -> (image: *bytes.Buffer, message: str) {
+  files := []*ast.SourceFile{}
+  defer fn() {
+    r := recover()
+    if r != nil {
+      e, ok := r.(*ast.CompileError)
+      if !ok { panic(r) }
+      names := []str{}
+      for _, f := range files { names = append(names, f.name) }
+      image = nil
+      message = ast.format_error(e, names)
+    }
+  }()
+  files = project.load_project(entry, root() + "/lib")
+  image = native.compile_native(files, rt_sources(target), target)
+  return
+}
+
+fn base_name(path: str) -> str {
+  i := strings.last_index(path, "/")
+  b := path[i + 1:]
+  return strings.trim_suffix(b, ".caju")
+}
+
+fn cmd_build(args: []str) {
+  out := ""
+  target := "linux"
+  entry := ""
+  i := 0
+  while i < len(args) {
+    a := args[i]
+    if a == "-o" && i + 1 < len(args) {
+      out = args[i + 1]
+      i += 2
+      continue
+    }
+    if a == "--target" && i + 1 < len(args) {
+      target = args[i + 1]
+      i += 2
+      continue
+    }
+    if entry != "" || strings.has_prefix(a, "-") { usage() }
+    entry = a
+    i++
+  }
+  if entry == "" { usage() }
+  if target != "linux" && target != "windows" { die("unknown target \"" + target + "\" (linux or windows)") }
+  if out == "" {
+    out = base_name(entry)
+    if target == "windows" { out = out + ".exe" }
+  }
+  image, msg := compile(entry, target)
+  if image == nil {
+    os.eprintln(msg)
+    os.exit(1)
+  }
+  err := os.write_file(out, image.string(), 0o755)
+  if err != nil { die(err.Error()) }
+}
+
+fn cmd_run(args: []str) {
+  if len(args) == 0 { usage() }
+  image, msg := compile(args[0], "linux")
+  if image == nil {
+    os.eprintln(msg)
+    os.exit(1)
+  }
+  err := os.exec_bytes(base_name(args[0]), image.string(), args, os.environ())
+  die(err.Error())
+}
+
+# ---------------------------------------------------------------- tests
+
+struct Test {
+  name: str
+  entry: str
+  expect: str
+}
+
+fn list_tests(dirs: []str, filter: str) -> []*Test {
+  out := []*Test{}
+  base := root() + "/tests/"
+  for _, d := range dirs {
+    p, err := os.run([]str{"ls", "-1", base + d}, nil, false)
+    if err != nil || p.code != 0 { continue }
+    for _, f := range strings.split(strings.trim_space(p.output), "\n") {
+      if f == "" { continue }
+      path := base + d + "/" + f
+      t := &Test{}
+      if strings.has_suffix(f, ".caju") {
+        t = &Test{name: d + "/" + f[0:len(f) - 5], entry: path, expect: path[0:len(path) - 5] + ".out"}
+      } else if strings.has_suffix(f, ".out") {
+        continue
+      } else if os.exists(path + "/main.caju") {
+        t = &Test{name: d + "/" + f, entry: path + "/main.caju", expect: path + "/expected.out"}
+      } else { continue }
+      if filter == "" || strings.contains(t.name, filter) { out = append(out, t) }
+    }
+  }
+  return out
+}
+
+fn first_diff(want: str, got: str) -> str {
+  a := strings.split(want, "\n")
+  b := strings.split(got, "\n")
+  i := 0
+  while i < len(a) && i < len(b) && a[i] == b[i] { i++ }
+  w := ""
+  g := ""
+  if i < len(a) { w = a[i] }
+  if i < len(b) { g = b[i] }
+  return "(first difference at line " + str(i + 1) + ")\n  want: " + strconv.quote(w) + "\n  got : " + strconv.quote(g)
+}
+
+fn git_commit() -> str {
+  p, err := os.run([]str{"git", "-C", root(), "rev-parse", "--short", "HEAD"}, nil, false)
+  if err != nil || p.code != 0 { return "none" }
+  c := strings.trim_space(p.output)
+  q, _ := os.run([]str{"git", "-C", root(), "status", "--porcelain"}, nil, false)
+  if q != nil && strings.trim_space(q.output) != "" { c = c + "+" }
+  return c
+}
+
+fn now_iso() -> str {
+  p, err := os.run([]str{"date", "-u", "+%Y-%m-%dT%H:%M:%SZ"}, nil, false)
+  if err != nil { return "" }
+  return strings.trim_space(p.output)
+}
+
+fn json_list(xs: []str) -> str {
+  q := []str{}
+  for _, x := range xs { q = append(q, strconv.quote(x)) }
+  return "[" + strings.join(q, ",") + "]"
+}
+
+fn append_line(path: str, line: str) {
+  old, _ := os.read_file(path)
+  err := os.write_file(path, old + line + "\n", 0o644)
+  if err != nil { die(err.Error()) }
+}
+
+fn cmd_test(args: []str) {
+  record := false
+  filter := ""
+  for _, a := range args {
+    if a == "--record" { record = true } else { filter = a }
+  }
+  tmp := "/tmp/caju-test-" + str(os.getpid())
+  ok := 0
+  bad := 0
+  skip := 0
+  failures := []str{}
+  env := []str{"CAJU_SKIP_SLEEP=1", "PATH=" + os.getenv("PATH")}
+  for _, t := range list_tests([]str{"lang", "examples", "parity", "native", "std"}, filter) {
+    if !os.exists(t.expect) {
+      print("?    " + t.name + " (no expected output)")
+      skip++
+      continue
+    }
+    want := strings.trim_suffix(read_or_die(t.expect), "\n")
+    got := ""
+    image, msg := compile(t.entry, "linux")
+    if image == nil {
+      if strings.contains(msg, "not supported yet") {
+        print("skip " + t.name + ": " + msg)
+        skip++
+        continue
+      }
+      got = msg
+    } else {
+      err := os.write_file(tmp, image.string(), 0o755)
+      if err != nil { die(err.Error()) }
+      p, err2 := os.run([]str{"timeout", "30", tmp}, env, false)
+      if err2 != nil { die(err2.Error()) }
+      got = strings.trim_suffix(p.output, "\n")
+      if p.signal != 0 || p.code == 124 { got = got + "\n<killed: exit " + str(p.code) + ">" }
+    }
+    if got == want {
+      ok++
+      continue
+    }
+    bad++
+    failures = append(failures, t.name)
+    print("FAIL " + t.name + " " + first_diff(want, got))
+  }
+  os.remove(tmp)
+  print("\n" + str(ok) + " passed, " + str(bad) + " failed, " + str(skip) + " skipped")
+  if record {
+    line := "{\"date\":" + strconv.quote(now_iso()) + ",\"commit\":" + strconv.quote(git_commit())
+    line += ",\"compiler\":\"self\",\"passed\":" + str(ok) + ",\"failed\":" + str(bad) + ",\"skipped\":" + str(skip) + ",\"failures\":" + json_list(failures) + "}"
+    append_line(root() + "/tests/history.jsonl", line)
+  }
+  if bad > 0 { os.exit(1) }
+}
+
+# ---------------------------------------------------------------- benchmarks
+
+fn ms(ns: int) -> int { return (ns + 500000) / 1000000 }
+
+fn pad_left(s: str, n: int) -> str {
+  while len(s) < n { s = " " + s }
+  return s
+}
+fn pad_right(s: str, n: int) -> str {
+  while len(s) < n { s = s + " " }
+  return s
+}
+
+fn cmd_bench(args: []str) {
+  runs := 3
+  note := ""
+  filter := ""
+  for _, a := range args {
+    if strings.has_prefix(a, "--runs=") {
+      runs, _ = strconv.atoi(a[7:])
+    } else if strings.has_prefix(a, "--note=") {
+      note = a[7:]
+    } else if a == "--history" {
+      p, err := os.run([]str{"cat", root() + "/bench/history.jsonl"}, nil, false)
+      if err == nil { os.stdout(p.output) }
+      return
+    } else { filter = a }
+  }
+  dir := root() + "/bench/programs/"
+  p, err := os.run([]str{"ls", "-1", dir}, nil, false)
+  if err != nil { die(err.Error()) }
+  tmp := "/tmp/caju-bench-" + str(os.getpid())
+  entries := []str{}
+  bad := 0
+  print("benchmark          compile ms   size KB    run ms   memory MB")
+  for _, f := range strings.split(strings.trim_space(p.output), "\n") {
+    if !strings.has_suffix(f, ".caju") || (filter != "" && !strings.contains(f, filter)) { continue }
+    name := f[0:len(f) - 5]
+    t0 := os.nanotime()
+    image, msg := compile(dir + f, "linux")
+    compile_ns := os.nanotime() - t0
+    if image == nil {
+      print(pad_right(name, 18) + " " + msg)
+      bad++
+      continue
+    }
+    os.write_file(tmp, image.string(), 0o755)
+    best := -1
+    rss := 0
+    out := ""
+    for i := 0; i < runs; i++ {
+      t1 := os.nanotime()
+      r, err2 := os.run([]str{"/usr/bin/time", "-f", "%M", "-o", tmp + ".mem", tmp}, nil, false)
+      dt := os.nanotime() - t1
+      if err2 != nil { die(err2.Error()) }
+      if best < 0 || dt < best { best = dt }
+      m, _ := os.read_file(tmp + ".mem")
+      kb, _ := strconv.atoi(strings.trim_space(m))
+      if kb > rss { rss = kb }
+      out = r.output
+    }
+    expect, e3 := os.read_file(dir + name + ".out")
+    flag := ""
+    if e3 == nil && expect != out {
+      flag = "WRONG OUTPUT"
+      bad++
+    }
+    print(pad_right(name, 18) + " " + pad_left(str(ms(compile_ns)), 10) + " " + pad_left(str(image.len() / 1024), 9) + " " + pad_left(str(ms(best)), 9) + " " + pad_left(strconv.format_float(num(rss * 10 / 1024) / 10.0), 11) + "   " + flag)
+    entries = append(entries, strconv.quote(name) + ":{\"compile_ms\":" + str(ms(compile_ns)) + ",\"size\":" + str(image.len()) + ",\"run_ms\":" + str(ms(best)) + ",\"rss_kb\":" + str(rss) + "}")
+  }
+  os.remove(tmp)
+  os.remove(tmp + ".mem")
+  if filter == "" {
+    append_line(root() + "/bench/history.jsonl", "{\"date\":" + strconv.quote(now_iso()) + ",\"commit\":" + strconv.quote(git_commit()) + ",\"compiler\":\"self\",\"note\":" + strconv.quote(note) + ",\"results\":{" + strings.join(entries, ",") + "}}")
+    print("\nsaved to bench/history.jsonl")
+  }
+  if bad > 0 { os.exit(1) }
+}
+
+let argv = os.args()
+if len(argv) < 2 { usage() }
+cmd := argv[1]
+rest := argv[2:]
+if cmd == "build" {
+  cmd_build(rest)
+} else if cmd == "run" {
+  cmd_run(rest)
+} else if cmd == "test" {
+  cmd_test(rest)
+} else if cmd == "bench" {
+  cmd_bench(rest)
+} else if cmd == "version" || cmd == "--version" {
+  print("caju " + VERSION)
+} else { usage() }

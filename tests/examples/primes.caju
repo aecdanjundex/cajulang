@@ -1,0 +1,9 @@
+for n = 2 to 50 {
+  let prime = true
+  let d = 2
+  while d * d <= n and prime {
+    if n % d == 0 { prime = false }
+    d = d + 1
+  }
+  if prime { print(n, "is prime") }
+}

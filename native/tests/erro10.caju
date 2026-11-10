@@ -1,3 +1,0 @@
-let x: any = "texto"
-n := x.(int)
-print(n)

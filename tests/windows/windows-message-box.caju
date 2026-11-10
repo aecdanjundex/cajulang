@@ -1,0 +1,15 @@
+# extern describes a function from a Windows DLL.
+# In the .exe the box is the real one; on the page, an imitation.
+extern "user32.dll" fn MessageBoxW(window: ptr, text: wstr, title: wstr, kind: u32) -> i32
+
+const MB_YESNO = 4
+const MB_ICONQUESTION = 32
+const IDYES = 6
+
+let answer = MessageBoxW(0, "Do you like cashew fruit?", "Important question", MB_YESNO + MB_ICONQUESTION)
+if answer == IDYES {
+  MessageBoxW(0, "Great choice!", "Caju", 64)
+} else {
+  MessageBoxW(0, "Too bad. Try the juice.", "Caju", 48)
+}
+print("Answer:", answer)

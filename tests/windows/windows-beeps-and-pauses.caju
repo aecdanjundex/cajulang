@@ -1,0 +1,13 @@
+# Beep and Sleep come from kernel32.dll. On the page, the sound comes out of the browser.
+extern "kernel32.dll" fn Beep(frequency: u32, duration: u32) -> bool
+extern "kernel32.dll" fn Sleep(milliseconds: u32)
+
+fn note(hz, ms) {
+  Beep(hz, ms)
+  Sleep(30)
+}
+
+# the first notes of "Asa Branca"
+note(392, 250); note(440, 250); note(494, 400); note(587, 400)
+note(587, 400); note(494, 250); note(523, 250); note(523, 500)
+print("End of the song")

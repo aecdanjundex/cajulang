@@ -1,0 +1,4 @@
+rectangle with area 12
+circle with area 12.56636
+triangle with area 15
+the largest is: circle = Circle{radius: 2}

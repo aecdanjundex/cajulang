@@ -1,0 +1,4 @@
+# The DLL exports the functions marked with dllexport in any
+# file of the project. The top-level code runs on the first call.
+import { PI } from "geometry.caju"
+print("geometry ready, PI =", PI)

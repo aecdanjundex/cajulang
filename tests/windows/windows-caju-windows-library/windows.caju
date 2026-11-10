@@ -1,0 +1,20 @@
+extern "user32.dll" fn MessageBoxW(window: ptr, text: wstr, title: wstr, kind: u32) -> i32
+extern "kernel32.dll" fn Beep(frequency: u32, duration: u32) -> bool
+extern "kernel32.dll" fn Sleep(ms: u32)
+
+const TITLE = "Caju Program"
+
+export fn notify(text) {
+  MessageBoxW(0, text, TITLE, 64)
+}
+
+export fn ask(text) {
+  return MessageBoxW(0, text, TITLE, 4 + 32) == 6
+}
+
+export fn beep(times) {
+  for i = 1 to times {
+    Beep(880, 150)
+    Sleep(120)
+  }
+}

@@ -1,0 +1,8 @@
+# This file also imports from config.caju.
+# The optimizer computes DISCOUNT_FACTOR before running,
+# even with the value coming from another file.
+import { DISCOUNT_PERCENT } from "config.caju"
+
+export const MOZZARELLA = 39.9
+export const PEPPERONI = 44.9
+export const DISCOUNT_FACTOR = 1 - DISCOUNT_PERCENT / 100

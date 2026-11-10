@@ -1,0 +1,2 @@
+fn descend(n) { return descend(n + 1) }
+print(descend(0))

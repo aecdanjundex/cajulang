@@ -1,0 +1,360 @@
+# The lexer: source text -> tokens. Port of bootstrap/lexer.js.
+#
+# The JavaScript lexer walks the source as UTF-16 units; this one walks UTF-8 bytes and counts
+# columns like JavaScript does (one per code point, two for code points above U+FFFF).
+
+import "std/strings"
+import "std/strconv"
+import "ast"
+
+# type: "NAME", "KEYWORD", "NUMBER", "STRING", "RUNE", "OP", "NEWLINE", "EOF".
+# RUNE tokens carry the code point in rune_value (value is ""); NUMBER tokens keep the text the
+# JavaScript lexer produces (0x/0b/0o literals already converted to decimal digits).
+export struct Token {
+  type: str
+  value: str
+  rune_value: int
+  line: int
+  col: int
+}
+
+export let KEYWORDS = map[str]bool{"let": true, "const": true, "if": true, "else": true, "while": true, "for": true, "to": true,
+  "and": true, "or": true, "not": true, "true": true, "false": true, "import": true, "from": true, "export": true,
+  "fn": true, "return": true, "extern": true, "dllexport": true, "struct": true, "interface": true, "nil": true,
+  "switch": true, "case": true, "default": true, "break": true, "continue": true, "fallthrough": true,
+  "defer": true, "go": true, "select": true, "chan": true, "map": true, "range": true}
+
+let OPS3 = map[str]bool{"...": true, "<<=": true, ">>=": true, "&^=": true}
+let OPS2 = map[str]bool{"==": true, "!=": true, "<=": true, ">=": true, "->": true, ":=": true, "++": true, "--": true,
+  "+=": true, "-=": true, "*=": true, "/=": true, "%=": true, "&=": true, "|=": true, "^=": true, "<<": true, ">>": true,
+  "&^": true, "<-": true, "**": true, "&&": true, "||": true}
+let OPS1 = "+-*/%^()=,<>{}:.[]&|!"
+
+struct Lexer {
+  src: str
+  i: int
+  line: int
+  col: int
+  toks: []*Token
+}
+
+# the byte at i, or -1 past the end
+fn (lx: *Lexer) at(i: int) -> int {
+  if i < 0 || i >= len(lx.src) { return -1 }
+  return int(lx.src[i])
+}
+
+# consumes one byte; the column advances once per UTF-16 unit of the code point
+fn (lx: *Lexer) adv() -> int {
+  c := int(lx.src[lx.i])
+  lx.i++
+  if c == 10 {
+    lx.line++
+    lx.col = 1
+  } else if (c & 0xC0) != 0x80 {
+    lx.col++
+    if c >= 0xF0 { lx.col++ }
+  }
+  return c
+}
+
+# bytes of the UTF-8 sequence that starts with c
+fn seq_len(c: int) -> int {
+  if c < 0x80 { return 1 }
+  if c >= 0xF0 { return 4 }
+  if c >= 0xE0 { return 3 }
+  if c >= 0xC0 { return 2 }
+  return 1
+}
+
+# consumes a whole code point
+fn (lx: *Lexer) adv_cp() {
+  n := seq_len(int(lx.src[lx.i]))
+  for k := 0; k < n && lx.i < len(lx.src); k++ { lx.adv() }
+}
+
+# the code point that starts at i
+fn (lx: *Lexer) code_point(i: int) -> int {
+  c := lx.at(i)
+  n := seq_len(c)
+  if n == 1 { return c }
+  cp := c & (0x7F >> n)
+  for k := 1; k < n; k++ {
+    b := lx.at(i + k)
+    if b < 0 { return cp }
+    cp = (cp << 6) | (b & 0x3F)
+  }
+  return cp
+}
+
+# the text of the JavaScript UTF-16 unit at i (a high surrogate prints as U+FFFD)
+fn (lx: *Lexer) unit_text(i: int) -> str {
+  n := seq_len(lx.at(i))
+  if n == 4 { return "�" }
+  e := i + n
+  if e > len(lx.src) { e = len(lx.src) }
+  return lx.src[i:e]
+}
+
+fn is_digit(c: int) -> bool { return c >= 48 && c <= 57 }
+fn is_hex(c: int) -> bool { return is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) }
+fn is_letter(c: int) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 }
+
+# /[A-Za-z_À-ÿ]/ on the UTF-16 unit at i: 0 if not, else its length in bytes
+fn (lx: *Lexer) ident_start(i: int) -> int {
+  c := lx.at(i)
+  if is_letter(c) { return 1 }
+  if c == 0xC3 {
+    d := lx.at(i + 1)
+    if d >= 0x80 && d <= 0xBF { return 2 }
+  }
+  return 0
+}
+fn (lx: *Lexer) ident_part(i: int) -> int {
+  if is_digit(lx.at(i)) { return 1 }
+  return lx.ident_start(i)
+}
+
+# /\s/ on the code point at i (JavaScript white space and line terminators)
+fn (lx: *Lexer) is_space(i: int) -> bool {
+  c := lx.at(i)
+  if c == 32 || (c >= 9 && c <= 13) { return true }
+  if c < 0x80 { return false }
+  cp := lx.code_point(i)
+  return cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000 || cp == 0xFEFF
+}
+
+fn (lx: *Lexer) push(type: str, value: str, line: int, col: int) {
+  lx.toks = append(lx.toks, &Token{type: type, value: value, line: line, col: col})
+}
+
+fn strip_underscores(s: str) -> str {
+  if strings.index_byte(s, 95) < 0 { return s }
+  return strings.replace_all(s, "_", "")
+}
+
+# digits in base 2, 8 or 16 -> decimal text (any size, like BigInt)
+fn to_decimal(digits: str, base: int) -> str {
+  dec := []int{}           # little-endian decimal digits
+  for i := 0; i < len(digits); i++ {
+    c := int(digits[i])
+    d := 0
+    if is_digit(c) { d = c - 48 } else if c >= 97 { d = c - 87 } else { d = c - 55 }
+    carry := d
+    for k := 0; k < len(dec); k++ {
+      v := dec[k] * base + carry
+      dec[k] = v % 10
+      carry = v / 10
+    }
+    while carry > 0 {
+      dec = append(dec, carry % 10)
+      carry = carry / 10
+    }
+  }
+  n := len(dec)
+  while n > 0 && dec[n - 1] == 0 { n-- }
+  if n == 0 { return "0" }
+  b := strings.Builder{}
+  for k := n - 1; k >= 0; k-- { b.write_byte(48 + dec[k]) }
+  return b.string()
+}
+
+# the escape after a backslash in a string or rune: \n \t \" \\ \x41 é \U0001F600
+fn (lx: *Lexer) escape(l: int, k: int) -> int {
+  lx.adv()
+  e := lx.at(lx.i)
+  if e == 110 { lx.adv(); return 10 }
+  if e == 116 { lx.adv(); return 9 }
+  if e == 114 { lx.adv(); return 13 }
+  if e == 92 || e == 34 || e == 39 { lx.adv(); return e }
+  if e == 48 { lx.adv(); return 0 }
+  hex := 0
+  if e == 120 { hex = 2 } else if e == 117 { hex = 4 } else if e == 85 { hex = 8 }
+  if hex > 0 {
+    lx.adv()
+    ok := lx.i + hex <= len(lx.src)
+    cp := 0
+    for q := 0; q < hex && ok; q++ {
+      c := lx.at(lx.i + q)
+      if !is_hex(c) { ok = false } else {
+        d := 0
+        if is_digit(c) { d = c - 48 } else if c >= 97 { d = c - 87 } else { d = c - 55 }
+        cp = cp * 16 + d
+      }
+    }
+    if !ok { ast.fail("lexical", "Escape \\" + strings.from_byte(e) + " needs " + str(hex) + " hex digits", l, k) }
+    for q := 0; q < hex; q++ { lx.adv() }
+    return cp
+  }
+  what := "undefined"
+  if e >= 0 { what = lx.unit_text(lx.i) }
+  ast.fail("lexical", "Unknown escape \"\\" + what + "\"", l, k)
+  return 0
+}
+
+fn (lx: *Lexer) number(l: int, k: int) {
+  src := lx.src
+  c := lx.at(lx.i)
+  start := lx.i
+  if c == 48 {
+    x := lx.at(lx.i + 1)
+    if x == 120 || x == 88 || x == 98 || x == 66 || x == 111 || x == 79 {
+      lx.adv()
+      lx.adv()
+      while lx.i < len(src) && (is_hex(lx.at(lx.i)) || lx.at(lx.i) == 95) { lx.adv() }
+      s := src[start:lx.i]
+      clean := strip_underscores(s)
+      b := int(clean[1]) | 32
+      base := 16
+      if b == 98 { base = 2 } else if b == 111 { base = 8 }
+      digits := clean[2:]
+      bad := len(digits) == 0
+      for q := 0; q < len(digits); q++ {
+        d := int(digits[q])
+        if base == 2 && d != 48 && d != 49 { bad = true }
+        if base == 8 && (d < 48 || d > 55) { bad = true }
+      }
+      if bad { ast.fail("lexical", "Invalid number \"" + s + "\"", l, k) }
+      lx.push("NUMBER", to_decimal(digits, base), l, k)
+      return
+    }
+  }
+  while lx.i < len(src) && (is_digit(lx.at(lx.i)) || lx.at(lx.i) == 46 || lx.at(lx.i) == 95) {
+    if lx.at(lx.i) == 46 && lx.at(lx.i + 1) == 46 { break }
+    lx.adv()
+  }
+  e := lx.at(lx.i)
+  f := lx.at(lx.i + 1)
+  exp_digits := true
+  if (e == 101 || e == 69) && (is_digit(f) || f == 43 || f == 45) {
+    lx.adv()
+    if lx.at(lx.i) == 43 || lx.at(lx.i) == 45 { lx.adv() }
+    exp_digits = false
+    while lx.i < len(src) && (is_digit(lx.at(lx.i)) || lx.at(lx.i) == 95) {
+      if lx.at(lx.i) != 95 { exp_digits = true }
+      lx.adv()
+    }
+  }
+  s := src[start:lx.i]
+  clean := strip_underscores(s)
+  dots := 0
+  for q := 0; q < len(clean); q++ { if clean[q] == 46 { dots++ } }
+  bad := dots > 1 || !exp_digits
+  if !bad {
+    v, err := strconv.parse_float(clean)
+    if err != nil || v > 1.7976931348623157e308 { bad = true }
+  }
+  if bad { ast.fail("lexical", "Invalid number \"" + s + "\"", l, k) }
+  lx.push("NUMBER", clean, l, k)
+}
+
+export fn lex(src: str, file_index: int) -> []*Token {
+  lx := &Lexer{src: src, i: 0, line: file_index * ast.LOC_BASE + 1, col: 1, toks: []*Token{}}
+  n := len(src)
+  while lx.i < n {
+    c := int(src[lx.i])
+    if c == 35 || (c == 47 && lx.at(lx.i + 1) == 47) {
+      # up to the end of the line; no line break inside, so only the column moves
+      for lx.i < n && src[lx.i] != 10 {
+        d := int(src[lx.i])
+        if (d & 0xC0) != 0x80 {
+          lx.col++
+          if d >= 0xF0 { lx.col++ }
+        }
+        lx.i++
+      }
+      continue
+    }
+    if c == 10 || c == 59 {
+      l := lx.line
+      k := lx.col
+      lx.adv()
+      last := len(lx.toks) > 0 && lx.toks[len(lx.toks) - 1].type != "NEWLINE"
+      if c == 59 { lx.push("NEWLINE", ";", l, k) } else if last { lx.push("NEWLINE", "↵", l, k) }
+      continue
+    }
+    if lx.is_space(lx.i) {
+      lx.adv_cp()
+      continue
+    }
+    l := lx.line
+    k := lx.col
+    if is_digit(c) || (c == 46 && is_digit(lx.at(lx.i + 1))) {
+      lx.number(l, k)
+      continue
+    }
+    if lx.ident_start(lx.i) > 0 {
+      start := lx.i
+      for lx.i < n {
+        d := int(src[lx.i])
+        if is_letter(d) || is_digit(d) { lx.i++ } else if d == 0xC3 && lx.i + 1 < n && int(src[lx.i + 1]) >= 0x80 && int(src[lx.i + 1]) <= 0xBF { lx.i += 2 } else { break }
+        lx.col++
+      }
+      s := src[start:lx.i]
+      if KEYWORDS[s] { lx.push("KEYWORD", s, l, k) } else { lx.push("NAME", s, l, k) }
+      continue
+    }
+    if c == 34 {
+      lx.adv()
+      b := strings.Builder{}
+      while lx.i < n && src[lx.i] != 34 {
+        if src[lx.i] == 10 { ast.fail("lexical", "String is missing its closing quote", l, k) }
+        if src[lx.i] == 92 {
+          b.write_rune(lx.escape(l, k))
+          continue
+        }
+        b.write_byte(lx.adv())
+      }
+      if lx.i >= n { ast.fail("lexical", "String is missing its closing quote", l, k) }
+      lx.adv()
+      lx.push("STRING", b.string(), l, k)
+      continue
+    }
+    if c == 96 {
+      lx.adv()
+      b := strings.Builder{}
+      while lx.i < n && src[lx.i] != 96 {
+        d := lx.adv()
+        if d != 13 { b.write_byte(d) }
+      }
+      if lx.i >= n { ast.fail("lexical", "Raw string is missing its closing backtick", l, k) }
+      lx.adv()
+      lx.push("STRING", b.string(), l, k)
+      continue
+    }
+    if c == 39 {
+      lx.adv()
+      ch := 0
+      if lx.at(lx.i) == 92 { ch = lx.escape(l, k) } else {
+        if lx.i >= n { ast.fail("lexical", "A rune is a single character in single quotes, like 'a'", l, k) }
+        ch = lx.code_point(lx.i)
+        lx.adv_cp()
+      }
+      if lx.at(lx.i) != 39 { ast.fail("lexical", "A rune is a single character in single quotes, like 'a'", l, k) }
+      lx.adv()
+      lx.toks = append(lx.toks, &Token{type: "RUNE", value: "", rune_value: ch, line: l, col: k})
+      continue
+    }
+    if lx.i + 3 <= n && OPS3[src[lx.i:lx.i + 3]] {
+      lx.push("OP", src[lx.i:lx.i + 3], l, k)
+      lx.adv()
+      lx.adv()
+      lx.adv()
+      continue
+    }
+    if lx.i + 2 <= n && OPS2[src[lx.i:lx.i + 2]] {
+      lx.push("OP", src[lx.i:lx.i + 2], l, k)
+      lx.adv()
+      lx.adv()
+      continue
+    }
+    if strings.index_byte(OPS1, c) >= 0 {
+      lx.adv()
+      lx.push("OP", strings.from_byte(c), l, k)
+      continue
+    }
+    ast.fail("lexical", "Unexpected character \"" + lx.unit_text(lx.i) + "\"", l, k)
+  }
+  lx.push("EOF", "∎", lx.line, lx.col)
+  return lx.toks
+}

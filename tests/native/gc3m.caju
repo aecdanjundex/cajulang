@@ -1,0 +1,28 @@
+# 3 million objects: only a few stay alive at the same time
+struct Node { v: int, name: str, next: *Node }
+let list: *Node = nil
+total := 0
+for i := 0; i < 3000000; i++ {
+  list = &Node{v: i, name: "n" + str(i % 100), next: list}
+  if i % 10000 == 9999 {
+    for p := list; p != nil; p = p.next { total += p.v % 7 }
+    list = nil
+  }
+}
+print(total)
+# maps and slices that grow and vanish
+sum := 0
+for r := 0; r < 200; r++ {
+  m := map[int][]int{}
+  for k := 0; k < 500; k++ { m[k] = append(m[k], k, r) }
+  sum += len(m) + m[499][1]
+}
+print(sum)
+# a structure that stays alive the whole time, checked at the end
+pinned := []*Node{}
+for i := 0; i < 1000; i++ { pinned = append(pinned, &Node{v: i, name: "pinned"}) }
+let garbage: *Node = nil
+for i := 0; i < 1000000; i++ { garbage = &Node{v: i} }
+ok := true
+for i, n := range pinned { if n.v != i or n.name != "pinned" { ok = false } }
+print(ok)

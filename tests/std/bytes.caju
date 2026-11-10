@@ -1,0 +1,13 @@
+import "std/bytes"
+b := bytes.new_buffer(0)
+for i := 0; i < 300; i++ { b.byte(i) }
+b.u32(0xDEADBEEF)
+b.u64(-2)
+b.write("caju")
+print(b.len(), b.get(255), b.get(256), b.get_u32(300), b.get_u64(304))
+b.set_u32(0, 0x01020304)
+print(b.get(0), b.get(3), b.slice(312, 316))
+c := bytes.new_buffer(4)
+c.write("xy")
+c.append(b)
+print(c.len(), c.slice(0, 2), len(c.string()))

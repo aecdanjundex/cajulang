@@ -1,0 +1,49 @@
+# structs and floating point: a small n-body simulation
+struct Body { x: num, y: num, z: num, vx: num, vy: num, vz: num, m: num }
+bodies := []*Body{
+  &Body{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 39.47841760435743},
+  &Body{4.84, -1.16, -0.10, 0.606, 2.81, -0.02, 0.037},
+  &Body{8.34, 4.12, -0.40, -1.01, 1.82, 0.008, 0.011},
+  &Body{12.89, -15.11, -0.22, 1.08, 0.868, -0.01, 0.0017},
+  &Body{15.37, -25.91, 0.179, 0.979, 0.594, -0.034, 0.002},
+}
+fn energy(bs: []*Body) -> num {
+  e := 0.0
+  for i, b := range bs {
+    e += 0.5 * b.m * (b.vx * b.vx + b.vy * b.vy + b.vz * b.vz)
+    for j := i + 1; j < len(bs); j++ {
+      c := bs[j]
+      dx := b.x - c.x
+      dy := b.y - c.y
+      dz := b.z - c.z
+      e -= b.m * c.m / (dx * dx + dy * dy + dz * dz) ** 0.5
+    }
+  }
+  return e
+}
+print(energy(bodies))
+for step := 0; step < 200000; step++ {
+  for i := 0; i < len(bodies); i++ {
+    b := bodies[i]
+    for j := i + 1; j < len(bodies); j++ {
+      c := bodies[j]
+      dx := b.x - c.x
+      dy := b.y - c.y
+      dz := b.z - c.z
+      d2 := dx * dx + dy * dy + dz * dz
+      mag := 0.01 / (d2 * d2 ** 0.5)
+      b.vx -= dx * c.m * mag
+      b.vy -= dy * c.m * mag
+      b.vz -= dz * c.m * mag
+      c.vx += dx * b.m * mag
+      c.vy += dy * b.m * mag
+      c.vz += dz * b.m * mag
+    }
+  }
+  for _, b := range bodies {
+    b.x += 0.01 * b.vx
+    b.y += 0.01 * b.vy
+    b.z += 0.01 * b.vz
+  }
+}
+print(energy(bodies))

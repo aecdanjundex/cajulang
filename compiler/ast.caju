@@ -1,0 +1,191 @@
+# The syntax tree shared by every stage of the compiler.
+#
+# This compiler is a port of the bootstrap compiler (bootstrap/*.js). A JavaScript node is an
+# object with free-form properties; here every node is the same struct, Node, with one field per
+# property. Field names are the JavaScript property names in snake_case. JavaScript null or
+# undefined becomes the zero value ("" for strings, nil for nodes and slices, false), except for
+# the optional integer annotations, which use NONE (see new_node).
+#
+# Properties whose JavaScript value has different types in different nodes are split:
+#   value   Number -> num_value (num), String -> str_value (str), Bool -> bool_value (bool),
+#           anything else (Assign, Return, Send, OpAssign, FieldAssign, fields, elems) -> value (*Node)
+#   body    an array of statements (Program, Module, Block, switch/select cases) -> stmts
+#           a node (Func, ForC, ForTo, While, Range) -> body
+#   decl    Assign: "let", "const", ":=", "=" -> decl (str); Range and select "recv": true -> define
+#   path    Import: the file -> path; Field/MethodCall/FieldAssign: embedded-field path -> field_path
+#   target  OpAssign: a node -> target; MethodCall: a type name -> target_name
+#   names   VarDecl: []str -> names; Import: [{name, line, col}] -> import_names (kind "ImportName")
+#   params  Func: []str -> params; Extern: [{name, type}] -> params and ptypes
+#   dll     Func (dllexport): {name, ret, types} -> dll_name, dll_ret, dll_types; Extern: the DLL -> dll
+#
+# Plain objects that are not nodes in JavaScript are nodes here, with a kind of their own:
+#   Switch/TypeSwitch case {exprs, types, body, bindType}  -> kind "Case" (is_default when both
+#                                                             exprs and types are null)
+#   struct field declaration {name, type, embedded}         -> kind "FieldDef"
+#   struct literal field {name, value}                      -> kind "FieldInit"
+#   resolved struct field {name, value} (sfields)           -> kind "SField"
+#   composite element {key, value}                          -> kind "Elem"
+#   interface method {name, params, ptypes, rtype}          -> kind "MethodSig"
+#   embedded interface {name}                               -> kind "Embed"
+#   method receiver {name, type, ptr}                       -> kind "Receiver"
+#   import name {name}                                      -> kind "ImportName"
+# Select cases keep their JavaScript kinds ("recv", "send", "default").
+#
+# Sets become map[str]bool (insertion order is kept, like JavaScript's Set).
+# Properties named like a Caju keyword get a trailing underscore: fn -> fn_, from -> from_, to -> to_.
+
+export const NONE = -1        # an absent optional integer annotation (JavaScript undefined)
+
+export struct Node {
+  kind: str
+  line: int                   # file * LOC_BASE + line
+  col: int
+  end_line: int
+
+  # ---- set by the parser and the linker
+  name: str
+  op: str
+  num_value: num
+  str_value: str
+  bool_value: bool
+  raw: str                    # integer literals: the exact digits
+  int: bool                   # number literal without a fraction or exponent
+  rune: bool
+  value: *Node
+  left: *Node
+  right: *Node
+  arg: *Node
+  expr: *Node
+  obj: *Node
+  index: *Node
+  lo: *Node
+  hi: *Node
+  key: *Node
+  ch: *Node
+  call: *Node
+  fn_: *Node                  # FuncLit: the Func; CallValue: the called expression
+  cond: *Node
+  init: *Node
+  post: *Node
+  then: *Node
+  otherwise: *Node
+  tag: *Node
+  subject: *Node
+  from_: *Node
+  to_: *Node
+  body: *Node
+  target: *Node
+  recv: *Node                 # Func: the method receiver (kind "Receiver")
+  stmts: []*Node
+  args: []*Node
+  args_spread: bool           # f(xs...)
+  values: []*Node
+  targets: []*Node
+  exprs: []*Node
+  cases: []*Node
+  elems: []*Node
+  fields: []*Node
+  methods: []*Node
+  embeds: []*Node
+  vars: []*Node
+  import_names: []*Node
+  is_default: bool
+  decl: str
+  define: bool
+  type: str                   # a type as canonical text: "int", "[]str", "map[str]int", "fn(int) -> str"
+  type_arg: str               # make(T, ...) / new(T)
+  types: []str
+  names: []str
+  params: []str
+  ptypes: []str               # "" for a parameter without a type
+  rtype: str                  # "" when the function has no "->"
+  rnames: []str
+  method: str
+  ptr: bool                   # Receiver: *T
+  embedded: bool              # FieldDef
+  exported: bool
+  label: str
+  bind: str
+  path: str
+  ns: str
+  symbol: str
+  dll: str
+  conv: str
+  ret: str
+  dll_name: str
+  dll_ret: str
+  dll_types: []str
+  comma_ok: bool
+  privileged: bool            # a call inside a std/ module: may use the low-level operations
+
+  # ---- annotations of the type checker and the checks (read by the code generator)
+  ty: str
+  ik: int                     # NONE when absent
+  fk: int
+  nk: int
+  call_kind: str
+  conv_mode: str
+  conv_to: str
+  box_t: str
+  append_t: str
+  bind_type: str
+  bound_method: str
+  stype: str
+  sfields: []*Node
+  field_path: []str
+  target_name: str
+  fty: str
+  rk: str
+  ret_ty: str
+  captures: []str
+  celled: map[str]bool
+  field_call: bool
+  recv_ptr: bool
+  recv_is_ptr: bool
+  fn_ref: bool
+  named: bool
+  nres: int
+  discard: int
+  unpack: int
+}
+
+# every node is created here, so the optional integers start as NONE
+export fn new_node(kind: str, line: int, col: int) -> *Node {
+  return &Node{kind: kind, line: line, col: col, ik: NONE, fk: NONE, nk: NONE, nres: NONE, discard: NONE, unpack: NONE}
+}
+
+# ---- source positions: file index * LOC_BASE + line, so the main file's lines are themselves
+export const LOC_BASE = 100000
+export fn loc_file(loc: int) -> int { return loc / LOC_BASE }
+export fn loc_line(loc: int) -> int { return loc % LOC_BASE }
+
+# ---- errors: every stage reports by panicking with a *CompileError; the driver recovers it
+export struct CompileError {
+  stage: str                  # "lexical", "syntax", "type", "link", "compile"
+  msg: str
+  line: int
+  col: int
+}
+export fn fail(stage: str, msg: str, line: int, col: int) {
+  panic(&CompileError{stage: stage, msg: msg, line: line, col: col})
+}
+# "Type error in main.caju, line 3: message."
+export fn format_error(e: *CompileError, files: []str) -> str {
+  f := loc_file(e.line)
+  name := "main.caju"
+  if f >= 0 && f < len(files) { name = files[f] } else if len(files) > 0 { name = files[0] }
+  stage := e.stage
+  if len(stage) > 0 { stage = upper_first(stage) }
+  return stage + " error in " + name + ", line " + str(loc_line(e.line)) + ": " + e.msg + "."
+}
+fn upper_first(s: str) -> str {
+  c := int(s[0])
+  if c >= 97 && c <= 122 { return string(rune(c - 32)) + s[1:] }
+  return s
+}
+
+# a source file of the project
+export struct SourceFile {
+  name: str
+  src: str
+}

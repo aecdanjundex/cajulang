@@ -1,0 +1,42 @@
+# An interface lists methods. Every struct that has those methods
+# satisfies the interface, without declaring anything: as in Go.
+interface Shape {
+  area() -> num
+  name() -> str
+}
+
+struct Rectangle { width: num, height: num }
+struct Circle { radius: num }
+struct Triangle { base: num, height: num }
+
+fn (r: Rectangle) area() -> num { return r.width * r.height }
+fn (r: Rectangle) name() -> str { return "rectangle" }
+
+fn (c: Circle) area() -> num { return 3.14159 * c.radius ** 2 }
+fn (c: Circle) name() -> str { return "circle" }
+
+fn (t: Triangle) area() -> num { return t.base * t.height / 2 }
+fn (t: Triangle) name() -> str { return "triangle" }
+
+fn describe(f: Shape) {
+  print(f.name(), "with area", f.area())
+}
+
+fn largest(a: Shape, b: Shape) -> Shape {
+  if a.area() >= b.area() { return a }
+  return b
+}
+
+let r = Rectangle{width: 3, height: 4}
+let c = Circle{radius: 2}
+describe(r)
+describe(c)
+describe(Triangle{base: 6, height: 5})
+
+# the right method is chosen at run time, by the type stored in the interface
+let m = largest(r, c)
+print("the largest is:", m.name(), "=", m)
+
+# Remove the # from the two lines to see the type error: area() and name() are missing
+# struct Point { x: num }
+# describe(Point{x: 1})

@@ -1,0 +1,354 @@
+# The linker: joins the project's files into a single program. Port of bootstrap/linker.js.
+# Each file is parsed separately. The linker follows the imports starting from the entry, checks
+# what each file exports, renames each module's names so they don't collide (x in util.caju
+# becomes x@util.caju) and puts the modules in order: an imported module comes before the module
+# that imports it.
+
+import "std/strings"
+import "ast"
+import "lexer"
+import "parser"
+
+struct Mod {
+  name: str
+  tree: *ast.Node
+  exports: map[str]*ast.Node
+  callables: map[str]bool
+  declared: map[str]bool
+}
+
+struct Linker {
+  files: []*ast.SourceFile
+  entry: str
+  index: map[str]int
+  mods: map[str]*Mod
+  order: []str
+  visiting: []str
+}
+
+fn link_err(msg: str, at: *ast.Node) { ast.fail("link", msg, at.line, at.col) }
+
+# names declared in a file (at any depth of its statements, not inside expressions)
+fn declared_in(tree: *ast.Node) -> map[str]bool {
+  names := map[str]bool{}
+  walk_declared(tree, names)
+  return names
+}
+fn walk_declared(n: *ast.Node, names: map[str]bool) {
+  if n == nil { return }
+  if (n.kind == "Assign" && n.decl != "") || n.kind == "ForTo" || n.kind == "Extern" || n.kind == "Struct" || n.kind == "Interface" { names[n.name] = true }
+  if n.kind == "Func" && n.recv == nil { names[n.name] = true }
+  if n.kind == "Func" { for _, p := range n.params { names[p] = true } }
+  if n.kind == "VarDecl" { for _, p := range n.names { names[p] = true } }
+  # the JavaScript walks body, then, otherwise, init and cases
+  for _, s := range n.stmts { walk_declared(s, names) }
+  walk_declared(n.body, names)
+  walk_declared(n.then, names)
+  walk_declared(n.otherwise, names)
+  walk_declared(n.init, names)
+  for _, c := range n.cases { walk_declared(c, names) }
+}
+
+fn (l: *Linker) load(name: str, from_: *ast.Node) {
+  if _, ok := l.mods[name]; ok { return }
+  for i, v := range l.visiting {
+    if v == name {
+      cycle := []str{}
+      for k := i; k < len(l.visiting); k++ { cycle = append(cycle, l.visiting[k]) }
+      cycle = append(cycle, name)
+      link_err("Circular import: " + strings.join(cycle, " → "), from_)
+    }
+  }
+  idx := l.index[name]
+  tree := parser.parse(lexer.lex(l.files[idx].src, idx))
+  l.visiting = append(l.visiting, name)
+  for _, st := range tree.stmts {
+    if st.kind != "Import" { continue }
+    if st.path == name { link_err("A file cannot import itself", st) }
+    if _, ok := l.index[st.path]; !ok { link_err("File \"" + st.path + "\" does not exist in the project", st) }
+    if st.path == l.entry { link_err(l.entry + " is the project's entry point and cannot be imported", st) }
+    l.load(st.path, st)
+  }
+  l.visiting = l.visiting[0:len(l.visiting) - 1]
+  m := &Mod{name: name, tree: tree, exports: map[str]*ast.Node{}, callables: map[str]bool{}}
+  for _, st := range tree.stmts {
+    if st.exported { m.exports[st.name] = st }
+    if st.kind == "Func" || st.kind == "Extern" { m.callables[st.name] = true }
+  }
+  m.declared = declared_in(tree)
+  l.mods[name] = m
+  l.order = append(l.order, name)
+}
+
+export fn link(files: []*ast.SourceFile) -> *ast.Node {
+  l := &Linker{files: files, entry: files[0].name, index: map[str]int{}, mods: map[str]*Mod{}, order: []str{}, visiting: []str{}}
+  for i, f := range files {
+    l.index[f.name] = i
+  }
+  l.load(l.entry, nil)
+
+  # a single file with no imports: nothing to link
+  if len(l.order) == 1 { return l.mods[l.entry].tree }
+
+  body := []*ast.Node{}
+  for _, mod_name := range l.order {
+    m := l.mods[mod_name]
+    r := &Renamer{l: l, m: m, mod_name: mod_name, imported: map[str]*Imported{}, namespaces: map[str]str{}}
+    for _, st := range m.tree.stmts {
+      if st.kind != "Import" || st.import_names == nil { continue }
+      dep := l.mods[st.path]
+      for _, it := range st.import_names {
+        if _, ok := dep.exports[it.name]; !ok {
+          if dep.declared[it.name] { link_err("\"" + it.name + "\" exists in " + st.path + " but is not exported. Write export before its declaration", it) }
+          link_err(st.path + " has nothing named \"" + it.name + "\"", it)
+        }
+        prev := r.imported[it.name]
+        if prev != nil && prev.from_ != st.path { link_err("\"" + it.name + "\" was already imported from " + prev.from_, it) }
+        if m.declared[it.name] { link_err("\"" + it.name + "\" is imported from " + st.path + " and also declared in this file. Choose a different name for one of them", it) }
+        r.imported[it.name] = &Imported{target: l.mangle(st.path, it.name), from_: st.path}
+      }
+    }
+    # namespaces: import "std/strings" lets this module write strings.name
+    for _, st := range m.tree.stmts {
+      if st.kind != "Import" || st.ns == "" { continue }
+      if m.declared[st.ns] { link_err("\"" + st.ns + "\" names the module " + st.path + " and is also declared in this file. Import it with another name: import other \"" + st.path + "\"", st) }
+      prev_ns, ok := r.namespaces[st.ns]
+      if ok && prev_ns != st.path { link_err("The namespace \"" + st.ns + "\" is already used by " + prev_ns + ". Import it with another name: import other \"" + st.path + "\"", st) }
+      r.namespaces[st.ns] = st.path
+    }
+    mod := ast.new_node("Module", 0, 0)
+    mod.name = mod_name
+    stmts := []*ast.Node{}
+    for _, st := range m.tree.stmts {
+      if st.kind != "Import" { stmts = append(stmts, r.tx(st)) }
+    }
+    mod.stmts = stmts
+    body = append(body, mod)
+  }
+  prog := ast.new_node("Program", 0, 0)
+  prog.stmts = body
+  return prog
+}
+
+fn (l: *Linker) mangle(mod: str, n: str) -> str {
+  if mod == l.entry { return n }
+  return n + "@" + mod
+}
+
+struct Imported {
+  target: str
+  from_: str
+}
+
+# renames the names of one module
+struct Renamer {
+  l: *Linker
+  m: *Mod
+  mod_name: str
+  imported: map[str]*Imported
+  namespaces: map[str]str
+  here: *ast.Node              # node being renamed, for error positions
+}
+
+# ns.name -> the linked name, or "" when ns is not a namespace of this module
+fn (r: *Renamer) qualified(q: str) -> str {
+  i := strings.index_byte(q, 46)
+  ns := q[0:i]
+  nm := q[i + 1:]
+  path, ok := r.namespaces[ns]
+  if !ok { return "" }
+  dep := r.l.mods[path]
+  if _, ok2 := dep.exports[nm]; !ok2 {
+    if dep.declared[nm] { link_err("\"" + nm + "\" exists in " + path + ", but it is not exported. Write export before its declaration", r.here) }
+    link_err(path + " has nothing called \"" + nm + "\"", r.here)
+  }
+  return r.l.mangle(path, nm)
+}
+
+fn (r: *Renamer) rename(n: str) -> str {
+  _, imp := r.imported[n]
+  if n == "_" || (n == "errors" && !r.m.declared[n] && !imp) { return n }
+  if strings.index_byte(n, 46) >= 0 {
+    q := r.qualified(n)
+    if q != "" { return q }
+  }
+  if imp { return r.imported[n].target }
+  return r.l.mangle(r.mod_name, n)
+}
+fn (r: *Renamer) rename_all(xs: []str) -> []str {
+  out := []str{}
+  for _, x := range xs { out = append(out, r.rename(x)) }
+  return out
+}
+
+# types: the module's own or imported structs and interfaces get their linked name, also inside
+# []T, map[K]V, *T... (the words of the type text, as the JavaScript regular expression finds them)
+fn (r: *Renamer) rt(ty: str) -> str {
+  if ty == "" { return ty }
+  b := strings.Builder{}
+  i := 0
+  n := len(ty)
+  while i < n {
+    k := parser.ident_char_len(ty, i, true)
+    if k == 0 {
+      b.write_byte(int(ty[i]))
+      i++
+      continue
+    }
+    j := i + k
+    for {
+      m := parser.ident_char_len(ty, j, false)
+      if m == 0 { break }
+      j += m
+    }
+    if j < n && ty[j] == 46 {
+      k2 := parser.ident_char_len(ty, j + 1, true)
+      if k2 > 0 {
+        j = j + 1 + k2
+        for {
+          m := parser.ident_char_len(ty, j, false)
+          if m == 0 { break }
+          j += m
+        }
+      }
+    }
+    w := ty[i:j]
+    if parser.is_type_word(w) || w == "map" || w == "chan" || w == "fn" { b.write(w) } else { b.write(r.rename(w)) }
+    i = j
+  }
+  return b.string()
+}
+fn (r: *Renamer) rt_all(xs: []str) -> []str {
+  out := []str{}
+  for _, x := range xs { out = append(out, r.rt(x)) }
+  return out
+}
+
+fn copy_node(n: *ast.Node) -> *ast.Node {
+  c := new(ast.Node)
+  *c = *n
+  return c
+}
+
+fn (r: *Renamer) tx_list(xs: []*ast.Node) -> []*ast.Node {
+  if xs == nil { return nil }
+  out := []*ast.Node{}
+  for _, x := range xs { out = append(out, r.tx(x)) }
+  return out
+}
+
+# a renamed copy of a node and its subtree
+fn (r: *Renamer) tx(n: *ast.Node) -> *ast.Node {
+  if n == nil { return nil }
+  o := copy_node(n)
+  if n.line != 0 { r.here = n }
+  # the standard library may use the low-level operations (__load8, __syscall, ...)
+  if n.kind == "Call" && strings.has_prefix(r.mod_name, "std/") { o.privileged = true }
+  is_assign := n.kind == "Assign" || n.kind == "ForTo"
+  if is_assign && n.name != "" && strings.index_byte(n.name, 46) >= 0 { link_err("\"" + n.name + "\" belongs to another module and cannot be changed here", n) }
+  if is_assign {
+    if im, ok := r.imported[n.name]; ok { link_err("\"" + n.name + "\" was imported from " + im.from_ + " and cannot be changed here", n) }
+  }
+  if n.kind == "Var" || is_assign || n.kind == "Func" || n.kind == "Extern" { o.name = r.rename(n.name) }
+  if n.kind == "Func" {
+    o.params = r.rename_all(n.params)
+    if n.rnames != nil { o.rnames = r.rename_all(n.rnames) }
+  }
+  if n.kind == "Assign" || n.kind == "CompositeLit" || n.kind == "Conversion" || n.kind == "TypeAssert" { o.type = r.rt(n.type) }
+  if n.kind == "Call" && n.type_arg != "" { o.type_arg = r.rt(n.type_arg) }
+  if n.kind == "VarDecl" { o.names = r.rename_all(n.names) }
+  if n.kind == "TypeSwitch" && n.bind != "" { o.bind = r.rename(n.bind) }
+  if n.types != nil {
+    ts := []str{}
+    for _, t := range n.types {
+      if t == "nil" { ts = append(ts, t) } else { ts = append(ts, r.rt(t)) }
+    }
+    o.types = ts
+  }
+  if n.kind == "Func" {
+    if n.ptypes != nil { o.ptypes = r.rt_all(n.ptypes) }
+    o.rtype = r.rt(n.rtype)
+    if n.recv != nil {
+      rv := copy_node(n.recv)
+      rv.type = r.rt(n.recv.type)
+      o.recv = rv
+      o.name = rv.type + "." + n.method
+    }
+  }
+  if n.kind == "Struct" {
+    fs := []*ast.Node{}
+    for _, f := range n.fields {
+      c := copy_node(f)
+      c.type = r.rt(f.type)
+      fs = append(fs, c)
+    }
+    o.fields = fs
+  }
+  if n.kind == "Interface" {
+    ms := []*ast.Node{}
+    for _, mt := range n.methods {
+      c := copy_node(mt)
+      c.ptypes = r.rt_all(mt.ptypes)
+      c.rtype = r.rt(mt.rtype)
+      ms = append(ms, c)
+    }
+    o.methods = ms
+    es := []*ast.Node{}
+    for _, e := range n.embeds {
+      c := copy_node(e)
+      c.name = r.rt(e.name)
+      es = append(es, c)
+    }
+    o.embeds = es
+  }
+  if n.kind == "Struct" || n.kind == "Interface" { o.name = r.rename(n.name) }
+  if n.kind == "StructLit" {
+    o.type = r.rt(n.type)
+    fs := []*ast.Node{}
+    for _, f := range n.fields {
+      c := copy_node(f)
+      c.value = r.tx(f.value)
+      fs = append(fs, c)
+    }
+    o.fields = fs
+  }
+  # calls: the module's own or imported functions and externs get their linked name; built-ins stay as they are
+  if n.kind == "Call" {
+    _, imp := r.imported[n.name]
+    if imp || r.m.callables[n.name] || r.m.declared[n.name] || strings.index_byte(n.name, 46) >= 0 { o.name = r.rename(n.name) }
+  }
+  # children, in the order of the JavaScript
+  o.expr = r.tx(n.expr)
+  o.value = r.tx(n.value)
+  o.left = r.tx(n.left)
+  o.right = r.tx(n.right)
+  o.arg = r.tx(n.arg)
+  o.cond = r.tx(n.cond)
+  o.then = r.tx(n.then)
+  o.otherwise = r.tx(n.otherwise)
+  o.from_ = r.tx(n.from_)
+  o.to_ = r.tx(n.to_)
+  o.body = r.tx(n.body)
+  o.stmts = r.tx_list(n.stmts)
+  o.args = r.tx_list(n.args)
+  o.obj = r.tx(n.obj)
+  o.init = r.tx(n.init)
+  o.post = r.tx(n.post)
+  o.tag = r.tx(n.tag)
+  o.cases = r.tx_list(n.cases)
+  o.exprs = r.tx_list(n.exprs)
+  o.subject = r.tx(n.subject)
+  o.vars = r.tx_list(n.vars)
+  o.targets = r.tx_list(n.targets)
+  o.values = r.tx_list(n.values)
+  o.target = r.tx(n.target)
+  o.ch = r.tx(n.ch)
+  o.call = r.tx(n.call)
+  o.index = r.tx(n.index)
+  o.lo = r.tx(n.lo)
+  o.hi = r.tx(n.hi)
+  o.elems = r.tx_list(n.elems)
+  o.key = r.tx(n.key)
+  o.fn_ = r.tx(n.fn_)
+  return o
+}

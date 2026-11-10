@@ -1,0 +1,9 @@
+fn counter() -> fn() -> int {
+  n := 0
+  return fn() -> int {
+    n++
+    return n
+  }
+}
+c1 := counter()
+print(c1(), c1())

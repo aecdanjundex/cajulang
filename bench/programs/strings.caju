@@ -1,0 +1,13 @@
+# building and scanning strings
+import "std/strings"
+b := strings.Builder{}
+for i := 0; i < 200000; i++ {
+  b.write("item ")
+  b.write(str(i))
+  b.write_byte(10)
+}
+s := b.string()
+lines := strings.split(s, "\n")
+total := 0
+for _, l := range lines { if strings.has_suffix(l, "7") { total += len(l) } }
+print(len(s), len(lines), total, strings.count(s, "99"))

@@ -1,0 +1,8 @@
+struct Node { v: int, next: any }
+let total = 0
+for i = 1 to 200000 {
+  let a = Node{v: i}
+  let b = Node{v: i * 2, next: a}
+  total = total + b.next.v + b.v
+}
+print(total)

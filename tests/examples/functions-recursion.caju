@@ -1,0 +1,23 @@
+fn factorial(n) {
+  if n <= 1 { return 1 }
+  return n * factorial(n - 1)
+}
+
+fn fib(n) {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+# Tower of Hanoi: how many moves for n disks?
+fn hanoi(n, source, target, spare) {
+  if n == 0 { return 0 }
+  let before = hanoi(n - 1, source, spare, target)
+  if n <= 2 {
+    print("  disk", n, "from", source, "to", target)
+  }
+  return before + 1 + hanoi(n - 1, spare, target, source)
+}
+
+print("10! =", factorial(10))
+for i = 0 to 10 { print("fib(" + i + ") =", fib(i)) }
+print("Moves for 3 disks:", hanoi(3, "A", "C", "B"))

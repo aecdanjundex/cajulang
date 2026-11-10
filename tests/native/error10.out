@@ -1,0 +1,1 @@
+Runtime error in error10.caju, line 2: x.(int): the stored value is str, not int.

@@ -1,0 +1,11 @@
+# In bytecode mode, the compiler rejects the program before running.
+# In tree mode, the error only shows up when line 9 executes.
+const LIMIT = 3
+let attempts = 0
+while attempts < 5 {
+  attempts = attempts + 1
+  print("attempt", attempts)
+  if attempts == LIMIT {
+    LIMIT = 10
+  }
+}

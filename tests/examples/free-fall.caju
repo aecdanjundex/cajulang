@@ -1,0 +1,26 @@
+# Simulates a stone falling from 100 m, in steps of 1/50 000 of a second.
+# The derived constants (HALF_G_DT2, G_DT) are computed only once,
+# by the optimizer. The debug block disappears from the bytecode.
+const G = 9.81
+const DT = 1.0 / 50_000     # 1 / 50_000 would give 0: between integers, division truncates
+const INITIAL_HEIGHT = 100
+const HALF_G_DT2 = 0.5 * G * DT ** 2
+const G_DT = G * DT
+const DEBUG = false
+
+let y = INITIAL_HEIGHT
+let v = 0
+let t = 0
+let steps = 0
+while y > 0 {
+  y = y - v * DT - HALF_G_DT2
+  v = v + G_DT
+  t = t + DT
+  steps = steps + 1
+  if DEBUG {
+    print(t, y, v)
+  }
+}
+print("Time to the ground:", t, "s")
+print("Final speed:", v, "m/s")
+print("Simulation steps:", steps)

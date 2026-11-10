@@ -1,0 +1,38 @@
+# Estimates the area of the Mandelbrot set by counting how many points
+# of a 320 × 260 grid never escape. The known value is ≈ 1.5066;
+# with a grid this coarse, the estimate gets close, but not equal.
+# Tens of millions of floating-point operations.
+const COLUMNS = 320
+const ROWS = 260
+const MAX_ITER = 150
+const X_MIN = -2.0
+const X_MAX = 0.5
+const Y_MIN = -1.25
+const Y_MAX = 1.25
+const DX = (X_MAX - X_MIN) / COLUMNS
+const DY = (Y_MAX - Y_MIN) / ROWS
+const TOTAL_AREA = (X_MAX - X_MIN) * (Y_MAX - Y_MIN)
+
+let inside = 0
+for row = 0 to ROWS - 1 {
+  let ci = Y_MIN + (row + 0.5) * DY
+  for col = 0 to COLUMNS - 1 {
+    let cr = X_MIN + (col + 0.5) * DX
+    let zr = 0
+    let zi = 0
+    let n = 0
+    while n < MAX_ITER and zr * zr + zi * zi <= 4 {
+      let tmp = zr * zr - zi * zi + cr
+      zi = 2 * zr * zi + ci
+      zr = tmp
+      n = n + 1
+    }
+    if n == MAX_ITER {
+      inside = inside + 1
+    }
+  }
+  if (row + 1) % 52 == 0 {
+    print("row", row + 1, "of", ROWS, "·", (row + 1) * 100 / ROWS + "%")
+  }
+}
+print("Estimated area:", TOTAL_AREA * inside / (ROWS * COLUMNS))

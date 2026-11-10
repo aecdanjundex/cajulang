@@ -1,0 +1,25 @@
+import "std/net"
+import "std/http"
+l, err := net.listen("127.0.0.1", 0)
+print(err)
+l2, err2 := net.listen("127.0.0.1", 39123)
+print(err2)
+c, err3 := net.dial("127.0.0.1", 39123)
+print(err3)
+s, _ := l2.accept()
+c.write("GET /hi?name=caju HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+http.handle("/hi", fn(req: *http.Request, res: *http.Response) {
+  res.set_header("X-Caju", "yes")
+  res.write("hi " + req.query + " " + req.body + " " + req.header("HOST"))
+})
+http.serve_conn(s)
+reply := ""
+while true {
+  chunk, _ := c.read(4096)
+  if chunk == "" { break }
+  reply = reply + chunk
+}
+print(reply)
+c.close()
+_, err4 := net.dial("127.0.0.1", 1)
+print(err4)

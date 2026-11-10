@@ -1,0 +1,14 @@
+# A typo in a path that never executes.
+# In Tree mode, the program runs all the way without complaining: the interpreter
+# only looks at a line when it gets to it.
+# In VM mode, the compiler analyzes the whole program first and rejects it.
+let points = 0
+for round = 1 to 5 {
+  points = points + round * 10
+  print("round", round, "points:", points)
+}
+
+if points > 1_000_000 {
+  bonus = bonus + 1   # "bonus" was never created with let
+}
+print("Game over")

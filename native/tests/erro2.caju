@@ -1,2 +1,0 @@
-fn desce(n: int) -> int { return desce(n + 1) }
-print(desce(0))

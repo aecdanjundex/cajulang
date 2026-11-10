@@ -1,0 +1,24 @@
+# fn creates a function; return gives back the result
+fn square(x) {
+  return x * x
+}
+
+fn largest(a, b) {
+  if a > b { return a }
+  return b
+}
+
+fn greeting(name) {
+  return "Hello, " + name + "!"
+}
+
+print(square(12), largest(7, 3), greeting("Caju"))
+
+# variables created inside the function are local
+let total = 100
+fn sum_to(n) {
+  let total = 0          # this is another variable, just for the function
+  for i = 1 to n { total = total + i }
+  return total
+}
+print(sum_to(10), total)

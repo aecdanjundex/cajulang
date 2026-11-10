@@ -1,0 +1,90 @@
+# build_main: compiles a Caju program to a native executable, like `node bootstrap/caju.js build`.
+#
+#   build_main [-o out] [--target linux|windows] file.caju
+#
+# The standard library comes from $CAJU_LIB (default /home/aecio/caju/lib) and the runtime
+# sources from $CAJU_RT (default /home/aecio/caju/rt).
+
+import "std/os"
+import "std/strings"
+import "ast"
+import "project"
+import "native"
+
+let files: []*ast.SourceFile = nil
+
+fn usage() {
+  os.eprintln("usage:\n  caju build [-o output] [--target linux|windows] file.caju")
+  os.exit(2)
+}
+
+fn file_names() -> []str {
+  names := []str{}
+  for _, f := range files { names = append(names, f.name) }
+  return names
+}
+
+fn read_or_die(path: str) -> str {
+  src, err := os.read_file(path)
+  if err != nil {
+    os.eprintln("build_main: " + err.Error())
+    os.exit(2)
+  }
+  return src
+}
+
+fn base_name(p: str) -> str { return p[strings.last_index(p, "/") + 1:] }
+
+# compiles the program; on an error in the program prints it and exits with 1
+fn build(entry: str, out: str, target: str, lib_dir: str, rt_dir: str) {
+  defer fn() {
+    r := recover()
+    if r != nil {
+      if e, ok := r.(*ast.CompileError); ok {
+        os.eprintln(ast.format_error(e, file_names()))
+        os.exit(1)
+      } else { panic(r) }
+    }
+  }()
+  rt := []str{}
+  for _, name := range []str{"core", "gc", "values", "dynamic", "panic", target} {
+    rt = append(rt, read_or_die(rt_dir + "/" + name + ".caju"))
+  }
+  files = project.load_project(entry, lib_dir)
+  image := native.compile_native(files, rt, target)
+  err := os.write_file(out, image.string(), 0o755)
+  if err != nil {
+    os.eprintln("build_main: " + err.Error())
+    os.exit(2)
+  }
+}
+
+out := ""
+target := "linux"
+entry := ""
+argv := os.args()[1:]
+for i := 0; i < len(argv); i++ {
+  a := argv[i]
+  if a == "-o" && i + 1 < len(argv) {
+    i++
+    out = argv[i]
+  } else if a == "--target" && i + 1 < len(argv) {
+    i++
+    target = argv[i]
+  } else if entry == "" {
+    entry = a
+  } else {
+    usage()
+  }
+}
+if entry == "" { usage() }
+if target != "linux" && target != "windows" { usage() }
+if out == "" {
+  out = strings.trim_suffix(base_name(entry), ".caju")
+  if target == "windows" { out += ".exe" }
+}
+lib_dir := os.getenv("CAJU_LIB")
+if lib_dir == "" { lib_dir = "/home/aecio/caju/lib" }
+rt_dir := os.getenv("CAJU_RT")
+if rt_dir == "" { rt_dir = "/home/aecio/caju/rt" }
+build(entry, out, target, lib_dir, rt_dir)

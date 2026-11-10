@@ -1,0 +1,9 @@
+struct P { x: num }
+struct L { a: P, b: P, t: str }
+fn (p: *P) advance(d: num) { p.x = p.x + d }
+let l = L{a: P{x: 1}}
+l.b.advance(5)
+l.a.advance(1)
+let c = l.a
+c.advance(100)
+print(l, c, l.a == P{x: 2})

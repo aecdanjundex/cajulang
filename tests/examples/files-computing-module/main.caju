@@ -1,0 +1,7 @@
+# primes.caju runs entirely before this line,
+# only once, and hands over the finished results.
+import { TOTAL, LARGEST, LIMIT } from "primes.caju"
+import "clock.caju"
+
+print("There are", TOTAL, "primes up to", LIMIT)
+print("The largest of them is", LARGEST)

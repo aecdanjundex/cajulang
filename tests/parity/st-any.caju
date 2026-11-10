@@ -1,0 +1,8 @@
+struct C { r: num }
+fn (c: C) area() -> num { return 3 * c.r * c.r }
+fn (c: *C) grow(k) { c.r = c.r + k }
+let xs: any = C{r: 1}
+xs.grow(2)
+print(xs.area(), xs.r)
+let n: any = 5
+print(n.area())

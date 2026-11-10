@@ -1,0 +1,16 @@
+3 nil
+error: division by zero
+1 2 3 1
+[1 4 9]
+[2 4 6]
+0
+1
+2
+1 9
+5 nil
+0 recovered: Integer division by zero
+body
+defer 2
+defer 1
+defer 0
+2 1

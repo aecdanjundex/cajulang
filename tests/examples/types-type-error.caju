@@ -1,0 +1,12 @@
+# This program has a type error. Compilation finds it before
+# running any line: no print happens.
+fn discounted(price: num, discount: num) -> num {
+  return price - price * discount
+}
+
+fn label(product: str, price: num) -> str {
+  return product + ": $ " + str(price)
+}
+
+print(label("cashew", discounted(12.5, 0.1)))
+print(label(discounted(8, 0.2), "mango"))   # swapped arguments

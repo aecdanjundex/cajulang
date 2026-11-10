@@ -1,0 +1,47 @@
+Point{x: 1, y: 2} Point{x: 10, y: 2} false true 3
+Point{x: 6, y: 2}
+Point{x: 7, y: 7} Point{x: 7, y: 7} 14
+Line{a: Point{x: 99, y: 7}, b: Point{x: 99, y: -1}, name: "l1"} Point{x: 7, y: 7}
+[1 2 0 0] [50 2 0 0] 4 false
+[1 6 0 4]
+8 base 8 Child{Base: Base{id: 8}, tag: "x"}
+[Point{x: 0, y: 0} Point{x: 100, y: 1} Point{x: 2, y: 4}] Point{x: 2, y: 1000}
+0 Point{x: -1, y: 0}
+1 Point{x: -1, y: 1}
+2 Point{x: -1, y: 4}
+[Point{x: 0, y: 0} Point{x: 100, y: 1} Point{x: 2, y: 4}]
+map["a":2 "b":5] 0 false 5 true 2
+map["b":5]
+map[1:Point{x: 1, y: 0} 2:Point{x: 0, y: 2}] Point{x: 0, y: 0}
+[1 2 3 40 5] [2 3 40] 3 4
+[1 2 3 40 5] [77 2 3 40 5]
+2 [9 9 3 40 5] [1 2] [40 5] [1 2 3 40 5]
+2 1
+[42 2 3] [42 2 3]
+0 110 110
+1 97 97
+2 239 239
+4 118 118
+5 101 101
+6 44 44
+7 32 32
+8 119 119
+9 111 111
+10 114 114
+11 108 108
+12 100 100
+13 12 97 na [110 97 195] [97 239]
+[255 65 195]
+true nil
+7
+3
+true 0 nil
+[1] false
+[[0 0 0] [0 1 2] [0 2 4]]
+k 0
+k 1
+k 2
+map["a":[1 2]]
+2 1
+[0 0 0 0 0]
+8 10

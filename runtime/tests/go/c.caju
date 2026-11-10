@@ -1,9 +1,0 @@
-fn contador() -> fn() -> int {
-  n := 0
-  return fn() -> int {
-    n++
-    return n
-  }
-}
-c1 := contador()
-print(c1(), c1())

@@ -1,0 +1,42 @@
+struct Node { value: int, next: *Node }
+list := &Node{value: 1}
+list.next = &Node{value: 2, next: &Node{value: 3}}
+for p := list; p != nil; p = p.next { print(p.value) }
+
+struct Point { x: int, y: int }
+fn (p: *Point) scale(k: int) { p.x *= k; p.y *= k }
+fn (p: Point) sum() -> int { return p.x + p.y }
+a := Point{1, 2}
+pa := &a
+pa.scale(10)
+print(a, pa.sum(), *pa)
+b := *pa
+b.x = 0
+print(a.x, b.x)
+a = Point{5, 5}
+print(pa)
+x := 10
+px := &x
+*px = 20
+*px += 1
+print(x, *px)
+fn incr(n: *int) { *n++ }
+incr(&x)
+print(x)
+q := new(int)
+*q = 7
+print(*q)
+r := new(Point)
+r.x = 3
+print(r, *r)
+nums := []int{1, 2, 3}
+pe := &nums[1]
+*pe = 50
+print(nums)
+fn swap(a: *int, b: *int) { *a, *b = *b, *a }
+u, v := 1, 2
+swap(&u, &v)
+print(u, v)
+let nilp: *Point = nil
+print(nilp == nil)
+print(nilp.x)

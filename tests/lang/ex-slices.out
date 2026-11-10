@@ -1,0 +1,9 @@
+[7 9 4 10 6] length 5 capacity 6
+[7 99 4 10 6] [99 4]
+average 25 or 25.2
+out of cashews: 0
+banana 10
+mango 5
+map["banana":10 "mango":5]
+["x" "y" "z"] ["changed" "y" "z"]
+[[1 2 3] [2 4 6] [3 6 9]]

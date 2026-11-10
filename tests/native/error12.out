@@ -1,0 +1,2 @@
+true
+Runtime error in error12.caju, line 4: Call of method "m" on a nil value.

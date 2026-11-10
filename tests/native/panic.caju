@@ -1,0 +1,82 @@
+fn level(n: int) {
+  defer print("leaving level", n)
+  if n == 0 { panic("bottom") }
+  level(n - 1)
+}
+fn protect(name: str, f: fn()) {
+  defer fn() {
+    r := recover()
+    print(name, "recovered:", r)
+  }()
+  f()
+  print(name, "finished normally")
+}
+protect("a", fn() { level(3) })
+protect("b", fn() { print("nothing") })
+fn helper() -> any { return recover() }
+fn indirect() -> (r: str) {
+  defer fn() {
+    x := helper()
+    print("helper saw:", x)
+    y := recover()
+    r = "caught " + str(y)
+  }()
+  panic("x")
+}
+print(indirect())
+fn double() -> (s: str) {
+  defer fn() { s = s + " | second: " + str(recover()) }()
+  defer fn() { panic("again") }()
+  panic("first")
+}
+print(double())
+fn count() -> (n: int) {
+  defer fn() { n *= 10 }()
+  defer fn() { n += 1 }()
+  n = 4
+  return n + 1
+}
+print(count())
+struct Err { code: int }
+fn fail() -> (e: any) {
+  defer fn() { e = recover() }()
+  panic(Err{7})
+}
+print(fail())
+fn bottom(n: int) -> int { return bottom(n + 1) + 1 }
+fn recursion() -> (msg: str) {
+  defer fn() { msg = str(recover()) }()
+  bottom(0)
+  return "never reached"
+}
+print(recursion())
+struct Cnt { v: int }
+fn (c: Cnt) show(tag: str) { print(tag, c.v) }
+fn method() {
+  c := Cnt{1}
+  defer c.show("deferred")
+  c.v = 99
+  print("now", c.v)
+}
+method()
+fn loop() {
+  for i := 0; i < 3; i++ { defer fn() { print("closure", i) }() }
+}
+loop()
+print(recover())
+fn errs() {
+  defer fn() {
+    if r := recover(); r != nil {
+      if e, ok := r.(error); ok { print("error:", e.Error()) }
+    }
+  }()
+  let m: map[str]int = nil
+  m["x"] = 1
+}
+errs()
+fn no_recover() -> int {
+  defer print("defer runs before the end")
+  let p: *Cnt = nil
+  return p.v
+}
+print(no_recover())

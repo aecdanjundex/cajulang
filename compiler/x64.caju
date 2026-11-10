@@ -1,0 +1,238 @@
+# x86-64 assembler: port of class X64 of bootstrap/native.js.
+# Machine code goes into a bytes.Buffer. Symbols (labels, functions, data) are strings; their
+# position is kept in syms as off * 2 + section (0 text, 1 data). Jumps, calls and RIP-relative
+# operands leave a fixup (a 32-bit hole) resolved when the section addresses are known.
+
+import "std/bytes"
+
+export const RAX = 0
+export const RCX = 1
+export const RDX = 2
+export const RBX = 3
+export const RSP = 4
+export const RBP = 5
+export const RSI = 6
+export const RDI = 7
+export const R8 = 8
+export const R9 = 9
+export const R10 = 10
+export const R11 = 11
+
+# condition codes
+export const CC_O = 0
+export const CC_B = 2
+export const CC_AE = 3
+export const CC_E = 4
+export const CC_NE = 5
+export const CC_BE = 6
+export const CC_A = 7
+export const CC_S = 8
+export const CC_NS = 9
+export const CC_P = 10
+export const CC_NP = 11
+export const CC_L = 12
+export const CC_GE = 13
+export const CC_LE = 14
+export const CC_G = 15
+
+export const SEC_TEXT = 0
+export const SEC_DATA = 1
+
+export struct X64 {
+  b: *bytes.Buffer
+  syms: map[str]int        # symbol -> off * 2 + section
+  fix_at: []int
+  fix_sym: []str
+  fix_end: []int
+  nlab: int
+}
+
+export fn new_x64() -> *X64 {
+  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0}
+}
+
+export fn (a: *X64) pos() -> int { return a.b.n }
+export fn (a: *X64) byte(x: int) { a.b.byte(x & 255) }
+export fn (a: *X64) byte2(x: int, y: int) {
+  a.b.byte(x & 255)
+  a.b.byte(y & 255)
+}
+export fn (a: *X64) byte3(x: int, y: int, z: int) {
+  a.b.byte(x & 255)
+  a.b.byte(y & 255)
+  a.b.byte(z & 255)
+}
+export fn (a: *X64) byte4(x: int, y: int, z: int, w: int) {
+  a.b.byte(x & 255)
+  a.b.byte(y & 255)
+  a.b.byte(z & 255)
+  a.b.byte(w & 255)
+}
+export fn (a: *X64) d32(v: int) { a.b.u32(v) }
+export fn (a: *X64) d64(v: int) { a.b.u64(v) }
+
+# an opcode of one or two bytes (0x0FAF = 0F AF)
+fn (a: *X64) op(op: int) {
+  if op > 255 { a.b.byte(op >> 8) }
+  a.b.byte(op & 255)
+}
+fn (a: *X64) pre(p: int) { if p != 0 { a.b.byte(p) } }
+
+export fn (a: *X64) rex(w: int, r: int, bb: int, force: bool) {
+  v := 0x40 | (w << 3) | (((r >> 3) & 1) << 2) | ((bb >> 3) & 1)
+  if v != 0x40 || force { a.b.byte(v) }
+}
+# register with register: modrm 11 reg rm
+export fn (a: *X64) rrx(op: int, reg: int, rm: int, w: int, pre: int) {
+  a.pre(pre)
+  a.rex(w, reg, rm, false)
+  a.op(op)
+  a.b.byte(0xC0 | ((reg & 7) << 3) | (rm & 7))
+}
+export fn (a: *X64) rr(op: int, reg: int, rm: int) { a.rrx(op, reg, rm, 1, 0) }
+export fn (a: *X64) rr32(op: int, reg: int, rm: int) { a.rrx(op, reg, rm, 0, 0) }
+# register with [base + disp32]
+export fn (a: *X64) rmx(op: int, reg: int, base: int, disp: int, w: int, pre: int) {
+  a.pre(pre)
+  a.rex(w, reg, base, false)
+  a.op(op)
+  a.b.byte(0x80 | ((reg & 7) << 3) | (base & 7))
+  if (base & 7) == 4 { a.b.byte(0x24) }
+  a.b.u32(disp)
+}
+export fn (a: *X64) rm(op: int, reg: int, base: int, disp: int) { a.rmx(op, reg, base, disp, 1, 0) }
+# register with [rip + symbol]
+export fn (a: *X64) ripx(op: int, reg: int, sym: str, w: int, pre: int, after: int) {
+  a.pre(pre)
+  a.rex(w, reg, 0, false)
+  a.op(op)
+  a.b.byte(0x05 | ((reg & 7) << 3))
+  at := a.b.n
+  a.b.u32(0)
+  a.add_fix(at, sym, at + 4 + after)
+}
+export fn (a: *X64) rip(op: int, reg: int, sym: str) { a.ripx(op, reg, sym, 1, 0, 0) }
+fn (a: *X64) add_fix(at: int, sym: str, end: int) {
+  a.fix_at = append(a.fix_at, at)
+  a.fix_sym = append(a.fix_sym, sym)
+  a.fix_end = append(a.fix_end, end)
+}
+export fn (a: *X64) label() -> str {
+  s := ".L" + str(a.nlab)
+  a.nlab++
+  return s
+}
+export fn (a: *X64) bind(sym: str) { a.syms[sym] = a.b.n * 2 + SEC_TEXT }
+export fn (a: *X64) bind_data(sym: str, off: int) { a.syms[sym] = off * 2 + SEC_DATA }
+export fn (a: *X64) jmp(sym: str) {
+  a.b.byte(0xE9)
+  at := a.b.n
+  a.b.u32(0)
+  a.add_fix(at, sym, at + 4)
+}
+export fn (a: *X64) jcc(cc: int, sym: str) {
+  a.b.byte(0x0F)
+  a.b.byte(0x80 + cc)
+  at := a.b.n
+  a.b.u32(0)
+  a.add_fix(at, sym, at + 4)
+}
+export fn (a: *X64) call(sym: str) {
+  a.b.byte(0xE8)
+  at := a.b.n
+  a.b.u32(0)
+  a.add_fix(at, sym, at + 4)
+}
+export fn (a: *X64) ret() { a.b.byte(0xC3) }
+export fn (a: *X64) mov_imm(r: int, x: int) {
+  if x == 0 {
+    a.rr32(0x31, r, r)              # xor r32, r32
+    return
+  }
+  if x > 0 && x < 0x80000000 {
+    a.rex(0, 0, r, false)
+    a.b.byte(0xB8 + (r & 7))
+    a.b.u32(x)
+    return
+  }
+  a.rex(1, 0, r, false)
+  a.b.byte(0xB8 + (r & 7))
+  a.b.u64(x)
+}
+export fn (a: *X64) mov(dst: int, src: int) { a.rr(0x89, src, dst) }
+export fn (a: *X64) load(r: int, base: int, disp: int) { a.rm(0x8B, r, base, disp) }
+export fn (a: *X64) store(base: int, disp: int, r: int) { a.rm(0x89, r, base, disp) }
+export fn (a: *X64) load_sym(r: int, sym: str) { a.rip(0x8B, r, sym) }
+export fn (a: *X64) store_sym(sym: str, r: int) { a.rip(0x89, r, sym) }
+export fn (a: *X64) lea(r: int, sym: str) { a.rip(0x8D, r, sym) }
+export fn (a: *X64) push(r: int) {
+  if r >= 8 { a.b.byte(0x41) }
+  a.b.byte(0x50 + (r & 7))
+}
+export fn (a: *X64) pop(r: int) {
+  if r >= 8 { a.b.byte(0x41) }
+  a.b.byte(0x58 + (r & 7))
+}
+# add sub and or xor cmp test
+export fn (a: *X64) alu(op: str, dst: int, src: int) {
+  c := 0
+  switch op {
+  case "add": c = 0x01
+  case "sub": c = 0x29
+  case "and": c = 0x21
+  case "or": c = 0x09
+  case "xor": c = 0x31
+  case "cmp": c = 0x39
+  case "test": c = 0x85
+  }
+  a.rr(c, src, dst)
+}
+export fn (a: *X64) imul(dst: int, src: int) { a.rr(0x0FAF, dst, src) }
+export fn (a: *X64) add_imm(r: int, v: int) {
+  a.rex(1, 0, r, false)
+  a.b.byte(0x81)
+  a.b.byte(0xC0 | (r & 7))
+  a.b.u32(v)
+}
+export fn (a: *X64) sub_imm(r: int, v: int) {
+  a.rex(1, 0, r, false)
+  a.b.byte(0x81)
+  a.b.byte(0xE8 | (r & 7))
+  a.b.u32(v)
+}
+export fn (a: *X64) cmp_imm(r: int, v: int) {
+  a.rex(1, 0, r, false)
+  a.b.byte(0x81)
+  a.b.byte(0xF8 | (r & 7))
+  a.b.u32(v)
+}
+# 2 not, 3 neg, 6 div, 7 idiv
+export fn (a: *X64) unary(ext: int, r: int) {
+  a.rex(1, 0, r, false)
+  a.b.byte(0xF7)
+  a.b.byte(0xC0 | (ext << 3) | (r & 7))
+}
+# 4 shl, 5 shr, 7 sar
+export fn (a: *X64) shift_cl(ext: int, r: int) {
+  a.rex(1, 0, r, false)
+  a.b.byte(0xD3)
+  a.b.byte(0xC0 | (ext << 3) | (r & 7))
+}
+export fn (a: *X64) cqo() { a.byte2(0x48, 0x99) }
+export fn (a: *X64) setcc(cc: int, r8: int) {
+  a.rex(0, 0, r8, r8 >= 4)
+  a.b.byte(0x0F)
+  a.b.byte(0x90 + cc)
+  a.b.byte(0xC0 | (r8 & 7))
+}
+# movzx r32, r8 (zeroes the rest)
+export fn (a: *X64) movzxb(dst: int, src: int) { a.rr32(0x0FB6, dst, src) }
+# floating point
+export fn (a: *X64) movq_x(x: int, r: int) { a.rrx(0x0F6E, x, r, 1, 0x66) }     # movq xmm, r64
+export fn (a: *X64) movq_r(r: int, x: int) { a.rrx(0x0F7E, x, r, 1, 0x66) }     # movq r64, xmm
+# addsd 58, mulsd 59, subsd 5C, divsd 5E, sqrtsd 51 (pre F2); cvtsd2ss 5A
+export fn (a: *X64) ssep(op: int, x: int, y: int, pre: int) { a.rrx(0x0F00 | op, x, y, 0, pre) }
+export fn (a: *X64) sse(op: int, x: int, y: int) { a.rrx(0x0F00 | op, x, y, 0, 0xF2) }
+export fn (a: *X64) ucomisd(x: int, y: int) { a.rrx(0x0F2E, x, y, 0, 0x66) }
+export fn (a: *X64) cvtsi2sd(x: int, r: int) { a.rrx(0x0F2A, x, r, 1, 0xF2) }
+export fn (a: *X64) cvttsd2si(r: int, x: int) { a.rrx(0x0F2C, r, x, 1, 0xF2) }

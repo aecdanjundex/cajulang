@@ -1,0 +1,165 @@
+# std/http: a small HTTP/1.1 server.
+#
+#   import "std/http"
+#   http.handle("/", fn(req: *http.Request, res: *http.Response) { res.write("hello world") })
+#   err := http.listen_and_serve("0.0.0.0", 3200)
+#
+# Connections are served one at a time, each request on its own connection (Connection: close).
+
+import "std/net"
+import "std/strings"
+import "std/strconv"
+import "std/os"
+
+export struct Request {
+  method: str
+  path: str               # without the query string
+  query: str              # what follows "?" in the target, without the "?"
+  version: str
+  headers: map[str]str    # names in lower case
+  body: str
+}
+
+export struct Response {
+  status: int
+  headers: map[str]str
+  body: strings.Builder
+}
+
+export fn (r: *Response) set_header(name: str, value: str) { r.headers[name] = value }
+export fn (r: *Response) set_status(code: int) { r.status = code }
+export fn (r: *Response) write(s: str) { r.body.write(s) }
+
+# the header value for name (any case), or ""
+export fn (r: *Request) header(name: str) -> str { return r.headers[strings.to_lower(name)] }
+
+let routes = map[str]fn(*Request, *Response){}
+let route_order = []str{}
+
+# registers a handler for a path; a path ending in "/" also matches everything below it
+export fn handle(path: str, h: fn(*Request, *Response)) {
+  if _, ok := routes[path]; !ok { route_order = append(route_order, path) }
+  routes[path] = h
+}
+
+export fn status_text(code: int) -> str {
+  switch code {
+  case 200: return "OK"
+  case 201: return "Created"
+  case 204: return "No Content"
+  case 301: return "Moved Permanently"
+  case 302: return "Found"
+  case 304: return "Not Modified"
+  case 400: return "Bad Request"
+  case 404: return "Not Found"
+  case 405: return "Method Not Allowed"
+  case 413: return "Payload Too Large"
+  case 500: return "Internal Server Error"
+  }
+  return "Status " + str(code)
+}
+
+# the handler for a path: an exact match, else the longest registered prefix ending in "/"
+fn find_route(path: str) -> (fn(*Request, *Response), bool) {
+  if h, ok := routes[path]; ok { return h, true }
+  best := ""
+  for _, p := range route_order {
+    if strings.has_suffix(p, "/") && strings.has_prefix(path, p) && len(p) > len(best) { best = p }
+  }
+  if best != "" { return routes[best], true }
+  return nil, false
+}
+
+const MAX_HEADER = 65536
+const MAX_BODY = 16777216
+
+# reads one request from the connection; ok is false if the connection closed or the request is bad
+fn read_request(c: *net.Conn) -> (*Request, int) {
+  data := strings.Builder{}
+  head_end := -1
+  while head_end < 0 {
+    chunk, err := c.read(8192)
+    if err != nil || chunk == "" { return nil, 0 }
+    data.write(chunk)
+    s := data.string()
+    head_end = strings.index(s, "\r\n\r\n")
+    if head_end < 0 && data.len() > MAX_HEADER { return nil, 400 }
+  }
+  s := data.string()
+  lines := strings.split(s[0:head_end], "\r\n")
+  first := strings.split(lines[0], " ")
+  if len(first) != 3 { return nil, 400 }
+  req := &Request{method: first[0], version: first[2], headers: map[str]str{}}
+  target := first[1]
+  q := strings.index_byte(target, 63)
+  if q >= 0 {
+    req.path = target[0:q]
+    req.query = target[q + 1:]
+  } else { req.path = target }
+  for i := 1; i < len(lines); i++ {
+    colon := strings.index_byte(lines[i], 58)
+    if colon <= 0 { return nil, 400 }
+    req.headers[strings.to_lower(strings.trim_space(lines[i][0:colon]))] = strings.trim_space(lines[i][colon + 1:])
+  }
+  body := s[head_end + 4:]
+  if cl, ok := req.headers["content-length"]; ok {
+    n, err := strconv.atoi(cl)
+    if err != nil || n < 0 { return nil, 400 }
+    if n > MAX_BODY { return nil, 413 }
+    b := strings.Builder{}
+    b.write(body)
+    while b.len() < n {
+      chunk, err2 := c.read(65536)
+      if err2 != nil || chunk == "" { return nil, 0 }
+      b.write(chunk)
+    }
+    body = b.string()[0:n]
+  }
+  req.body = body
+  return req, 200
+}
+
+fn send(c: *net.Conn, res: *Response, head_only: bool) {
+  body := res.body.string()
+  out := strings.Builder{}
+  out.write("HTTP/1.1 " + str(res.status) + " " + status_text(res.status) + "\r\n")
+  if _, ok := res.headers["Content-Type"]; !ok { res.headers["Content-Type"] = "text/plain; charset=utf-8" }
+  for k, v := range res.headers { out.write(k + ": " + v + "\r\n") }
+  out.write("Content-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n")
+  if !head_only { out.write(body) }
+  c.write(out.string())
+}
+
+# serves one connection
+export fn serve_conn(c: *net.Conn) {
+  req, code := read_request(c)
+  if req == nil {
+    if code != 0 {
+      res := &Response{status: code, headers: map[str]str{}}
+      res.write(status_text(code) + "\n")
+      send(c, res, false)
+    }
+    c.close()
+    return
+  }
+  res := &Response{status: 200, headers: map[str]str{}}
+  h, ok := find_route(req.path)
+  if !ok {
+    res.status = 404
+    res.write("404 page not found\n")
+  } else { h(req, res) }
+  send(c, res, req.method == "HEAD")
+  c.close()
+}
+
+# listens on host:port and serves requests forever (returns only on an error)
+export fn listen_and_serve(host: str, port: int) -> error {
+  l, err := net.listen(host, port)
+  if err != nil { return err }
+  while true {
+    c, err2 := l.accept()
+    if err2 != nil { return err2 }
+    serve_conn(c)
+  }
+  return nil
+}

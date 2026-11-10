@@ -1,0 +1,10 @@
+const PI = 3.14159
+const DELIVERY_FEE = 7.5
+
+let radius = 4
+print("Circle area:", PI * radius ** 2)
+
+for qty = 1 to 3 {
+  const PRICE = 19.9   # runs on every iteration, but it is the same declaration
+  print(qty + " pizza(s): $ " + (qty * PRICE + DELIVERY_FEE))
+}

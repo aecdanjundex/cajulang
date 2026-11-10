@@ -1,0 +1,21 @@
+# Counts how many primes there are up to 30 000,
+# testing only odd divisors up to the root of each number.
+const LIMIT = 30_000
+let total = 1   # 2 already counts
+
+for n = 3 to LIMIT {
+  if n % 2 != 0 {
+    let prime = true
+    let d = 3
+    while d * d <= n and prime {
+      if n % d == 0 {
+        prime = false
+      }
+      d = d + 2
+    }
+    if prime {
+      total = total + 1
+    }
+  }
+}
+print("There are", total, "primes up to", LIMIT)

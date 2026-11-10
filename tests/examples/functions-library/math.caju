@@ -1,0 +1,26 @@
+# Only what has export can be imported.
+export fn gcd(a, b) {
+  while b != 0 {
+    let r = a % b
+    a = b
+    b = r
+  }
+  return a
+}
+
+export fn is_prime(n) {
+  if n < 2 { return false }
+  let d = 2
+  while d * d <= n {
+    if n % d == 0 { return false }
+    d = d + 1
+  }
+  return true
+}
+
+export fn power(base, exp) {
+  if exp == 0 { return 1 }
+  return base * power(base, exp - 1)
+}
+
+fn helper() { return 0 }   # no export: invisible to other files

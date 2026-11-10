@@ -1,0 +1,245 @@
+# std/strings: searching, splitting and building strings.
+# Strings are immutable sequences of bytes (UTF-8). s[i] is a byte, s[a:b] a substring.
+
+# Builder: appends bytes to a growing buffer and turns them into a string once at the end.
+export struct Builder {
+  mem: int      # buffer: a string block [length][bytes][0] from __newstr
+  n: int        # bytes used
+  cap: int      # bytes available
+}
+
+fn (b: *Builder) grow(extra: int) {
+  if b.n + extra <= b.cap { return }
+  c := b.cap * 2
+  if c < 64 { c = 64 }
+  while c < b.n + extra { c = c * 2 }
+  m := __newstr(c)
+  i := 0
+  while i < b.n {
+    __store8(m + 8 + i, __load8(b.mem + 8 + i))
+    i++
+  }
+  b.mem = m
+  b.cap = c
+}
+export fn (b: *Builder) write(s: str) {
+  n := len(s)
+  if n == 0 { return }
+  b.grow(n)
+  p := __strp(s) + 8
+  d := b.mem + 8 + b.n
+  i := 0
+  while i < n {
+    __store8(d + i, __load8(p + i))
+    i++
+  }
+  b.n += n
+}
+export fn (b: *Builder) write_byte(c: int) {
+  b.grow(1)
+  __store8(b.mem + 8 + b.n, c)
+  b.n++
+}
+# appends the UTF-8 encoding of a code point
+export fn (b: *Builder) write_rune(r: int) {
+  if r < 0x80 { b.write_byte(r); return }
+  if r < 0x800 {
+    b.write_byte(0xC0 | (r >> 6))
+    b.write_byte(0x80 | (r & 0x3F))
+    return
+  }
+  if r < 0x10000 {
+    b.write_byte(0xE0 | (r >> 12))
+    b.write_byte(0x80 | ((r >> 6) & 0x3F))
+    b.write_byte(0x80 | (r & 0x3F))
+    return
+  }
+  b.write_byte(0xF0 | (r >> 18))
+  b.write_byte(0x80 | ((r >> 12) & 0x3F))
+  b.write_byte(0x80 | ((r >> 6) & 0x3F))
+  b.write_byte(0x80 | (r & 0x3F))
+}
+export fn (b: *Builder) len() -> int { return b.n }
+export fn (b: *Builder) reset() { b.n = 0 }
+# the bytes written so far, as a new string (the builder can keep growing)
+export fn (b: *Builder) string() -> str {
+  m := __newstr(b.n)
+  i := 0
+  while i < b.n {
+    __store8(m + 8 + i, __load8(b.mem + 8 + i))
+    i++
+  }
+  return __pstr(m)
+}
+
+# do the bytes of a at offset i equal the bytes of b?
+fn equal_at(a: str, i: int, b: str) -> bool {
+  pa := __strp(a) + 8 + i
+  pb := __strp(b) + 8
+  n := len(b)
+  k := 0
+  while k < n {
+    if __load8(pa + k) != __load8(pb + k) { return false }
+    k++
+  }
+  return true
+}
+export fn has_prefix(s: str, prefix: str) -> bool { return len(s) >= len(prefix) && equal_at(s, 0, prefix) }
+export fn has_suffix(s: str, suffix: str) -> bool { return len(s) >= len(suffix) && equal_at(s, len(s) - len(suffix), suffix) }
+# index of the first occurrence of sub in s at or after byte position from_, or -1
+export fn index_from(s: str, sub: str, from_: int) -> int {
+  n := len(sub)
+  if from_ < 0 { from_ = 0 }
+  if n == 0 {
+    if from_ <= len(s) { return from_ }
+    return -1
+  }
+  ps := __strp(s) + 8
+  pt := __strp(sub) + 8
+  first := __load8(pt)
+  last := len(s) - n
+  i := from_
+  while i <= last {
+    if __load8(ps + i) == first {
+      k := 1
+      while k < n && __load8(ps + i + k) == __load8(pt + k) { k++ }
+      if k == n { return i }
+    }
+    i++
+  }
+  return -1
+}
+# index of the first occurrence of sub in s, or -1
+export fn index(s: str, sub: str) -> int { return index_from(s, sub, 0) }
+export fn last_index(s: str, sub: str) -> int {
+  n := len(sub)
+  ps := __strp(s) + 8
+  pt := __strp(sub) + 8
+  i := len(s) - n
+  while i >= 0 {
+    k := 0
+    while k < n && __load8(ps + i + k) == __load8(pt + k) { k++ }
+    if k == n { return i }
+    i--
+  }
+  return -1
+}
+export fn index_byte(s: str, c: int) -> int {
+  p := __strp(s) + 8
+  n := len(s)
+  i := 0
+  while i < n {
+    if __load8(p + i) == c { return i }
+    i++
+  }
+  return -1
+}
+export fn contains(s: str, sub: str) -> bool { return index(s, sub) >= 0 }
+export fn count(s: str, sub: str) -> int {
+  if len(sub) == 0 { return len(s) + 1 }
+  c := 0
+  i := 0
+  while true {
+    j := index_from(s, sub, i)
+    if j < 0 { return c }
+    c++
+    i = j + len(sub)
+  }
+  return c
+}
+export fn split(s: str, sep: str) -> []str {
+  out := []str{}
+  if len(sep) == 0 {
+    for i := 0; i < len(s); i++ { out = append(out, s[i:i + 1]) }
+    return out
+  }
+  start := 0
+  while true {
+    j := index_from(s, sep, start)
+    if j < 0 { break }
+    out = append(out, s[start:j])
+    start = j + len(sep)
+  }
+  return append(out, s[start:])
+}
+export fn join(parts: []str, sep: str) -> str {
+  b := Builder{}
+  for i, p := range parts {
+    if i > 0 { b.write(sep) }
+    b.write(p)
+  }
+  return b.string()
+}
+export fn repeat(s: str, n: int) -> str {
+  b := Builder{}
+  for i := 0; i < n; i++ { b.write(s) }
+  return b.string()
+}
+export fn replace_all(s: str, old: str, new_: str) -> str {
+  if len(old) == 0 { return s }
+  b := Builder{}
+  i := 0
+  while true {
+    j := index_from(s, old, i)
+    if j < 0 { break }
+    b.write(s[i:j])
+    b.write(new_)
+    i = j + len(old)
+  }
+  b.write(s[i:])
+  return b.string()
+}
+export fn is_space(c: int) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 }
+export fn trim_space(s: str) -> str {
+  a := 0
+  b := len(s)
+  while a < b && is_space(int(s[a])) { a++ }
+  while b > a && is_space(int(s[b - 1])) { b-- }
+  return s[a:b]
+}
+export fn trim_prefix(s: str, prefix: str) -> str {
+  if has_prefix(s, prefix) { return s[len(prefix):] }
+  return s
+}
+export fn trim_suffix(s: str, suffix: str) -> str {
+  if has_suffix(s, suffix) { return s[0:len(s) - len(suffix)] }
+  return s
+}
+export fn to_upper(s: str) -> str {
+  b := Builder{}
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c >= 97 && c <= 122 { c -= 32 }
+    b.write_byte(c)
+  }
+  return b.string()
+}
+export fn to_lower(s: str) -> str {
+  b := Builder{}
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c >= 65 && c <= 90 { c += 32 }
+    b.write_byte(c)
+  }
+  return b.string()
+}
+# splits on runs of white space, dropping empty fields
+export fn fields(s: str) -> []str {
+  out := []str{}
+  i := 0
+  n := len(s)
+  while i < n {
+    while i < n && is_space(int(s[i])) { i++ }
+    j := i
+    while j < n && !is_space(int(s[j])) { j++ }
+    if j > i { out = append(out, s[i:j]) }
+    i = j
+  }
+  return out
+}
+# the string made of one byte
+export fn from_byte(c: int) -> str {
+  m := __newstr(1)
+  __store8(m + 8, c)
+  return __pstr(m)
+}

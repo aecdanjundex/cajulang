@@ -1,0 +1,7 @@
+const PI = 3
+let x = 10
+fn f(x) {
+  let PI = 99
+  return x + PI
+}
+print(f(1), x, PI)

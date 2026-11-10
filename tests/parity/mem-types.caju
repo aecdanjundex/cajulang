@@ -1,0 +1,4 @@
+let p = alloc(8)
+poke32(p, true)
+print(peek32(p))
+poke32(p, "x")

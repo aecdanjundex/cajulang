@@ -1,0 +1,4 @@
+# The linker checks the imports before anything runs.
+# SECRET exists in data.caju, but was not exported.
+import { PUBLIC, SECRET } from "data.caju"
+print(PUBLIC, SECRET)

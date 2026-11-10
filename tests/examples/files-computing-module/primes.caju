@@ -1,0 +1,18 @@
+export const LIMIT = 10_000
+export let TOTAL = 0
+export let LARGEST = 0
+
+for n = 2 to LIMIT {
+  let prime = true
+  let d = 2
+  while d * d <= n and prime {
+    if n % d == 0 {
+      prime = false
+    }
+    d = d + 1
+  }
+  if prime {
+    TOTAL = TOTAL + 1
+    LARGEST = n
+  }
+}

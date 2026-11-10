@@ -1,0 +1,6 @@
+Point{x: 3, y: 4} distance 5
+after move: Point{x: 4, y: 5}
+after tryMove: Point{x: 4, y: 5}
+a: Point{x: 4, y: 5} b: Point{x: 0, y: 5}
+equal? false true
+Point{x: 0, y: 0} Point{x: 0, y: 2}

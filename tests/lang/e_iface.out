@@ -1,0 +1,20 @@
+square 4
+circle 3
+int 4
+num 2.5
+num 4
+str hi
+int8
+square with side 3
+pointer to circle 7
+slice of 2
+nil
+error: failed
+other
+Square{side: 4} true
+nil false
+square
+100 vroom 100
+200 200
+vroom 200
+vroom 200

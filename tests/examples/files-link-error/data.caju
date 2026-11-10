@@ -1,0 +1,2 @@
+export const PUBLIC = "everyone sees this"
+const SECRET = "only this file sees this"

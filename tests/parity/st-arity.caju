@@ -1,0 +1,5 @@
+struct C { r: num }
+fn (c: C) f(a) { return a }
+let v: any = C{}
+print(v.f(1))
+print(v.f())

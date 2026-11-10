@@ -1,0 +1,37 @@
+# Errors are values: the function returns the result and an error.
+fn divide(a: int, b: int) -> (int, error) {
+  if b == 0 { return 0, errors.New("division by zero") }
+  return a / b, nil
+}
+for _, d := range []int{3, 0} {
+  q, err := divide(10, d)
+  if err != nil {
+    print("error:", err)
+    continue
+  }
+  print("10 /", d, "=", q)
+}
+
+# defer schedules a call for when the function exits (last to first)
+fn chores() {
+  defer print("3. clear the table")
+  defer print("2. wash the dishes")
+  print("1. have dinner")
+}
+chores()
+
+# panic unwinds the calls; recover, inside a defer, stops the panic
+fn safe(f: fn()) -> (err: error) {
+  defer fn() {
+    if r := recover(); r != nil { err = errors.New("recovered: " + str(r)) }
+  }()
+  f()
+  return nil
+}
+print(safe(fn() { panic("something went wrong") }))
+print(safe(fn() {
+  list := []int{1, 2, 3}
+  i := 5
+  print(list[i])               # a runtime error also becomes a panic
+}))
+print(safe(fn() { print("all good") }))

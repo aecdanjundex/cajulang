@@ -1,0 +1,53 @@
+fn worker(id: int, jobs: chan int, results: chan str) {
+  for t := range jobs {
+    results <- "w" + str(id) + ":" + str(t * t)
+  }
+}
+jobs := make(chan int, 10)
+results := make(chan str, 10)
+for w := 1; w <= 3; w++ { go worker(w, jobs, results) }
+for i := 1; i <= 5; i++ { jobs <- i }
+close(jobs)
+for i := 0; i < 5; i++ { print(<-results) }
+
+ping := make(chan str)
+pong := make(chan str)
+go fn() {
+  for i := 0; i < 3; i++ {
+    msg := <-ping
+    pong <- msg + " pong"
+  }
+}()
+for i := 0; i < 3; i++ {
+  ping <- "ping" + str(i)
+  print(<-pong)
+}
+
+done := make(chan bool)
+data := make(chan int)
+go fn() {
+  for i := 0; i < 3; i++ { data <- i; sleep(0.1) }
+  done <- true
+}()
+finished := false
+for !finished {
+  select {
+  case v := <-data:
+    print("datum", v)
+  case <-done:
+    print("done")
+    finished = true
+  }
+}
+c := make(chan int, 1)
+select {
+case v := <-c: print("received", v)
+default: print("nothing ready")
+}
+v, ok := <-jobs
+print(v, ok)
+go fn() { sleep(0.2); print("goroutine slept") }()
+sleep(0.5)
+print("end of main")
+blocker := make(chan int)
+<-blocker

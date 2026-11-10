@@ -54,3 +54,14 @@ Resumo das conversas que construíram a Caju, para dar contexto a quem continua.
 - `5e-324`: o JS imprime o subnormal mais curto; o nativo imprime 12 algarismos.
 - `any` com tipo errado indo para um tipo concreto: a VM segue sem conferir; o nativo dá erro.
 - (Fase 6) a ordem de preempção entre goroutines não será a mesma.
+
+## Reorganização e compilador em Caju (fase 9)
+
+- O repositório foi reorganizado: a página HTML e o runtime em Rust saíram; o compilador em
+  JavaScript foi dividido em `bootstrap/*.js`; o runtime foi para `rt/`, a biblioteca padrão para
+  `lib/` e os testes para `tests/` (com a saída esperada ao lado de cada programa). Código,
+  comentários e mensagens passaram para o inglês.
+- O compilador foi portado para Caju (`compiler/*.caju`) como tradução fiel do JS
+  (`docs/compiler-port.md`). Resultado: para todos os programas de `tests/` ele gera binários
+  idênticos byte a byte aos do bootstrap (Linux e Windows), e a autocompilação fecha: os
+  estágios 1, 2 e 3 são iguais (cerca de 2 s por estágio, binário de 1,2 MB).

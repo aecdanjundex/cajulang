@@ -1,0 +1,27 @@
+# Counts the triples a² + b² = c² with a < b < c ≤ 2 000.
+# That is 2 million (a, b) pairs tested with a square root (x ** 0.5).
+const MAX_C = 2_000
+let total = 0
+let primitive = 0
+
+for a = 1 to MAX_C {
+  for b = a + 1 to MAX_C {
+    let c = (a * a + b * b) ** 0.5
+    if c <= MAX_C and c % 1 == 0 {
+      total = total + 1
+      # primitive when a and b have no common divisor (Euclid's algorithm)
+      let x = a
+      let y = b
+      while y != 0 {
+        let r = x % y
+        x = y
+        y = r
+      }
+      if x == 1 {
+        primitive = primitive + 1
+      }
+    }
+  }
+}
+print(total, "pythagorean triples with c ≤", MAX_C)
+print(primitive, "of them are primitive")

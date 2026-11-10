@@ -1,0 +1,12 @@
+worker 1 did job 1
+worker 2 did job 2
+worker 3 did job 3
+worker 1 did job 4
+worker 2 did job 5
+worker 3 did job 6
+tick 1
+tick 2
+tick 3
+finished
+waiting for a value that never comes...
+Runtime error in ex-goroutines.caju, line 38: All goroutines are blocked, waiting for each other (deadlock).

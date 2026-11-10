@@ -1,0 +1,1 @@
+Type error in mem-types.caju, line 4: poke32 expects int as argument 2, but got str.

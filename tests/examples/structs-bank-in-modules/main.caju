@@ -1,0 +1,16 @@
+# The struct, the methods and the interface come from bank.caju.
+# Methods with *Account change the original account.
+import { Account, Statement, open } from "bank.caju"
+
+let ana = open("Ana", 100)
+ana.deposit(50)
+ana.withdraw(30)
+ana.withdraw(500)
+
+let bia = open("Bia", 10)
+bia.deposit(5)
+
+fn show(e: Statement) { print("•", e.summary()) }
+show(ana)
+show(bia)
+print(ana)

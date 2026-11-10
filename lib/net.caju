@@ -1,0 +1,152 @@
+# std/net: TCP sockets over IPv4 (Linux x86-64).
+
+import "std/strings"
+import "std/strconv"
+
+const SYS_CLOSE = 3
+const SYS_SOCKET = 41
+const SYS_CONNECT = 42
+const SYS_ACCEPT = 43
+const SYS_SENDTO = 44
+const SYS_RECVFROM = 45
+const SYS_SHUTDOWN = 48
+const SYS_BIND = 49
+const SYS_LISTEN = 50
+const SYS_SETSOCKOPT = 54
+
+const AF_INET = 2
+const SOCK_STREAM = 1
+const SOL_SOCKET = 1
+const SO_REUSEADDR = 2
+const MSG_NOSIGNAL = 0x4000      # a write to a closed connection returns an error instead of killing the program
+
+fn sys_error(what: str, r: int) -> error {
+  e := -r
+  msg := "error " + str(e)
+  if e == 98 { msg = "address already in use" } else if e == 111 { msg = "connection refused" } else if e == 13 { msg = "permission denied" } else if e == 104 { msg = "connection reset by peer" } else if e == 32 { msg = "broken pipe" } else if e == 110 { msg = "connection timed out" } else if e == 101 { msg = "network is unreachable" } else if e == 99 { msg = "cannot assign requested address" }
+  return errors.New(what + ": " + msg)
+}
+
+# "a.b.c.d" -> the address as a 32-bit number in network order (as stored in memory), or -1
+fn parse_ipv4(host: str) -> int {
+  if host == "" || host == "localhost" { host = "127.0.0.1" }
+  parts := strings.split(host, ".")
+  if len(parts) != 4 { return -1 }
+  a := 0
+  for i, p := range parts {
+    v, err := strconv.parse_int(p, 10)
+    if err != nil || v < 0 || v > 255 { return -1 }
+    a = a | (v << (8 * i))
+  }
+  return a
+}
+
+# struct sockaddr_in: family, port (big-endian), address, 8 bytes of zeros
+fn sockaddr(ip: int, port: int) -> int {
+  m := __newstr(16)
+  p := m + 8
+  __store64(p, 0)
+  __store64(p + 8, 0)
+  __store8(p, AF_INET)
+  __store8(p + 2, port >> 8)
+  __store8(p + 3, port & 255)
+  __store8(p + 4, ip)
+  __store8(p + 5, ip >> 8)
+  __store8(p + 6, ip >> 16)
+  __store8(p + 7, ip >> 24)
+  return p
+}
+
+export struct Listener {
+  fd: int
+  port: int
+}
+
+export struct Conn {
+  fd: int
+  closed: bool
+}
+
+# listens for TCP connections on host:port ("0.0.0.0" for every interface)
+export fn listen(host: str, port: int) -> (*Listener, error) {
+  ip := parse_ipv4(host)
+  if ip < 0 { return nil, errors.New("listen: invalid IPv4 address \"" + host + "\"") }
+  fd := __syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0, 0, 0, 0)
+  if fd < 0 { return nil, sys_error("socket", fd) }
+  one := __newstr(8)
+  __store64(one + 8, 1)
+  __syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, one + 8, 4, 0)
+  r := __syscall(SYS_BIND, fd, sockaddr(ip, port), 16, 0, 0, 0)
+  if r < 0 {
+    __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return nil, sys_error("listen on " + host + ":" + str(port), r)
+  }
+  r = __syscall(SYS_LISTEN, fd, 128, 0, 0, 0, 0)
+  if r < 0 {
+    __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return nil, sys_error("listen", r)
+  }
+  return &Listener{fd: fd, port: port}, nil
+}
+
+# waits for the next connection
+export fn (l: *Listener) accept() -> (*Conn, error) {
+  __flush()            # print's pending output goes out before the program waits
+  while true {
+    fd := __syscall(SYS_ACCEPT, l.fd, 0, 0, 0, 0, 0)
+    if fd == -4 { continue }         # interrupted: try again
+    if fd < 0 { return nil, sys_error("accept", fd) }
+    return &Conn{fd: fd}, nil
+  }
+  return nil, nil
+}
+export fn (l: *Listener) close() { __syscall(SYS_CLOSE, l.fd, 0, 0, 0, 0, 0) }
+
+# connects to host:port
+export fn dial(host: str, port: int) -> (*Conn, error) {
+  ip := parse_ipv4(host)
+  if ip < 0 { return nil, errors.New("dial: invalid IPv4 address \"" + host + "\"") }
+  fd := __syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0, 0, 0, 0)
+  if fd < 0 { return nil, sys_error("socket", fd) }
+  r := __syscall(SYS_CONNECT, fd, sockaddr(ip, port), 16, 0, 0, 0)
+  if r < 0 {
+    __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return nil, sys_error("dial " + host + ":" + str(port), r)
+  }
+  return &Conn{fd: fd}, nil
+}
+
+# reads up to max bytes; "" with a nil error means the other side closed the connection
+export fn (c: *Conn) read(max: int) -> (str, error) {
+  __flush()
+  m := __newstr(max)
+  while true {
+    r := __syscall(SYS_RECVFROM, c.fd, m + 8, max, 0, 0, 0)
+    if r == -4 { continue }
+    if r < 0 { return "", sys_error("read", r) }
+    __store64(m, r)
+    __store8(m + 8 + r, 0)
+    return __pstr(m), nil
+  }
+  return "", nil
+}
+
+# writes all of s
+export fn (c: *Conn) write(s: str) -> error {
+  p := __strp(s) + 8
+  n := len(s)
+  while n > 0 {
+    w := __syscall(SYS_SENDTO, c.fd, p, n, MSG_NOSIGNAL, 0, 0)
+    if w == -4 { continue }
+    if w < 0 { return sys_error("write", w) }
+    p += w
+    n -= w
+  }
+  return nil
+}
+
+export fn (c: *Conn) close() {
+  if c.closed { return }
+  c.closed = true
+  __syscall(SYS_CLOSE, c.fd, 0, 0, 0, 0, 0)
+}

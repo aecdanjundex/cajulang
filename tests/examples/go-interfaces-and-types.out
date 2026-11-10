@@ -1,0 +1,11 @@
+rectangle 6
+circle 3.14159
+radius 1
+is the first one a circle? false
+integer 7
+number 2.5
+string of 5 bytes
+slice with 2 items
+error: oops
+nil
+something else

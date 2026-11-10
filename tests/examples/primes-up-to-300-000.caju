@@ -1,0 +1,25 @@
+# Counts the primes up to 300 000 by trial division.
+# About 30 million instructions on the VM. In Tree mode, it takes much longer.
+# Shows the progress every 50 000 numbers.
+const LIMIT = 300_000
+const STEP = 50_000
+let total = 1   # 2 already counts
+
+for n = 3 to LIMIT {
+  if n % 2 != 0 {
+    let prime = true
+    let d = 3
+    while d * d <= n and prime {
+      if n % d == 0 {
+        prime = false
+      }
+      d = d + 2
+    }
+    if prime {
+      total = total + 1
+    }
+  }
+  if n % STEP == 0 {
+    print("up to", n, "→", total, "primes")
+  }
+}

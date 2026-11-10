@@ -1,0 +1,10 @@
+# The project always starts at main.caju.
+# Click the tabs above to see the other files.
+import { STORE_NAME, DELIVERY_FEE } from "config.caju"
+import { MOZZARELLA, PEPPERONI, DISCOUNT_FACTOR } from "menu.caju"
+
+print("Welcome to", STORE_NAME)
+let order = 2 * MOZZARELLA + PEPPERONI
+let total = order * DISCOUNT_FACTOR + DELIVERY_FEE
+print("Order: $", order)
+print("With discount and delivery: $", total)

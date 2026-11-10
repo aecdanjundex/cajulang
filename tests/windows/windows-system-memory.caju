@@ -1,0 +1,15 @@
+# GlobalMemoryStatusEx is not imitated on the page: here it returns false.
+# Build the .exe to see the real numbers of your computer.
+extern "kernel32.dll" fn GlobalMemoryStatusEx(info: ptr) -> bool
+
+const MB = 1024 * 1024
+let info = alloc(64)
+poke32(info, 64)           # dwLength: the size of the MEMORYSTATUSEX struct
+if GlobalMemoryStatusEx(info) {
+  print("Memory in use:", peek32(info + 4), "%")
+  print("Total RAM:", peek64(info + 8) / MB, "MB")
+  print("Free RAM:", peek64(info + 16) / MB, "MB")
+} else {
+  print("No data: run the .exe on Windows to see the real memory.")
+}
+free(info)

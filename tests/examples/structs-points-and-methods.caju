@@ -1,0 +1,37 @@
+# struct groups typed fields. Methods are functions with a receiver, as in Go:
+#   fn (p: Point) name()    receives a copy
+#   fn (p: *Point) name()   receives the original and can change it
+struct Point {
+  x: num
+  y: num
+}
+
+fn (p: Point) distance() -> num {
+  return (p.x ** 2 + p.y ** 2) ** 0.5
+}
+
+fn (p: *Point) move(dx: num, dy: num) {
+  p.x = p.x + dx
+  p.y = p.y + dy
+}
+
+fn (p: Point) tryMove() {
+  p.x = 1000          # changes only the copy
+}
+
+let a = Point{x: 3, y: 4}
+print(a, "distance", a.distance())
+
+a.move(1, 1)
+print("after move:", a)
+a.tryMove()
+print("after tryMove:", a)
+
+# structs are values: b is a copy of a
+let b = a
+b.x = 0
+print("a:", a, "b:", b)
+print("equal?", a == b, a == Point{x: 4, y: 5})
+
+# a field not given starts with the zero value of its type
+print(Point{}, Point{y: 2})

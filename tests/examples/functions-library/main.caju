@@ -1,0 +1,11 @@
+# The functions come from math.caju, with export fn
+import { gcd, is_prime, power } from "math.caju"
+
+print("gcd(84, 36) =", gcd(84, 36))
+print("2^20 =", power(2, 20))
+
+let primes = ""
+for n = 2 to 40 {
+  if is_prime(n) { primes = primes + n + " " }
+}
+print("Primes up to 40:", primes)

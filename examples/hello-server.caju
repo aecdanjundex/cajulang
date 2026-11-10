@@ -1,0 +1,13 @@
+# A web server that answers "hello world" on http://localhost:3200/
+import "std/http"
+import "std/os"
+
+http.handle("/", fn(req: *http.Request, res: *http.Response) {
+  res.write("hello world")
+})
+print("listening on http://localhost:3200/")
+err := http.listen_and_serve("0.0.0.0", 3200)
+if err != nil {
+  os.eprintln(err.Error())
+  os.exit(1)
+}

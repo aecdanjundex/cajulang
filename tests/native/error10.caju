@@ -1,0 +1,3 @@
+let x: any = "text"
+n := x.(int)
+print(n)

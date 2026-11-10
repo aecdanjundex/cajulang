@@ -1,0 +1,14 @@
+let grade = 7.5
+
+if grade >= 9 {
+  print("Excellent")
+} else if grade >= 7 {
+  print("Passed")
+} else {
+  print("Make-up exam")
+}
+
+let age = 20
+if age >= 18 and not (age >= 65) {
+  print("Working age")
+}

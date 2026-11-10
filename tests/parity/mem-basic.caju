@@ -1,0 +1,6 @@
+let p = alloc(16)
+poke32(p, 123456)
+poke16(p + 4, 65535)
+poke8(p + 6, 300)
+print(peek32(p), peek16(p + 4), peek8(p + 6), peek64(p))
+free(p)

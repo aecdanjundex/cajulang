@@ -1,0 +1,31 @@
+export interface Statement {
+  summary() -> str
+}
+
+export struct Account {
+  owner: str
+  balance: num
+  operations: int
+}
+
+export fn open(owner: str, initial: num) -> Account {
+  return Account{owner: owner, balance: initial}
+}
+
+fn (c: *Account) deposit(amount: num) {
+  c.balance = c.balance + amount
+  c.operations = c.operations + 1
+}
+
+fn (c: *Account) withdraw(amount: num) {
+  if amount > c.balance {
+    print(c.owner + ": insufficient balance to withdraw " + str(amount))
+    return
+  }
+  c.balance = c.balance - amount
+  c.operations = c.operations + 1
+}
+
+fn (c: Account) summary() -> str {
+  return c.owner + " has $ " + str(c.balance) + " (operations: " + str(c.operations) + ")"
+}

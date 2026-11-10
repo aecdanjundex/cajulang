@@ -1,0 +1,73 @@
+# dump_main: prints the syntax tree of a stage in the canonical text of bootstrap/dump.js,
+# to compare the port with the bootstrap compiler.
+#
+#   dump_main [--stage=parse|link|check] file.caju
+#     parse  the entry file only, as the parser returns it
+#     link   the linked program (all imported files)
+#     check  the linked program after the type checker and the checks (with annotations)
+#
+# The standard library comes from $CAJU_LIB (default /home/aecio/caju/lib).
+
+import "std/os"
+import "std/strings"
+import "ast"
+import "lexer"
+import "parser"
+import "linker"
+import "project"
+import "dump"
+import "check"
+
+let files: []*ast.SourceFile = nil
+
+fn file_names() -> []str {
+  names := []str{}
+  for _, f := range files { names = append(names, f.name) }
+  return names
+}
+
+# the tree of a stage; panics with *ast.CompileError on an error in the program
+fn run_stage(stage: str, entry: str, lib_dir: str) -> *ast.Node {
+  files = project.load_project(entry, lib_dir)
+  if len(files) == 0 {
+    os.eprintln("dump_main: cannot read " + entry)
+    os.exit(2)
+  }
+  if stage == "parse" { return parser.parse(lexer.lex(files[0].src, 0)) }
+  if stage == "link" { return linker.link(files) }
+  if stage == "check" {
+    prog := linker.link(files)
+    check.check(prog)
+    return prog
+  }
+  os.eprintln("dump_main: unknown stage " + stage)
+  os.exit(2)
+  return nil
+}
+
+fn run(stage: str, entry: str, lib_dir: str) {
+  defer fn() {
+    r := recover()
+    if r != nil {
+      if e, ok := r.(*ast.CompileError); ok {
+        os.eprintln(ast.format_error(e, file_names()))
+        os.exit(1)
+      } else { panic(r) }
+    }
+  }()
+  tree := run_stage(stage, entry, lib_dir)
+  os.stdout(dump.dump(tree))
+}
+
+stage := "parse"
+entry := ""
+for _, a := range os.args()[1:] {
+  if strings.has_prefix(a, "--stage=") { stage = a[8:] } else if !strings.has_prefix(a, "--") { entry = a }
+}
+if entry == "" {
+  os.eprintln("usage: dump_main [--stage=parse|link|check] file.caju")
+  os.exit(2)
+}
+lib_dir := os.getenv("CAJU_LIB")
+if lib_dir == "" { lib_dir = "/home/aecio/caju/lib" }
+run(stage, entry, lib_dir)

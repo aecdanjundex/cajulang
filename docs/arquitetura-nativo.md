@@ -1,8 +1,8 @@
 # Compilador nativo da Caju: como está feito (fases 1 a 5)
 
-Referência técnica para quem continua o trabalho. O código está em `native/native.js` (o
-compilador, em JavaScript, colado dentro de `web/caju.html` pelo `native/splice.py`) e em
-`native/rt/*.caju` (o runtime, escrito em Caju e compilado junto com cada programa).
+Referência técnica para quem continua o trabalho. O código está em `bootstrap/native.js` (o
+compilador, em JavaScript) e em
+`rt/*.caju` (o runtime, escrito em Caju e compilado junto com cada programa).
 
 ## Visão geral
 
@@ -100,7 +100,7 @@ int8/uint/num-inteiro/*struct vão numa caixa. O nativo reproduz pelo descritor 
 - `x.(T)` (`rt_assert`) e o switch de tipos (`rt_type_is`) usam o descritor; a mensagem de erro
   é a da VM (`x.(T): o valor guardado é U, não T`).
 
-## Runtime em Caju (`native/rt/`)
+## Runtime em Caju (`rt/`)
 
 | Arquivo | Conteúdo |
 |---|---|

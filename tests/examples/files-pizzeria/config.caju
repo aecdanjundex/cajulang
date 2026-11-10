@@ -1,0 +1,7 @@
+# Settings used by several files.
+# Only what has export can be imported.
+export const STORE_NAME = "Caju Pizzeria"
+export const DELIVERY_FEE = 7.5
+export const DISCOUNT_PERCENT = 10
+
+const REGISTER_PASSWORD = 1234   # no export: stays only in this file

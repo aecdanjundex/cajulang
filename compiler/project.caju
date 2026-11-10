@@ -1,0 +1,84 @@
+# Project loading: reads the entry file and every file it imports. Port of bootstrap/project.js.
+# Import paths are relative to the entry file's directory; paths starting with "std/" come from
+# the standard library directory (lib_dir).
+
+import "std/os"
+import "std/strings"
+import "ast"
+import "lexer"
+
+struct Loader {
+  base: str
+  lib_dir: str
+  files: []*ast.SourceFile
+  seen: map[str]bool
+}
+
+export fn resolve_import(base: str, name: str, lib_dir: str) -> str {
+  if strings.has_prefix(name, "std/") { return join_path(lib_dir, name[4:]) }
+  return join_path(base, name)
+}
+
+fn join_path(dir: str, name: str) -> str {
+  if dir == "" { return name }
+  if strings.has_suffix(dir, "/") { return dir + name }
+  return dir + "/" + name
+}
+
+# the directory of an absolute path ("/" for a file at the root)
+fn dir_name(p: str) -> str {
+  i := strings.last_index(p, "/")
+  if i < 0 { return "." }
+  if i == 0 { return "/" }
+  return p[0:i]
+}
+fn base_name(p: str) -> str {
+  for len(p) > 1 && strings.has_suffix(p, "/") { p = p[0:len(p) - 1] }
+  return p[strings.last_index(p, "/") + 1:]
+}
+fn absolute(p: str) -> str {
+  if strings.has_prefix(p, "/") { return p }
+  return join_path(os.getwd(), p)
+}
+
+# the tokens of src, or nil if it has a lexical error (the parser reports it later)
+fn try_lex(src: str, idx: int) -> (toks: []*lexer.Token) {
+  defer fn() {
+    if r := recover(); r != nil { toks = nil }
+  }()
+  toks = lexer.lex(src, idx)
+  return
+}
+
+fn (ld: *Loader) add(name: str, file: str) {
+  if ld.seen[name] { return }
+  ld.seen[name] = true
+  if !os.exists(file) { return }           # the linker reports the missing file
+  src, err := os.read_file(file)
+  if err != nil { return }
+  ld.files = append(ld.files, &ast.SourceFile{name: name, src: src})
+  toks := try_lex(src, len(ld.files) - 1)
+  if toks == nil { return }
+  for i := 0; i + 1 < len(toks); i++ {
+    if toks[i].type != "KEYWORD" || toks[i].value != "import" { continue }
+    j := i + 1
+    if toks[j].value == "{" {
+      while j < len(toks) && toks[j].value != "}" { j++ }
+      j += 2
+    }
+    if j < len(toks) && toks[j].type == "NAME" { j++ }      # import alias "path"
+    if j < len(toks) && toks[j].type == "STRING" {
+      nm := toks[j].value
+      if !strings.has_suffix(nm, ".caju") { nm = nm + ".caju" }
+      ld.add(nm, resolve_import(ld.base, nm, ld.lib_dir))
+    }
+  }
+}
+
+# the entry first, then the files in the order their imports were found
+export fn load_project(entry: str, lib_dir: str) -> []*ast.SourceFile {
+  abs := absolute(entry)
+  ld := &Loader{base: dir_name(abs), lib_dir: lib_dir, files: []*ast.SourceFile{}, seen: map[str]bool{}}
+  ld.add(base_name(entry), abs)
+  return ld.files
+}

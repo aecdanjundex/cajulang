@@ -1,0 +1,2 @@
+1
+Runtime error in i_deadlock.caju, line 4: All goroutines are blocked, waiting for each other (deadlock).

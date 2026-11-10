@@ -1,0 +1,72 @@
+fn generator() -> fn() -> fn() -> int {
+  base := 100
+  return fn() -> fn() -> int {
+    k := 0
+    return fn() -> int {
+      k++
+      base++
+      return base * 10 + k
+    }
+  }
+}
+g := generator()
+a := g()
+b := g()
+print(a(), a(), b(), a())
+let fact: fn(int) -> int = nil
+fact = fn(n: int) -> int {
+  if n <= 1 { return 1 }
+  return n * fact(n - 1)
+}
+print(fact(10))
+fn adjust(n: int) -> fn() -> int {
+  return fn() -> int { n *= 2; return n }
+}
+d := adjust(3)
+print(d(), d(), d())
+count := 0
+incr := fn() { count++ }
+for i := 0; i < 5; i++ { incr() }
+print(count)
+let fs: []fn() -> int = nil
+for i := 0; i < 3; i++ {
+  j := i * i
+  fs = append(fs, fn() -> int { return i + j })
+}
+for _, f := range fs { print(f()) }
+fs2 := []fn() -> int{}
+for i := range 3 { fs2 = append(fs2, fn() -> int { return i }) }
+for _, f := range fs2 { print(f()) }
+struct Stack { items: []int }
+fn (p: *Stack) push(x: int) { p.items = append(p.items, x) }
+fn (p: Stack) top() -> int { return p.items[len(p.items) - 1] }
+pl := &Stack{}
+push := pl.push
+push(1)
+push(2)
+tp := pl.top
+push(3)
+print(pl.items, tp(), pl.top())
+struct Pair { a: int, b: str }
+fn two() -> (int, str) { return 7, "seven" }
+let pr: Pair = Pair{}
+let mp: map[str]int = map[str]int{}
+pr.a, pr.b = two()
+mp["x"], pr.b = two()
+print(pr, mp)
+let xs: []any = []any{Pair{1, "a"}, Pair{1, "a"}, &Pair{2, "b"}}
+print(xs[0] == xs[1], xs[1] == xs[2], xs)
+fn apply(f: fn(any) -> any, x: any) -> any { return f(x) }
+print(apply(fn(v: any) -> any { return v + v }, 21), apply(fn(v: any) -> any { return v + "!" }, "hi"))
+fn sum(ns: []int) -> (total: int, n: int) {
+  for _, x := range ns { total += x }
+  n = len(ns)
+  return total, n
+}
+t, n := sum([]int{1, 2, 3, 4})
+print(t, n)
+fn average(ns: []int) -> num {
+  t, n := sum(ns)
+  return num(t) / num(n)
+}
+print(average([]int{1, 2, 3, 4}))

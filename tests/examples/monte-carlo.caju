@@ -1,0 +1,22 @@
+# Estimates π by sampling points in a square and counting how many fall in the circle.
+# With no random function in the language, the program itself generates
+# pseudorandom numbers with the Park–Miller generator: seed = seed × 16807 mod (2³¹ − 1).
+const POINTS = 2_000_000
+const MODULUS = 2147483647
+const MULT = 16807
+const REPORT = 400_000
+
+let seed = 42
+let inside = 0
+for i = 1 to POINTS {
+  seed = seed * MULT % MODULUS
+  let x = seed / MODULUS
+  seed = seed * MULT % MODULUS
+  let y = seed / MODULUS
+  if x * x + y * y <= 1 {
+    inside = inside + 1
+  }
+  if i % REPORT == 0 {
+    print(i, "points → π ≈", 4 * inside / i)
+  }
+}

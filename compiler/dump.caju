@@ -1,0 +1,193 @@
+# Prints a syntax tree in the canonical text form of bootstrap/dump.js, to compare the port with
+# the bootstrap compiler stage by stage. Generated from the field list of ast.caju: when a field
+# is added to Node, add it here too, in the same position.
+
+import "std/strings"
+import "std/strconv"
+import "std/math"
+import "ast"
+
+# a string as JSON.stringify writes it (the JavaScript dump uses it): \u00XX for control bytes,
+# \b \f \n \r \t, and \udXXX for an encoded lone surrogate
+fn json_quote(s: str) -> str {
+  b := strings.Builder{}
+  b.write_byte(34)
+  hex := "0123456789abcdef"
+  i := 0
+  while i < len(s) {
+    c := int(s[i])
+    if c == 34 { b.write("\\\"") } else if c == 92 { b.write("\\\\") } else if c == 10 { b.write("\\n") } else if c == 9 { b.write("\\t") } else if c == 13 { b.write("\\r") } else if c == 8 { b.write("\\b") } else if c == 12 { b.write("\\f") } else if c < 32 {
+      b.write("\\u00")
+      b.write_byte(int(hex[c >> 4]))
+      b.write_byte(int(hex[c & 15]))
+    } else if c == 0xED && i + 2 < len(s) && int(s[i + 1]) >= 0xA0 {
+      cp := ((c & 15) << 12) | ((int(s[i + 1]) & 63) << 6) | (int(s[i + 2]) & 63)
+      b.write("\\u")
+      for k := 12; k >= 0; k -= 4 { b.write_byte(int(hex[(cp >> k) & 15])) }
+      i += 2
+    } else { b.write_byte(c) }
+    i++
+  }
+  b.write_byte(34)
+  return b.string()
+}
+# the 64 bits of x in hexadecimal, unsigned
+fn hex_u64(x: int) -> str {
+  if x >= 0 { return strconv.format_int(x, 16) }
+  hi := (x >> 4) & 0x0FFFFFFFFFFFFFFF
+  return strconv.format_int(hi, 16) + strconv.format_int(x & 15, 16)
+}
+
+struct Dumper {
+  out: strings.Builder
+  indent: int
+}
+
+fn (d: *Dumper) line(s: str) {
+  for i := 0; i < d.indent + 1; i++ { d.out.write("  ") }
+  d.out.write(s)
+  d.out.write_byte(10)
+}
+fn (d: *Dumper) node_field(name: str, n: *ast.Node) {
+  d.line(name + ":")
+  d.indent += 2
+  d.node(n)
+  d.indent -= 2
+}
+fn (d: *Dumper) nodes(name: str, xs: []*ast.Node) {
+  if len(xs) == 0 { return }
+  d.line(name + ": [" + str(len(xs)) + "]")
+  d.indent += 2
+  for _, x := range xs { d.node(x) }
+  d.indent -= 2
+}
+fn (d: *Dumper) strs(name: str, xs: []str) {
+  if len(xs) == 0 { return }
+  q := []str{}
+  for _, x := range xs { q = append(q, json_quote(x)) }
+  d.line(name + ": [" + strings.join(q, " ") + "]")
+}
+fn (d: *Dumper) set(name: str, m: map[str]bool) {
+  if len(m) == 0 { return }
+  q := []str{}
+  for k, _ := range m { q = append(q, json_quote(k)) }
+  d.line(name + ": {" + strings.join(q, " ") + "}")
+}
+
+fn (d: *Dumper) node(n: *ast.Node) {
+  for i := 0; i < d.indent; i++ { d.out.write("  ") }
+  d.out.write(n.kind)
+  d.out.write_byte(10)
+  NONE := ast.NONE
+  if n.line != 0 { d.line("line=" + str(n.line)) }
+  if n.col != 0 { d.line("col=" + str(n.col)) }
+  if n.end_line != 0 { d.line("end_line=" + str(n.end_line)) }
+  if n.name != "" { d.line("name=" + json_quote(n.name)) }
+  if n.op != "" { d.line("op=" + json_quote(n.op)) }
+  if n.num_value != 0.0 || math.bits(n.num_value) != 0 { d.line("num_value=0x" + hex_u64(math.bits(n.num_value))) }
+  if n.str_value != "" { d.line("str_value=" + json_quote(n.str_value)) }
+  if n.bool_value { d.line("bool_value=true") }
+  if n.raw != "" { d.line("raw=" + json_quote(n.raw)) }
+  if n.int { d.line("int=true") }
+  if n.rune { d.line("rune=true") }
+  if n.value != nil { d.node_field("value", n.value) }
+  if n.left != nil { d.node_field("left", n.left) }
+  if n.right != nil { d.node_field("right", n.right) }
+  if n.arg != nil { d.node_field("arg", n.arg) }
+  if n.expr != nil { d.node_field("expr", n.expr) }
+  if n.obj != nil { d.node_field("obj", n.obj) }
+  if n.index != nil { d.node_field("index", n.index) }
+  if n.lo != nil { d.node_field("lo", n.lo) }
+  if n.hi != nil { d.node_field("hi", n.hi) }
+  if n.key != nil { d.node_field("key", n.key) }
+  if n.ch != nil { d.node_field("ch", n.ch) }
+  if n.call != nil { d.node_field("call", n.call) }
+  if n.fn_ != nil { d.node_field("fn_", n.fn_) }
+  if n.cond != nil { d.node_field("cond", n.cond) }
+  if n.init != nil { d.node_field("init", n.init) }
+  if n.post != nil { d.node_field("post", n.post) }
+  if n.then != nil { d.node_field("then", n.then) }
+  if n.otherwise != nil { d.node_field("otherwise", n.otherwise) }
+  if n.tag != nil { d.node_field("tag", n.tag) }
+  if n.subject != nil { d.node_field("subject", n.subject) }
+  if n.from_ != nil { d.node_field("from_", n.from_) }
+  if n.to_ != nil { d.node_field("to_", n.to_) }
+  if n.body != nil { d.node_field("body", n.body) }
+  if n.target != nil { d.node_field("target", n.target) }
+  if n.recv != nil { d.node_field("recv", n.recv) }
+  d.nodes("stmts", n.stmts)
+  d.nodes("args", n.args)
+  if n.args_spread { d.line("args_spread=true") }
+  d.nodes("values", n.values)
+  d.nodes("targets", n.targets)
+  d.nodes("exprs", n.exprs)
+  d.nodes("cases", n.cases)
+  d.nodes("elems", n.elems)
+  d.nodes("fields", n.fields)
+  d.nodes("methods", n.methods)
+  d.nodes("embeds", n.embeds)
+  d.nodes("vars", n.vars)
+  d.nodes("import_names", n.import_names)
+  if n.is_default { d.line("is_default=true") }
+  if n.decl != "" { d.line("decl=" + json_quote(n.decl)) }
+  if n.define { d.line("define=true") }
+  if n.type != "" { d.line("type=" + json_quote(n.type)) }
+  if n.type_arg != "" { d.line("type_arg=" + json_quote(n.type_arg)) }
+  d.strs("types", n.types)
+  d.strs("names", n.names)
+  d.strs("params", n.params)
+  d.strs("ptypes", n.ptypes)
+  if n.rtype != "" { d.line("rtype=" + json_quote(n.rtype)) }
+  d.strs("rnames", n.rnames)
+  if n.method != "" { d.line("method=" + json_quote(n.method)) }
+  if n.ptr { d.line("ptr=true") }
+  if n.embedded { d.line("embedded=true") }
+  if n.exported { d.line("exported=true") }
+  if n.label != "" { d.line("label=" + json_quote(n.label)) }
+  if n.bind != "" { d.line("bind=" + json_quote(n.bind)) }
+  if n.path != "" { d.line("path=" + json_quote(n.path)) }
+  if n.ns != "" { d.line("ns=" + json_quote(n.ns)) }
+  if n.symbol != "" { d.line("symbol=" + json_quote(n.symbol)) }
+  if n.dll != "" { d.line("dll=" + json_quote(n.dll)) }
+  if n.conv != "" { d.line("conv=" + json_quote(n.conv)) }
+  if n.ret != "" { d.line("ret=" + json_quote(n.ret)) }
+  if n.dll_name != "" { d.line("dll_name=" + json_quote(n.dll_name)) }
+  if n.dll_ret != "" { d.line("dll_ret=" + json_quote(n.dll_ret)) }
+  d.strs("dll_types", n.dll_types)
+  if n.comma_ok { d.line("comma_ok=true") }
+  if n.privileged { d.line("privileged=true") }
+  if n.ty != "" { d.line("ty=" + json_quote(n.ty)) }
+  if n.ik != NONE && n.ik != 0 { d.line("ik=" + str(n.ik)) }
+  if n.fk != NONE && n.fk != 0 { d.line("fk=" + str(n.fk)) }
+  if n.nk != NONE && n.nk != 0 { d.line("nk=" + str(n.nk)) }
+  if n.call_kind != "" { d.line("call_kind=" + json_quote(n.call_kind)) }
+  if n.conv_mode != "" { d.line("conv_mode=" + json_quote(n.conv_mode)) }
+  if n.conv_to != "" { d.line("conv_to=" + json_quote(n.conv_to)) }
+  if n.box_t != "" { d.line("box_t=" + json_quote(n.box_t)) }
+  if n.append_t != "" { d.line("append_t=" + json_quote(n.append_t)) }
+  if n.bind_type != "" { d.line("bind_type=" + json_quote(n.bind_type)) }
+  if n.bound_method != "" { d.line("bound_method=" + json_quote(n.bound_method)) }
+  if n.stype != "" { d.line("stype=" + json_quote(n.stype)) }
+  d.nodes("sfields", n.sfields)
+  d.strs("field_path", n.field_path)
+  if n.target_name != "" { d.line("target_name=" + json_quote(n.target_name)) }
+  if n.fty != "" { d.line("fty=" + json_quote(n.fty)) }
+  if n.rk != "" { d.line("rk=" + json_quote(n.rk)) }
+  if n.ret_ty != "" { d.line("ret_ty=" + json_quote(n.ret_ty)) }
+  d.strs("captures", n.captures)
+  d.set("celled", n.celled)
+  if n.field_call { d.line("field_call=true") }
+  if n.recv_ptr { d.line("recv_ptr=true") }
+  if n.recv_is_ptr { d.line("recv_is_ptr=true") }
+  if n.fn_ref { d.line("fn_ref=true") }
+  if n.named { d.line("named=true") }
+  if n.nres != NONE && n.nres != 0 { d.line("nres=" + str(n.nres)) }
+  if n.discard != NONE && n.discard != 0 { d.line("discard=" + str(n.discard)) }
+  if n.unpack != NONE && n.unpack != 0 { d.line("unpack=" + str(n.unpack)) }
+}
+
+export fn dump(n: *ast.Node) -> str {
+  d := Dumper{}
+  d.node(n)
+  return d.out.string()
+}

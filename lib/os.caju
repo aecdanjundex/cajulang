@@ -1,0 +1,305 @@
+# std/os: the program's arguments and environment, files, and processes (Linux x86-64).
+# Everything here talks to the kernel with system calls.
+
+import "std/strings"
+
+const SYS_READ = 0
+const SYS_WRITE = 1
+const SYS_OPEN = 2
+const SYS_CLOSE = 3
+const SYS_FSTAT = 5
+const SYS_LSEEK = 8
+const SYS_ACCESS = 21
+const SYS_GETPID = 39
+const SYS_EXECVE = 59
+const SYS_GETCWD = 79
+const SYS_MKDIR = 83
+const SYS_UNLINK = 87
+const SYS_CHMOD = 90
+const SYS_CLOCK_GETTIME = 228
+const SYS_MEMFD_CREATE = 319
+const SYS_EXECVEAT = 322
+
+const O_RDONLY = 0
+const O_WRONLY = 1
+const O_CREAT = 64
+const O_TRUNC = 512
+
+let ERRNO_NAMES = []str{"", "operation not permitted", "no such file or directory", "no such process", "interrupted", "input/output error",
+  "no such device or address", "argument list too long", "exec format error", "bad file descriptor", "no child processes",
+  "resource temporarily unavailable", "out of memory", "permission denied", "bad address", "block device required",
+  "device or resource busy", "file exists", "invalid cross-device link", "no such device", "not a directory", "is a directory",
+  "invalid argument", "too many open files in system", "too many open files", "not a terminal", "text file busy",
+  "file too large", "no space left on device", "illegal seek", "read-only file system"}
+
+# the message for a failed system call (it returns -errno)
+fn errno_text(r: int) -> str {
+  e := -r
+  if e > 0 && e < len(ERRNO_NAMES) { return ERRNO_NAMES[e] }
+  return "error " + str(e)
+}
+fn sys_error(what: str, path: str, r: int) -> error {
+  return errors.New(what + " " + path + ": " + errno_text(r))
+}
+
+# a C string (pointer to bytes ending in 0) copied into a Caju string
+fn from_cstr(p: int) -> str {
+  n := 0
+  while __load8(p + n) != 0 { n++ }
+  m := __newstr(n)
+  i := 0
+  while i < n {
+    __store8(m + 8 + i, __load8(p + i))
+    i++
+  }
+  return __pstr(m)
+}
+# a pointer to the bytes of s, ending in 0 (Caju strings already end in 0)
+fn cstr(s: str) -> int { return __strp(s) + 8 }
+
+# the command line: args()[0] is the program, then its arguments
+export fn args() -> []str {
+  p := __argp()
+  argc := __load64(p)
+  out := []str{}
+  for i := 0; i < argc; i++ { out = append(out, from_cstr(__load64(p + 8 + 8 * i))) }
+  return out
+}
+# the environment as "NAME=value" strings
+export fn environ() -> []str {
+  p := __argp()
+  e := p + 8 * (__load64(p) + 2)
+  out := []str{}
+  while __load64(e) != 0 {
+    out = append(out, from_cstr(__load64(e)))
+    e += 8
+  }
+  return out
+}
+# the value of an environment variable, or "" if it is not set
+export fn getenv(name: str) -> str {
+  v, _ := lookup_env(name)
+  return v
+}
+export fn lookup_env(name: str) -> (str, bool) {
+  for _, kv := range environ() {
+    if len(kv) > len(name) && kv[len(name)] == 61 && strings.has_prefix(kv, name) { return kv[len(name) + 1:], true }
+  }
+  return "", false
+}
+
+# ends the program now (print's pending output is written first)
+export fn exit(code: int) { __exit(code) }
+
+fn write_fd(fd: int, s: str) -> int {
+  p := cstr(s)
+  n := len(s)
+  while n > 0 {
+    w := __syscall(SYS_WRITE, fd, p, n, 0, 0, 0)
+    if w < 0 { return w }
+    p += w
+    n -= w
+  }
+  return 0
+}
+# writes s to the standard output, in order with print
+export fn stdout(s: str) {
+  __flush()
+  write_fd(1, s)
+}
+# writes s to the standard error
+export fn stderr(s: str) {
+  __flush()
+  write_fd(2, s)
+}
+# writes a line to the standard error
+export fn eprintln(s: str) { stderr(s + "\n") }
+
+# reads the whole standard input
+export fn read_stdin() -> str { return read_all(0) }
+
+fn read_all(fd: int) -> str {
+  b := strings.Builder{}
+  buf := __newstr(65536)
+  while true {
+    r := __syscall(SYS_READ, fd, buf + 8, 65536, 0, 0, 0)
+    if r <= 0 { break }
+    for i := 0; i < r; i++ { b.write_byte(__load8(buf + 8 + i)) }
+  }
+  return b.string()
+}
+
+# reads a whole file
+export fn read_file(path: str) -> (str, error) {
+  fd := __syscall(SYS_OPEN, cstr(path), O_RDONLY, 0, 0, 0, 0)
+  if fd < 0 { return "", sys_error("open", path, fd) }
+  size := __syscall(SYS_LSEEK, fd, 0, 2, 0, 0, 0)
+  if size < 0 {
+    __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return "", sys_error("seek", path, size)
+  }
+  __syscall(SYS_LSEEK, fd, 0, 0, 0, 0, 0)
+  m := __newstr(size)
+  got := 0
+  while got < size {
+    r := __syscall(SYS_READ, fd, m + 8 + got, size - got, 0, 0, 0)
+    if r < 0 {
+      __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+      return "", sys_error("read", path, r)
+    }
+    if r == 0 { break }
+    got += r
+  }
+  __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+  __store64(m, got)
+  return __pstr(m), nil
+}
+
+# writes data to a file, creating or truncating it; mode is the Unix permission (0o644, 0o755)
+export fn write_file(path: str, data: str, mode: int) -> error {
+  fd := __syscall(SYS_OPEN, cstr(path), O_WRONLY | O_CREAT | O_TRUNC, mode, 0, 0, 0)
+  if fd < 0 { return sys_error("open", path, fd) }
+  r := write_fd(fd, data)
+  __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+  if r < 0 { return sys_error("write", path, r) }
+  r = __syscall(SYS_CHMOD, cstr(path), mode, 0, 0, 0, 0)
+  if r < 0 { return sys_error("chmod", path, r) }
+  return nil
+}
+
+export fn exists(path: str) -> bool { return __syscall(SYS_ACCESS, cstr(path), 0, 0, 0, 0, 0) == 0 }
+export fn remove(path: str) -> error {
+  r := __syscall(SYS_UNLINK, cstr(path), 0, 0, 0, 0, 0)
+  if r < 0 { return sys_error("remove", path, r) }
+  return nil
+}
+export fn mkdir(path: str, mode: int) -> error {
+  r := __syscall(SYS_MKDIR, cstr(path), mode, 0, 0, 0, 0)
+  if r < 0 { return sys_error("mkdir", path, r) }
+  return nil
+}
+export fn getwd() -> str {
+  m := __newstr(4096)
+  r := __syscall(SYS_GETCWD, m + 8, 4096, 0, 0, 0, 0)
+  if r <= 0 { return "." }
+  return from_cstr(m + 8)
+}
+export fn getpid() -> int { return __syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0) }
+
+# monotonic clock, in nanoseconds (for measuring durations)
+export fn nanotime() -> int {
+  ts := __newstr(16)
+  __syscall(SYS_CLOCK_GETTIME, 1, ts + 8, 0, 0, 0, 0)
+  return __load64(ts + 8) * 1000000000 + __load64(ts + 16)
+}
+
+# a NULL-terminated array of C strings, for execve
+fn cstr_array(xs: []str) -> int {
+  a := __newstr(8 * (len(xs) + 1))
+  for i, x := range xs { __store64(a + 8 + 8 * i, cstr(x)) }
+  __store64(a + 8 + 8 * len(xs), 0)
+  return a + 8
+}
+
+# replaces this process by the program at path; returns only if that fails
+export fn exec(path: str, argv: []str, env: []str) -> error {
+  __flush()
+  r := __syscall(SYS_EXECVE, cstr(path), cstr_array(argv), cstr_array(env), 0, 0, 0)
+  return sys_error("exec", path, r)
+}
+
+# replaces this process by a program given as bytes (an ELF executable), without writing it
+# to a file: the bytes go into an anonymous memory file that is executed directly
+export fn exec_bytes(name: str, image: str, argv: []str, env: []str) -> error {
+  fd := __syscall(SYS_MEMFD_CREATE, cstr(name), 0, 0, 0, 0, 0)
+  if fd < 0 { return sys_error("memfd_create", name, fd) }
+  w := write_fd(fd, image)
+  if w < 0 { return sys_error("write", name, w) }
+  __flush()
+  empty := ""
+  r := __syscall(SYS_EXECVEAT, fd, cstr(empty), cstr_array(argv), cstr_array(env), 4096, 0)   # AT_EMPTY_PATH
+  return sys_error("exec", name, r)
+}
+
+# ---------------------------------------------------------------- running other programs
+const SYS_PIPE = 22
+const SYS_DUP2 = 33
+const SYS_FORK = 57
+const SYS_WAIT4 = 61
+const SYS_EXIT_GROUP = 231
+const SYS_READLINK = 89
+
+# the full path of a program: names with a "/" are used as they are, others are searched in PATH
+export fn look_path(name: str) -> str {
+  if strings.index_byte(name, 47) >= 0 { return name }
+  for _, dir := range strings.split(getenv("PATH"), ":") {
+    if dir == "" { dir = "." }
+    p := dir + "/" + name
+    if exists(p) { return p }
+  }
+  return name
+}
+
+# the result of a finished program
+export struct Process {
+  output: str      # what it wrote to the standard output (and error, if merged)
+  code: int        # exit code; 128 + n if it was killed by signal n
+  signal: int      # the signal that killed it, or 0
+}
+
+# runs argv[0] with the arguments argv[1:] and waits for it, collecting its standard output.
+# With merge_stderr the standard error goes to the same output; otherwise it is inherited.
+# env == nil keeps this program's environment.
+export fn run(argv: []str, env: []str, merge_stderr: bool) -> (*Process, error) {
+  if len(argv) == 0 { return nil, errors.New("run: no program") }
+  path := look_path(argv[0])
+  if env == nil { env = environ() }
+  fds := __newstr(8)
+  r := __syscall(SYS_PIPE, fds + 8, 0, 0, 0, 0, 0)
+  if r < 0 { return nil, sys_error("pipe", path, r) }
+  rd := __load8(fds + 8) | (__load8(fds + 9) << 8) | (__load8(fds + 10) << 16)
+  wr := __load8(fds + 12) | (__load8(fds + 13) << 8) | (__load8(fds + 14) << 16)
+  cargv := cstr_array(argv)
+  cenv := cstr_array(env)
+  cpath := cstr(path)
+  __flush()
+  pid := __syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+  if pid < 0 { return nil, sys_error("fork", path, pid) }
+  if pid == 0 {
+    # child: only system calls from here on
+    __syscall(SYS_DUP2, wr, 1, 0, 0, 0, 0)
+    if merge_stderr { __syscall(SYS_DUP2, wr, 2, 0, 0, 0, 0) }
+    __syscall(SYS_CLOSE, rd, 0, 0, 0, 0, 0)
+    __syscall(SYS_CLOSE, wr, 0, 0, 0, 0, 0)
+    __syscall(SYS_EXECVE, cpath, cargv, cenv, 0, 0, 0)
+    __syscall(SYS_EXIT_GROUP, 127, 0, 0, 0, 0, 0)
+  }
+  __syscall(SYS_CLOSE, wr, 0, 0, 0, 0, 0)
+  out := read_all(rd)
+  __syscall(SYS_CLOSE, rd, 0, 0, 0, 0, 0)
+  st := __newstr(8)
+  while true {
+    w := __syscall(SYS_WAIT4, pid, st + 8, 0, 0, 0, 0)
+    if w != -4 { break }
+  }
+  status := __load8(st + 8) | (__load8(st + 9) << 8)
+  p := &Process{output: out}
+  sig := status & 0x7F
+  if sig == 0 { p.code = (status >> 8) & 0xFF } else {
+    p.signal = sig
+    p.code = 128 + sig
+  }
+  if p.code == 127 && !exists(path) { return p, errors.New("run " + argv[0] + ": program not found") }
+  return p, nil
+}
+
+# the path of the running executable
+export fn executable() -> str {
+  m := __newstr(4096)
+  self := "/proc/self/exe"
+  r := __syscall(SYS_READLINK, cstr(self), m + 8, 4096, 0, 0, 0)
+  if r <= 0 { return "" }
+  __store64(m, r)
+  __store8(m + 8 + r, 0)
+  return __pstr(m)
+}

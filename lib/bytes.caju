@@ -1,0 +1,134 @@
+# std/bytes: Buffer, a growable array of bytes kept in raw memory (one byte per byte, unlike
+# []uint8, which uses a word per element). Made for binary output: machine code, files.
+
+export struct Buffer {
+  mem: int      # string block [length][bytes][0] from __newstr
+  n: int
+  cap: int
+}
+
+export fn new_buffer(cap: int) -> *Buffer {
+  if cap < 16 { cap = 16 }
+  return &Buffer{mem: __newstr(cap), n: 0, cap: cap}
+}
+
+fn (b: *Buffer) reserve(extra: int) {
+  if b.n + extra <= b.cap { return }
+  c := b.cap * 2
+  if c < 64 { c = 64 }
+  while c < b.n + extra { c = c * 2 }
+  m := __newstr(c)
+  i := 0
+  while i + 8 <= b.n {
+    __store64(m + 8 + i, __load64(b.mem + 8 + i))
+    i += 8
+  }
+  while i < b.n {
+    __store8(m + 8 + i, __load8(b.mem + 8 + i))
+    i++
+  }
+  b.mem = m
+  b.cap = c
+}
+
+export fn (b: *Buffer) len() -> int { return b.n }
+export fn (b: *Buffer) reset() { b.n = 0 }
+# cuts the buffer to n bytes
+export fn (b: *Buffer) truncate(n: int) { if n < b.n { b.n = n } }
+
+export fn (b: *Buffer) byte(c: int) {
+  if b.n >= b.cap { b.reserve(1) }
+  __store8(b.mem + 8 + b.n, c)
+  b.n++
+}
+# little-endian integers
+export fn (b: *Buffer) u16(x: int) {
+  b.byte(x)
+  b.byte(x >> 8)
+}
+export fn (b: *Buffer) u32(x: int) {
+  b.reserve(4)
+  p := b.mem + 8 + b.n
+  __store8(p, x)
+  __store8(p + 1, x >> 8)
+  __store8(p + 2, x >> 16)
+  __store8(p + 3, x >> 24)
+  b.n += 4
+}
+export fn (b: *Buffer) u64(x: int) {
+  b.reserve(8)
+  __store64(b.mem + 8 + b.n, x)
+  b.n += 8
+}
+export fn (b: *Buffer) zeros(n: int) {
+  b.reserve(n)
+  for i := 0; i < n; i++ { __store8(b.mem + 8 + b.n + i, 0) }
+  b.n += n
+}
+export fn (b: *Buffer) write(s: str) {
+  n := len(s)
+  b.reserve(n)
+  p := __strp(s) + 8
+  d := b.mem + 8 + b.n
+  for i := 0; i < n; i++ { __store8(d + i, __load8(p + i)) }
+  b.n += n
+}
+export fn (b: *Buffer) append(o: *Buffer) {
+  b.reserve(o.n)
+  d := b.mem + 8 + b.n
+  for i := 0; i < o.n; i++ { __store8(d + i, __load8(o.mem + 8 + i)) }
+  b.n += o.n
+}
+
+# reading and patching at an offset (must be inside the buffer)
+fn (b: *Buffer) check(at: int, n: int) {
+  if at < 0 || at + n > b.n { panic("bytes.Buffer: offset " + str(at) + " out of range (length " + str(b.n) + ")") }
+}
+export fn (b: *Buffer) get(at: int) -> int {
+  b.check(at, 1)
+  return __load8(b.mem + 8 + at)
+}
+export fn (b: *Buffer) set(at: int, c: int) {
+  b.check(at, 1)
+  __store8(b.mem + 8 + at, c)
+}
+export fn (b: *Buffer) get_u32(at: int) -> int {
+  b.check(at, 4)
+  p := b.mem + 8 + at
+  return __load8(p) | (__load8(p + 1) << 8) | (__load8(p + 2) << 16) | (__load8(p + 3) << 24)
+}
+export fn (b: *Buffer) set_u16(at: int, x: int) {
+  b.check(at, 2)
+  __store8(b.mem + 8 + at, x)
+  __store8(b.mem + 9 + at, x >> 8)
+}
+export fn (b: *Buffer) set_u32(at: int, x: int) {
+  b.check(at, 4)
+  p := b.mem + 8 + at
+  __store8(p, x)
+  __store8(p + 1, x >> 8)
+  __store8(p + 2, x >> 16)
+  __store8(p + 3, x >> 24)
+}
+export fn (b: *Buffer) get_u64(at: int) -> int {
+  b.check(at, 8)
+  return __load64(b.mem + 8 + at)
+}
+export fn (b: *Buffer) set_u64(at: int, x: int) {
+  b.check(at, 8)
+  __store64(b.mem + 8 + at, x)
+}
+
+# the contents as a string (a copy)
+export fn (b: *Buffer) string() -> str {
+  m := __newstr(b.n)
+  for i := 0; i < b.n; i++ { __store8(m + 8 + i, __load8(b.mem + 8 + i)) }
+  return __pstr(m)
+}
+# a copy of bytes [lo, hi)
+export fn (b: *Buffer) slice(lo: int, hi: int) -> str {
+  b.check(lo, hi - lo)
+  m := __newstr(hi - lo)
+  for i := lo; i < hi; i++ { __store8(m + 8 + i - lo, __load8(b.mem + 8 + i)) }
+  return __pstr(m)
+}

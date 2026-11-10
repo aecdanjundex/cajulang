@@ -1,0 +1,7 @@
+# Heavy recursion: almost 400 thousand function calls.
+# Use "Compare speed": this is where bytecode pulls furthest ahead of the tree.
+fn fib(n) {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+print("fib(26) =", fib(26))

@@ -1,0 +1,1525 @@
+# The parser: tokens -> syntax tree (recursive descent). Port of bootstrap/parser.js.
+# The grammar is described at the top of bootstrap/parser.js. The JavaScript parser keeps its
+# state in closures; here it lives in Parser and the closures are its methods.
+
+import "std/strings"
+import "std/strconv"
+import "ast"
+import "lexer"
+
+# ---- type words (from bootstrap/types.js and values.js)
+let PRIM_TYPES = map[str]bool{"int": true, "num": true, "str": true, "bool": true, "any": true, "error": true,
+  "int8": true, "int16": true, "int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true,
+  "uint32": true, "uint64": true, "float32": true, "void": true}
+# JavaScript's `s in TYPE_ALIASES` is also true for the properties of Object.prototype
+let PROTO_NAMES = map[str]bool{"constructor": true, "__defineGetter__": true, "__defineSetter__": true,
+  "hasOwnProperty": true, "__lookupGetter__": true, "__lookupSetter__": true, "isPrototypeOf": true,
+  "propertyIsEnumerable": true, "toString": true, "valueOf": true, "__proto__": true, "toLocaleString": true}
+export let FFI_TYPES = []str{"void", "i32", "u32", "i64", "u64", "f32", "f64", "bool", "ptr", "str", "wstr"}
+let FFI_ONLY = map[str]bool{"i32": true, "u32": true, "i64": true, "u64": true, "f32": true, "f64": true, "ptr": true, "wstr": true}
+
+# byte -> uint8, rune -> int32, string -> str, float64 -> num; "" for any other name
+export fn type_alias(s: str) -> str {
+  if s == "byte" { return "uint8" }
+  if s == "rune" { return "int32" }
+  if s == "string" { return "str" }
+  if s == "float64" { return "num" }
+  return ""
+}
+export fn is_type_word(s: str) -> bool { return PRIM_TYPES[s] || type_alias(s) != "" || PROTO_NAMES[s] }
+fn is_ffi_type(s: str) -> bool {
+  for _, t := range FFI_TYPES { if t == s { return true } }
+  return false
+}
+export fn ffi_lang(t: str) -> str {
+  if t == "void" { return "void" }
+  if t == "f32" || t == "f64" { return "num" }
+  if t == "bool" { return "bool" }
+  if t == "str" || t == "wstr" { return "str" }
+  return "int"
+}
+export fn func_type_text(ps: []str, res: []str) -> str {
+  s := "fn(" + strings.join(ps, ", ") + ")"
+  if len(res) == 1 { s = s + " -> " + res[0] } else if len(res) > 1 { s = s + " -> (" + strings.join(res, ", ") + ")" }
+  return s
+}
+
+# /^[A-Za-z_À-ÿ][A-Za-z0-9_À-ÿ]*$/ (À-ÿ is U+00C0..U+00FF: 0xC3 followed by 0x80..0xBF)
+export fn ident_char_len(s: str, i: int, first: bool) -> int {
+  if i >= len(s) { return 0 }
+  c := int(s[i])
+  if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 { return 1 }
+  if !first && c >= 48 && c <= 57 { return 1 }
+  if c == 0xC3 && i + 1 < len(s) && int(s[i + 1]) >= 0x80 && int(s[i + 1]) <= 0xBF { return 2 }
+  return 0
+}
+fn is_ident(s: str) -> bool {
+  if len(s) == 0 { return false }
+  i := ident_char_len(s, 0, true)
+  if i == 0 { return false }
+  while i < len(s) {
+    m := ident_char_len(s, i, false)
+    if m == 0 { return false }
+    i += m
+  }
+  return true
+}
+fn is_ascii_ident(s: str) -> bool {
+  if len(s) == 0 { return false }
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    ok := (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || (i > 0 && c >= 48 && c <= 57)
+    if !ok { return false }
+  }
+  return true
+}
+fn all_digits(s: str) -> bool {
+  if len(s) == 0 { return false }
+  for i := 0; i < len(s); i++ { if s[i] < 48 || s[i] > 57 { return false } }
+  return true
+}
+fn contains_str(xs: []str, s: str) -> bool {
+  for _, x := range xs { if x == s { return true } }
+  return false
+}
+fn results_text(r: []str) -> str {
+  if len(r) == 0 { return "void" }
+  if len(r) == 1 { return r[0] }
+  return "(" + strings.join(r, ", ") + ")"
+}
+
+# the token as the JavaScript parser shows it (RUNE values are numbers there)
+fn tok_value(t: *lexer.Token) -> str {
+  if t.type == "RUNE" { return str(t.rune_value) }
+  return t.value
+}
+
+fn nd(kind: str, t: *lexer.Token) -> *ast.Node { return ast.new_node(kind, t.line, t.col) }
+
+# what statements() stops at
+const END_EOF = 0
+const END_BRACE = 1
+const END_CASE = 2
+
+struct Parser {
+  toks: []*lexer.Token
+  p: int
+  namespaces: map[str]bool      # bound by imports in this file: ns.name refers to an exported name
+  fn_depth: int                 # how many functions deep we are (return, defer)
+  loop_depth: int
+  switch_depth: int
+  no_lit: int                   # in if, while, for and switch, "name {" opens the block
+}
+
+export fn parse(toks: []*lexer.Token) -> *ast.Node {
+  ps := &Parser{toks: toks, p: 0, namespaces: map[str]bool{}}
+  return ps.program()
+}
+
+fn (ps: *Parser) peek(o: int) -> *lexer.Token {
+  i := ps.p + o
+  if i > len(ps.toks) - 1 { i = len(ps.toks) - 1 }
+  return ps.toks[i]
+}
+fn (ps: *Parser) is_op(v: str, o: int) -> bool {
+  t := ps.peek(o)
+  return t.type == "OP" && t.value == v
+}
+fn (ps: *Parser) is_kw(v: str, o: int) -> bool {
+  t := ps.peek(o)
+  return t.type == "KEYWORD" && t.value == v
+}
+fn (ps: *Parser) is_semi() -> bool {
+  t := ps.peek(0)
+  return t.type == "NEWLINE" && t.value == ";"
+}
+fn (ps: *Parser) skip_nl() {
+  while ps.peek(0).type == "NEWLINE" { ps.p++ }
+}
+fn (ps: *Parser) next() -> *lexer.Token {
+  t := ps.toks[ps.p]
+  ps.p++
+  return t
+}
+fn (ps: *Parser) fail(msg: str) {
+  t := ps.peek(0)
+  got := "\"" + tok_value(t) + "\""
+  if t.type == "EOF" { got = "end of program" } else if t.type == "NEWLINE" {
+    if t.value == ";" { got = "\";\"" } else { got = "end of line" }
+  }
+  ast.fail("syntax", msg + ", but found " + got, t.line, t.col)
+}
+fn fail_at(msg: str, line: int, col: int) { ast.fail("syntax", msg, line, col) }
+fn (ps: *Parser) expect(v: str, what: str) -> *lexer.Token {
+  if !ps.is_op(v, 0) {
+    if what == "" { what = "\"" + v + "\"" }
+    ps.fail("Expected " + what)
+  }
+  return ps.next()
+}
+fn (ps: *Parser) expect_kw(v: str, what: str) -> *lexer.Token {
+  if !ps.is_kw(v, 0) { ps.fail("Expected " + what) }
+  return ps.next()
+}
+fn (ps: *Parser) name(what: str) -> str {
+  if ps.peek(0).type != "NAME" { ps.fail("Expected " + what) }
+  return ps.next().value
+}
+
+# ---- types: a type becomes a canonical string ("[]int", "map[str]int", "fn(int) -> (int, error)")
+fn (ps: *Parser) lang_type(allow_void: bool) -> str {
+  tk := ps.peek(0)
+  if ps.is_op("[", 0) {
+    ps.p++
+    if ps.is_op("]", 0) {
+      ps.p++
+      return "[]" + ps.lang_type(false)
+    }
+    if ps.peek(0).type != "NUMBER" || !all_digits(ps.peek(0).value) { ps.fail("Expected the array size (an integer) or \"]\"") }
+    n := ps.next().value
+    ps.expect("]", "\"]\" after the array size")
+    return "[" + n + "]" + ps.lang_type(false)
+  }
+  if ps.is_kw("map", 0) {
+    ps.p++
+    ps.expect("[", "\"[\" after map, as in map[str]int")
+    k := ps.lang_type(false)
+    ps.expect("]", "\"]\" after the key type")
+    return "map[" + k + "]" + ps.lang_type(false)
+  }
+  if ps.is_op("*", 0) {
+    ps.p++
+    return "*" + ps.lang_type(false)
+  }
+  if ps.is_kw("chan", 0) {
+    ps.p++
+    return "chan " + ps.lang_type(false)
+  }
+  if ps.is_kw("fn", 0) {
+    ps.p++
+    ps.expect("(", "\"(\" after fn, as in fn(int) -> int")
+    pts := []str{}
+    while !ps.is_op(")", 0) {
+      if ps.peek(0).type == "NAME" && ps.is_op(":", 1) { ps.p += 2 }
+      pts = append(pts, ps.lang_type(false))
+      if ps.is_op(",", 0) { ps.p++ } else if !ps.is_op(")", 0) { ps.fail("Expected \",\" or \")\" in the type list") }
+    }
+    ps.p++
+    res := []str{}
+    if ps.is_op("->", 0) {
+      ps.p++
+      res, _ = ps.result_types()
+    }
+    return func_type_text(pts, res)
+  }
+  if tk.type == "NAME" && tk.value == "void" {
+    if allow_void {
+      ps.p++
+      return "void"
+    }
+    fail_at("void can only be used as a return type, after ->", tk.line, tk.col)
+  }
+  if tk.type == "NAME" && FFI_ONLY[tk.value] {
+    v := tk.value
+    use := ""
+    if v[0] == 102 { use = "num" } else if v[0] == 117 { use = "uint" + v[1:] } else if v == "ptr" { use = "int" } else if v == "wstr" { use = "str" } else { use = "int" + v[1:] }
+    fail_at(v + " is a C type, only valid in extern and dllexport. Use " + use + " here", tk.line, tk.col)
+  }
+  if tk.type == "NAME" {
+    q := ps.qualified()
+    ps.p++
+    if q != "" { return q }
+    a := type_alias(tk.value)
+    if a != "" { return a }
+    return tk.value
+  }
+  extra := ""
+  if allow_void { extra = ", or void" }
+  ps.fail("Expected a type, such as int, num, str, bool, []int, map[str]int or a struct name" + extra)
+  return ""
+}
+
+# after "->": one type, or several in parentheses, with optional names (named results);
+# names is nil when the results have no names
+fn (ps: *Parser) result_types() -> ([]str, []str) {
+  if !ps.is_op("(", 0) {
+    t := ps.lang_type(true)
+    if t == "void" { return []str{}, nil }
+    return []str{t}, nil
+  }
+  ps.p++
+  types := []str{}
+  names := []str{}
+  while !ps.is_op(")", 0) {
+    if ps.peek(0).type == "NAME" && ps.is_op(":", 1) {
+      names = append(names, ps.toks[ps.p].value)
+      ps.p += 2
+    }
+    types = append(types, ps.lang_type(false))
+    if ps.is_op(",", 0) { ps.p++ } else if !ps.is_op(")", 0) { ps.fail("Expected \",\" or \")\" in the result list") }
+  }
+  ps.p++
+  if len(names) > 0 && len(names) != len(types) { ps.fail("Either all results are named or none are") }
+  if len(names) == 0 { return types, nil }
+  return types, names
+}
+
+# a dllexport accepts the C types plus int (becomes i64) and num (becomes f64)
+fn (ps: *Parser) dll_type() -> str {
+  tk := ps.peek(0)
+  if tk.type == "NAME" && (tk.value == "int" || tk.value == "num") {
+    ps.p++
+    if tk.value == "int" { return "i64" }
+    return "f64"
+  }
+  if tk.type == "NAME" && tk.value == "any" { fail_at("An exported function needs concrete types; any has no C equivalent", tk.line, tk.col) }
+  return ps.ffi_type()
+}
+fn (ps: *Parser) ffi_type() -> str {
+  tk := ps.peek(0)
+  if tk.type != "NAME" || !is_ffi_type(tk.value) { ps.fail("Expected a type (" + strings.join(FFI_TYPES, ", ") + ")") }
+  ps.p++
+  return tk.value
+}
+
+# ns.name, when ns is a namespace of this file: leaves p on name and returns "ns.name"; else ""
+fn (ps: *Parser) qualified() -> str {
+  t := ps.peek(0)
+  if t.type == "NAME" && ps.namespaces[t.value] && ps.is_op(".", 1) && ps.peek(2).type == "NAME" {
+    ps.p += 2
+    return t.value + "." + ps.toks[ps.p].value
+  }
+  return ""
+}
+
+fn (ps: *Parser) cond_expr() -> *ast.Node {
+  ps.no_lit++
+  e := ps.expr()
+  ps.no_lit--
+  return e
+}
+# after NAME: "{" opens a literal, unless in a condition
+fn (ps: *Parser) lit_ahead() -> bool { return ps.no_lit == 0 && ps.is_op("{", 0) }
+# Point{x: 1} uses names; Point{1, 2} gives the fields in order
+fn (ps: *Parser) named_fields_ahead() -> bool {
+  q := 1
+  while ps.peek(q).type == "NEWLINE" { q++ }
+  return ps.is_op("}", q) || (ps.peek(q).type == "NAME" && ps.is_op(":", q + 1))
+}
+# parameter list: (a: int, b: str); with typed, the type is required ("" for a missing type)
+fn (ps: *Parser) param_list(typed: bool, what: str) -> ([]str, []str) {
+  params := []str{}
+  ptypes := []str{}
+  ps.expect("(", "\"(\" after the " + what + " name")
+  ps.skip_nl()
+  while !ps.is_op(")", 0) {
+    pt := ps.peek(0)
+    pn := ps.name("a parameter name")
+    if contains_str(params, pn) { fail_at("Parameter \"" + pn + "\" appears twice", pt.line, pt.col) }
+    params = append(params, pn)
+    if typed {
+      ps.expect(":", "\":\" and the type after " + pn)
+      ptypes = append(ptypes, ps.lang_type(false))
+    } else if ps.is_op(":", 0) {
+      ps.p++
+      ptypes = append(ptypes, ps.lang_type(false))
+    } else {
+      ptypes = append(ptypes, "")
+    }
+    ps.skip_nl()
+    if ps.is_op(",", 0) {
+      ps.p++
+      ps.skip_nl()
+    } else if !ps.is_op(")", 0) { ps.fail("Expected \",\" or \")\" in the parameter list") }
+  }
+  ps.p++
+  return params, ptypes
+}
+# separator between items of a declaration block: end of line or comma
+fn (ps: *Parser) item_end(what: str) {
+  if ps.is_op(",", 0) {
+    ps.p++
+    ps.skip_nl()
+    return
+  }
+  if ps.peek(0).type == "NEWLINE" { ps.skip_nl() } else if !ps.is_op("}", 0) { ps.fail("Expected end of line or \"}\" after " + what) }
+}
+
+fn (ps: *Parser) ends_at(mode: int) -> bool {
+  if mode == END_EOF { return ps.peek(0).type == "EOF" }
+  if mode == END_BRACE { return ps.is_op("}", 0) }
+  return ps.is_kw("case", 0) || ps.is_kw("default", 0) || ps.is_op("}", 0)
+}
+fn (ps: *Parser) statements(mode: int, top: bool) -> []*ast.Node {
+  body := []*ast.Node{}
+  ps.skip_nl()
+  while !ps.ends_at(mode) {
+    if ps.peek(0).type == "EOF" { ps.fail("Expected \"}\" to close the block") }
+    body = append(body, ps.statement(top))
+    if ps.peek(0).type == "NEWLINE" { ps.skip_nl() } else if !ps.ends_at(mode) { ps.fail("Expected end of statement") }
+  }
+  return body
+}
+fn (ps: *Parser) program() -> *ast.Node {
+  n := ast.new_node("Program", 0, 0)
+  n.stmts = ps.statements(END_EOF, true)
+  return n
+}
+fn (ps: *Parser) block() -> *ast.Node {
+  ps.expect("{", "\"{\" to open the block")
+  n := ast.new_node("Block", 0, 0)
+  n.stmts = ps.statements(END_BRACE, false)
+  ps.p++
+  return n
+}
+# function body (declared or literal): return and defer are allowed inside; enclosing loops are not
+fn (ps: *Parser) func_body() -> *ast.Node {
+  sl := ps.loop_depth
+  ss := ps.switch_depth
+  sn := ps.no_lit
+  ps.fn_depth++
+  ps.loop_depth = 0
+  ps.switch_depth = 0
+  ps.no_lit = 0
+  b := ps.block()
+  ps.no_lit = sn
+  ps.fn_depth--
+  ps.loop_depth = sl
+  ps.switch_depth = ss
+  return b
+}
+# "fn" already consumed: (params) -> results { body }
+fn (ps: *Parser) func_rest(t: *lexer.Token, fname: str, recv: *ast.Node) -> *ast.Node {
+  params, ptypes := ps.param_list(false, "function")
+  if recv != nil {
+    params = append([]str{recv.name}, params...)
+    rt := recv.type
+    if recv.ptr { rt = "*" + recv.type }
+    ptypes = append([]str{rt}, ptypes...)
+    for i := 1; i < len(params); i++ {
+      if params[i] == recv.name { fail_at("Parameter \"" + recv.name + "\" has the same name as the receiver", t.line, t.col) }
+    }
+  }
+  f := nd("Func", t)
+  if ps.is_op("->", 0) {
+    ps.p++
+    results, rnames := ps.result_types()
+    f.rtype = results_text(results)
+    f.rnames = rnames
+    for _, nm := range rnames {
+      if contains_str(params, nm) { fail_at("Result \"" + nm + "\" has the same name as a parameter", t.line, t.col) }
+    }
+  }
+  f.body = ps.func_body()
+  f.name = fname
+  f.params = params
+  f.ptypes = ptypes
+  f.end_line = ps.toks[ps.p - 1].line
+  return f
+}
+
+fn (ps: *Parser) statement(top: bool) -> *ast.Node {
+  t := ps.peek(0)
+  if ps.is_kw("import", 0) {
+    if !top { ps.fail("import can only appear at the top level of a file, outside blocks") }
+    ps.p++
+    names := []*ast.Node{}
+    has_names := false
+    if ps.is_op("{", 0) {
+      ps.p++
+      has_names = true
+      while !ps.is_op("}", 0) {
+        nt := ps.peek(0)
+        nm := ps.name("the name of something to import")
+        it := nd("ImportName", nt)
+        it.name = nm
+        names = append(names, it)
+        if ps.is_op(",", 0) { ps.p++ } else if !ps.is_op("}", 0) { ps.fail("Expected \",\" or \"}\" in the import list") }
+      }
+      ps.p++
+      if len(names) == 0 { ps.fail("The import list is empty") }
+      ps.expect_kw("from", "\"from\" after the list of names")
+    }
+    # import "std/strings" binds the namespace strings; import s "std/strings" binds s
+    alias := ""
+    if !has_names && ps.peek(0).type == "NAME" && ps.peek(1).type == "STRING" { alias = ps.next().value }
+    if ps.peek(0).type != "STRING" { ps.fail("Expected the file name in quotes, like \"util.caju\"") }
+    path := ps.next().value
+    if !strings.has_suffix(path, ".caju") { path = path + ".caju" }
+    n := nd("Import", t)
+    n.path = path
+    if has_names { n.import_names = names } else {
+      ns := alias
+      if ns == "" { ns = path[strings.last_index(path, "/") + 1:len(path) - 5] }
+      if !is_ident(ns) { fail_at("\"" + ns + "\" is not a valid namespace name; write a name before the path: import name \"" + path + "\"", t.line, t.col) }
+      ps.namespaces[ns] = true
+      n.ns = ns
+    }
+    return n
+  }
+  if ps.is_kw("export", 0) {
+    if !top { ps.fail("export can only appear at the top level of a file, outside blocks") }
+    ps.p++
+    if !(ps.is_kw("let", 0) || ps.is_kw("const", 0) || ps.is_kw("fn", 0) || ps.is_kw("extern", 0) || ps.is_kw("dllexport", 0) || ps.is_kw("struct", 0) || ps.is_kw("interface", 0)) {
+      ps.fail("export must be followed by let, const, fn, struct, interface, extern or dllexport")
+    }
+    decl := ps.statement(true)
+    decl.exported = true
+    return decl
+  }
+  if ps.is_kw("struct", 0) {
+    if !top { fail_at("struct can only appear at the top level of a file, outside blocks and functions", t.line, t.col) }
+    ps.p++
+    nt := ps.peek(0)
+    sname := ps.name("the struct name after struct")
+    if is_type_word(sname) || is_ffi_type(sname) { fail_at("\"" + sname + "\" is already a built-in type; choose another name", nt.line, nt.col) }
+    ps.expect("{", "\"{\" and the field list")
+    ps.skip_nl()
+    fields := []*ast.Node{}
+    while !ps.is_op("}", 0) {
+      ft := ps.peek(0)
+      # embedded field: just a struct name (or *Struct), as in Go
+      if (ps.peek(0).type == "NAME" && !ps.is_op(":", 1)) || ps.is_op("*", 0) {
+        ptr := false
+        if ps.is_op("*", 0) {
+          ps.p++
+          ptr = true
+        }
+        tn := ps.name("the embedded struct name")
+        for _, f := range fields { if f.name == tn { fail_at("Field \"" + tn + "\" appears twice", ft.line, ft.col) } }
+        fd := nd("FieldDef", ft)
+        fd.name = tn
+        fd.type = tn
+        if ptr { fd.type = "*" + tn }
+        fd.embedded = true
+        fields = append(fields, fd)
+      } else {
+        fname := ps.name("a field name, like x: num")
+        for _, f := range fields { if f.name == fname { fail_at("Field \"" + fname + "\" appears twice", ft.line, ft.col) } }
+        ps.expect(":", "\":\" and the type after " + fname + ": every struct field needs a type")
+        fd := nd("FieldDef", ft)
+        fd.name = fname
+        fd.type = ps.lang_type(false)
+        fields = append(fields, fd)
+      }
+      ps.item_end("the field")
+    }
+    ps.p++
+    n := nd("Struct", t)
+    n.name = sname
+    n.fields = fields
+    return n
+  }
+  if ps.is_kw("interface", 0) {
+    if !top { fail_at("interface can only appear at the top level of a file, outside blocks and functions", t.line, t.col) }
+    ps.p++
+    nt := ps.peek(0)
+    iname := ps.name("the interface name after interface")
+    if is_type_word(iname) || is_ffi_type(iname) { fail_at("\"" + iname + "\" is already a built-in type; choose another name", nt.line, nt.col) }
+    ps.expect("{", "\"{\" and the method list")
+    ps.skip_nl()
+    methods := []*ast.Node{}
+    embeds := []*ast.Node{}
+    while !ps.is_op("}", 0) {
+      mt := ps.peek(0)
+      mname := ps.name("a method name, like area() -> num")
+      if !ps.is_op("(", 0) {
+        e := nd("Embed", mt)
+        e.name = mname
+        if type_alias(mname) != "" { e.name = type_alias(mname) }
+        embeds = append(embeds, e)
+        ps.item_end("the embedded interface")
+        continue
+      }
+      for _, m := range methods { if m.name == mname { fail_at("Method \"" + mname + "\" appears twice", mt.line, mt.col) } }
+      params, ptypes := ps.param_list(true, "method")
+      r := []str{}
+      if ps.is_op("->", 0) {
+        ps.p++
+        r, _ = ps.result_types()
+      }
+      ms := nd("MethodSig", mt)
+      ms.name = mname
+      ms.params = params
+      ms.ptypes = ptypes
+      ms.rtype = results_text(r)
+      methods = append(methods, ms)
+      ps.item_end("the method")
+    }
+    ps.p++
+    n := nd("Interface", t)
+    n.name = iname
+    n.methods = methods
+    n.embeds = embeds
+    return n
+  }
+  if ps.is_kw("fn", 0) && (!ps.is_op("(", 1) || ps.is_method_header()) {
+    if !top { fail_at("fn can only appear at the top level of a file, outside blocks and other functions. To create a function here, use fn(...) { } as a value", t.line, t.col) }
+    ps.p++
+    # method, as in Go: fn (p: Point) name(...)   or, to modify the original, fn (p: *Point) name(...)
+    has_recv := false
+    let recv: *ast.Node = nil
+    if ps.is_op("(", 0) {
+      ps.p++
+      rn := ps.name("the receiver name, like fn (p: Point) name()")
+      ps.expect(":", "\":\" and the struct after " + rn)
+      ptr := false
+      if ps.is_op("*", 0) {
+        ps.p++
+        ptr = true
+      }
+      rtk := ps.peek(0)
+      rtype := ps.name("the method's struct name")
+      ps.expect(")", "\")\" after the receiver")
+      recv = nd("Receiver", rtk)
+      recv.name = rn
+      recv.type = rtype
+      recv.ptr = ptr
+      has_recv = true
+    }
+    if has_recv {
+      fname := ps.name("the method name")
+      f := ps.func_rest(t, recv.type + "." + fname, recv)
+      f.method = fname
+      f.recv = recv
+      return f
+    }
+    fname := ps.name("the function name after fn")
+    return ps.func_rest(t, fname, nil)
+  }
+  if ps.is_kw("return", 0) {
+    if ps.fn_depth == 0 { fail_at("return can only be used inside a function", t.line, t.col) }
+    ps.p++
+    values := []*ast.Node{}
+    if !(ps.peek(0).type == "NEWLINE" || ps.peek(0).type == "EOF" || ps.is_op("}", 0) || ps.is_kw("case", 0) || ps.is_kw("default", 0)) {
+      values = ps.expr_list()
+    }
+    n := nd("Return", t)
+    if len(values) == 1 { n.value = values[0] }
+    n.values = values
+    return n
+  }
+  if ps.is_kw("dllexport", 0) {
+    # function the DLL offers to other languages: signature with C types
+    if !top { fail_at("dllexport can only appear at the top level of a file", t.line, t.col) }
+    ps.p++
+    ps.expect_kw("fn", "\"fn\" after dllexport")
+    nt := ps.peek(0)
+    fname := ps.name("the exported function name")
+    if !is_ascii_ident(fname) { fail_at("An exported function name may only contain unaccented letters, digits and _, so other languages can call it", nt.line, nt.col) }
+    ps.expect("(", "\"(\" after the function name")
+    pnames := []str{}
+    ptys := []str{}
+    while !ps.is_op(")", 0) {
+      pt := ps.peek(0)
+      pn := ps.name("a parameter name")
+      if contains_str(pnames, pn) { fail_at("Parameter \"" + pn + "\" appears twice", pt.line, pt.col) }
+      ps.expect(":", "\":\" and the type after " + pn + ": every parameter of an exported function needs a type")
+      tt := ps.peek(0)
+      ty := ps.dll_type()
+      if ty == "void" { fail_at("void can only be used as a return type", tt.line, tt.col) }
+      pnames = append(pnames, pn)
+      ptys = append(ptys, ty)
+      if ps.is_op(",", 0) { ps.p++ } else if !ps.is_op(")", 0) { ps.fail("Expected \",\" or \")\" in the parameter list") }
+    }
+    ps.p++
+    ret := "void"
+    if ps.is_op("->", 0) {
+      ps.p++
+      ret = ps.dll_type()
+    }
+    body := ps.func_body()
+    f := nd("Func", t)
+    f.name = fname
+    f.params = pnames
+    lang := []str{}
+    for _, q := range ptys { lang = append(lang, ffi_lang(q)) }
+    f.ptypes = lang
+    f.rtype = ffi_lang(ret)
+    f.body = body
+    f.end_line = ps.toks[ps.p - 1].line
+    f.dll_name = fname
+    f.dll_ret = ret
+    f.dll_types = ptys
+    return f
+  }
+  if ps.is_kw("extern", 0) {
+    if !top { fail_at("extern can only appear at the top level of a file", t.line, t.col) }
+    ps.p++
+    if ps.peek(0).type != "STRING" { ps.fail("Expected the DLL name in quotes, like \"user32.dll\"") }
+    dll := ps.next().value
+    conv := "stdcall"
+    if ps.peek(0).type == "NAME" && (ps.peek(0).value == "stdcall" || ps.peek(0).value == "cdecl") { conv = ps.next().value }
+    ps.expect_kw("fn", "\"fn\" after the DLL name (and the calling convention, if any)")
+    sym := ps.name("the DLL function name")
+    ps.expect("(", "\"(\" after the function name")
+    pnames := []str{}
+    ptys := []str{}
+    while !ps.is_op(")", 0) {
+      pt := ps.peek(0)
+      pn := ps.name("a parameter name")
+      if contains_str(pnames, pn) { fail_at("Parameter \"" + pn + "\" appears twice", pt.line, pt.col) }
+      ps.expect(":", "\":\" and the type after " + pn)
+      tt := ps.peek(0)
+      ty := ps.ffi_type()
+      if ty == "void" { fail_at("void can only be used as a return type", tt.line, tt.col) }
+      pnames = append(pnames, pn)
+      ptys = append(ptys, ty)
+      if ps.is_op(",", 0) { ps.p++ } else if !ps.is_op(")", 0) { ps.fail("Expected \",\" or \")\" in the parameter list") }
+    }
+    ps.p++
+    ret := "void"
+    if ps.is_op("->", 0) {
+      ps.p++
+      ret = ps.ffi_type()
+    }
+    n := nd("Extern", t)
+    n.name = sym
+    n.symbol = sym
+    n.dll = dll
+    n.conv = conv
+    n.params = pnames
+    n.ptypes = ptys
+    n.ret = ret
+    return n
+  }
+  if ps.is_kw("let", 0) || ps.is_kw("const", 0) {
+    kw := ps.next().value
+    nm := ps.name("a name after " + kw)
+    ty := ""
+    if ps.is_op(":", 0) {
+      ps.p++
+      ty = ps.lang_type(false)
+    }
+    if kw == "const" && !ps.is_op("=", 0) { ps.fail("A constant needs a value: const " + nm + " = ...") }
+    n := nd("Assign", t)
+    n.name = nm
+    n.decl = kw
+    n.type = ty
+    if !ps.is_op("=", 0) && ty != "" { return n }      # let x: int  (zero value)
+    if ty != "" { ps.expect("=", "\"=\" and the initial value: " + kw + " " + nm + ": " + ty + " = ...") } else { ps.expect("=", "\"=\" after the name") }
+    n.value = ps.expr()
+    return n
+  }
+  if ps.is_kw("if", 0) { return ps.if_stmt() }
+  if ps.is_kw("while", 0) {
+    ps.p++
+    n := nd("While", t)
+    n.cond = ps.cond_expr()
+    n.body = ps.loop_body()
+    return n
+  }
+  if ps.is_kw("for", 0) { return ps.for_stmt() }
+  if ps.is_kw("switch", 0) { return ps.switch_stmt() }
+  if ps.is_kw("select", 0) { return ps.select_stmt() }
+  # loop label: outer: for ... { ... break outer }
+  lq := 2
+  while t.type == "NAME" && ps.is_op(":", 1) && ps.peek(lq).type == "NEWLINE" { lq++ }
+  if t.type == "NAME" && ps.is_op(":", 1) && (ps.is_kw("for", lq) || ps.is_kw("while", lq) || ps.is_kw("switch", lq) || ps.is_kw("select", lq)) {
+    ps.p += lq
+    let s: *ast.Node = nil
+    if ps.is_kw("for", 0) { s = ps.for_stmt() } else if ps.is_kw("while", 0) {
+      ps.p++
+      s = nd("While", t)
+      s.cond = ps.cond_expr()
+      s.body = ps.loop_body()
+    } else if ps.is_kw("switch", 0) { s = ps.switch_stmt() } else { s = ps.select_stmt() }
+    s.label = t.value
+    return s
+  }
+  if ps.is_kw("break", 0) || ps.is_kw("continue", 0) {
+    kw := ps.next().value
+    label := ""
+    if ps.peek(0).type == "NAME" { label = ps.next().value }
+    if kw == "continue" && ps.loop_depth == 0 { fail_at("continue can only be used inside a loop", t.line, t.col) }
+    if kw == "break" && ps.loop_depth == 0 && ps.switch_depth == 0 { fail_at("break can only be used inside a loop, switch or select", t.line, t.col) }
+    kind := "Continue"
+    if kw == "break" { kind = "Break" }
+    n := nd(kind, t)
+    n.label = label
+    return n
+  }
+  if ps.is_kw("fallthrough", 0) {
+    ps.p++
+    return nd("Fallthrough", t)
+  }
+  if ps.is_kw("defer", 0) || ps.is_kw("go", 0) {
+    kw := ps.next().value
+    call := ps.expr()
+    if call.kind != "Call" && call.kind != "MethodCall" && call.kind != "CallValue" { fail_at(kw + " must be followed by a function call, like " + kw + " f(x)", t.line, t.col) }
+    kind := "Go"
+    if kw == "defer" { kind = "Defer" }
+    n := nd(kind, t)
+    n.call = call
+    return n
+  }
+  if ps.is_kw("else", 0) { ps.fail("Found \"else\" without a preceding \"if\"") }
+  return ps.simple_stmt(false)
+}
+# loop body: break and continue are allowed inside
+fn (ps: *Parser) loop_body() -> *ast.Node {
+  ps.loop_depth++
+  b := ps.block()
+  ps.loop_depth--
+  return b
+}
+fn is_op_assign(v: str) -> bool {
+  return v == "+=" || v == "-=" || v == "*=" || v == "/=" || v == "%=" || v == "&=" || v == "|=" || v == "^=" || v == "<<=" || v == ">>=" || v == "&^="
+}
+# assignment, short declaration, x++, channel send or expression
+fn (ps: *Parser) simple_stmt(allow_range: bool) -> *ast.Node {
+  t := ps.peek(0)
+  lhs := ps.expr_list()
+  op := ps.peek(0)
+  if op.type == "OP" && (op.value == ":=" || op.value == "=") {
+    ps.p++
+    if allow_range && ps.is_kw("range", 0) {
+      ps.p++
+      subject := ps.expr()
+      for _, e := range lhs {
+        if op.value == ":=" && e.kind != "Var" { fail_at("\":=\" must be preceded by variable names", e.line, e.col) }
+      }
+      if len(lhs) > 2 { fail_at("range yields at most two values: index (or key) and value", t.line, t.col) }
+      n := nd("Range", t)
+      n.vars = lhs
+      n.define = op.value == ":="
+      n.subject = subject
+      return n
+    }
+    rhs := ps.expr_list()
+    if op.value == ":=" {
+      for _, e := range lhs {
+        if e.kind != "Var" {
+          if e.line != 0 { fail_at("\":=\" must be preceded by variable names, like x := 1 or a, b := f()", e.line, e.col) }
+          fail_at("\":=\" must be preceded by variable names, like x := 1 or a, b := f()", t.line, t.col)
+        }
+      }
+      if len(lhs) == 1 && len(rhs) == 1 {
+        n := nd("Assign", t)
+        n.name = lhs[0].name
+        n.decl = ":="
+        n.value = rhs[0]
+        return n
+      }
+      n := nd("VarDecl", t)
+      names := []str{}
+      for _, e := range lhs { names = append(names, e.name) }
+      n.names = names
+      n.values = rhs
+      return n
+    }
+    for _, e := range lhs { ps.check_target(e) }
+    if len(lhs) == 1 && len(rhs) == 1 {
+      if lhs[0].kind == "Var" {
+        n := nd("Assign", t)
+        n.name = lhs[0].name
+        n.value = rhs[0]
+        return n
+      }
+      if lhs[0].kind == "Field" {
+        n := ast.new_node("FieldAssign", lhs[0].line, lhs[0].col)
+        n.obj = lhs[0].obj
+        n.name = lhs[0].name
+        n.value = rhs[0]
+        return n
+      }
+    }
+    n := nd("MultiAssign", t)
+    n.targets = lhs
+    n.values = rhs
+    return n
+  }
+  if op.type == "OP" && is_op_assign(op.value) {
+    ps.p++
+    if len(lhs) != 1 { fail_at("\"" + op.value + "\" changes a single variable", op.line, op.col) }
+    ps.check_target(lhs[0])
+    n := nd("OpAssign", t)
+    n.target = lhs[0]
+    n.op = op.value[0:len(op.value) - 1]
+    n.value = ps.expr()
+    return n
+  }
+  if op.type == "OP" && (op.value == "++" || op.value == "--") {
+    ps.p++
+    if len(lhs) != 1 { fail_at("\"" + op.value + "\" changes a single variable", op.line, op.col) }
+    ps.check_target(lhs[0])
+    one := nd("Number", op)
+    one.num_value = 1.0
+    one.int = true
+    n := nd("OpAssign", t)
+    n.target = lhs[0]
+    n.op = op.value[0:1]
+    n.value = one
+    return n
+  }
+  if op.type == "OP" && op.value == "<-" {
+    ps.p++
+    if len(lhs) != 1 { fail_at("You can only send on one channel at a time", op.line, op.col) }
+    n := nd("Send", t)
+    n.ch = lhs[0]
+    n.value = ps.expr()
+    return n
+  }
+  if len(lhs) != 1 { ps.fail("A list of values must be followed by \"=\" or \":=\"") }
+  n := nd("ExprStmt", t)
+  n.expr = lhs[0]
+  return n
+}
+fn (ps: *Parser) check_target(e: *ast.Node) {
+  if e.kind != "Var" && e.kind != "Field" && e.kind != "Index" && e.kind != "Deref" {
+    line := e.line
+    if line == 0 { line = ps.peek(0).line }
+    fail_at("You can only assign to a variable, a field (p.x), an element (a[i]) or a pointer (*p)", line, e.col)
+  }
+}
+fn (ps: *Parser) expr_list() -> []*ast.Node {
+  list := []*ast.Node{ps.expr()}
+  while ps.is_op(",", 0) {
+    ps.p++
+    list = append(list, ps.expr())
+  }
+  return list
+}
+fn (ps: *Parser) if_stmt() -> *ast.Node {
+  t := ps.next()
+  n := nd("If", t)
+  ps.no_lit++
+  first := ps.simple_stmt(false)
+  if ps.is_semi() {
+    ps.p++
+    n.init = first
+    n.cond = ps.expr()
+  } else if first.kind == "ExprStmt" { n.cond = first.expr } else {
+    fail_at("An assignment in an if must be followed by \";\" and the condition: if x := f(); x > 0 { }", t.line, t.col)
+  }
+  ps.no_lit--
+  n.then = ps.block()
+  save := ps.p
+  ps.skip_nl()
+  if ps.is_kw("else", 0) {
+    ps.p++
+    if ps.is_kw("if", 0) { n.otherwise = ps.if_stmt() } else { n.otherwise = ps.block() }
+  } else { ps.p = save }
+  return n
+}
+fn (ps: *Parser) for_stmt() -> *ast.Node {
+  t := ps.next()
+  # for {  } : infinite loop
+  if ps.is_op("{", 0) {
+    n := nd("ForC", t)
+    n.body = ps.loop_body()
+    return n
+  }
+  # for range x { }
+  if ps.is_kw("range", 0) {
+    ps.p++
+    n := nd("Range", t)
+    n.subject = ps.cond_expr()
+    n.body = ps.loop_body()
+    return n
+  }
+  # for i = a to b { }  (Caju's classic for)
+  if ps.peek(0).type == "NAME" && ps.is_op("=", 1) {
+    save := ps.p
+    ps.p += 2
+    from_e := ps.cond_expr()
+    if ps.is_kw("to", 0) {
+      ps.p++
+      n := nd("ForTo", t)
+      n.name = ps.toks[save].value
+      n.from_ = from_e
+      n.to_ = ps.cond_expr()
+      n.body = ps.loop_body()
+      return n
+    }
+    ps.p = save
+  }
+  ps.no_lit++
+  h := ps.for_header(t)
+  ps.no_lit--
+  h.body = ps.loop_body()
+  return h
+}
+# the header of a for: a Range node, or a ForC node with init, cond and post
+fn (ps: *Parser) for_header(t: *lexer.Token) -> *ast.Node {
+  n := nd("ForC", t)
+  if !ps.is_semi() {
+    first := ps.simple_stmt(true)
+    if first.kind == "Range" { return first }
+    if !ps.is_semi() {
+      if first.kind != "ExprStmt" { fail_at("In a for with an assignment, use for init; condition; post { }", t.line, t.col) }
+      n.cond = first.expr
+      return n
+    }
+    n.init = first
+  }
+  ps.p++
+  if !ps.is_semi() { n.cond = ps.expr() }
+  if !ps.is_semi() { ps.fail("Expected \";\" after the for condition") }
+  ps.p++
+  if !ps.is_op("{", 0) { n.post = ps.simple_stmt(false) }
+  return n
+}
+# switch and select cases: "case ...:" and "default:", with the statements up to the next case
+fn (ps: *Parser) case_body() -> []*ast.Node { return ps.statements(END_CASE, false) }
+fn (ps: *Parser) switch_stmt() -> *ast.Node {
+  t := ps.next()
+  let init: *ast.Node = nil
+  let tag: *ast.Node = nil
+  type_switch := false
+  bind := ""
+  let subject: *ast.Node = nil
+  ps.no_lit++
+  if !ps.is_op("{", 0) {
+    let first: *ast.Node = nil
+    if !ps.is_semi() { first = ps.simple_stmt(false) }
+    if ps.is_semi() {
+      ps.p++
+      init = first
+      if !ps.is_op("{", 0) { tag = ps.simple_stmt(false) }
+    } else { tag = first }
+  }
+  ps.no_lit--
+  # switch v := x.(type)  or  switch x.(type)
+  if tag != nil {
+    if tag.kind == "Assign" && tag.decl == ":=" && tag.value.kind == "TypeOf" {
+      type_switch = true
+      bind = tag.name
+      subject = tag.value.obj
+    } else if tag.kind == "ExprStmt" && tag.expr.kind == "TypeOf" {
+      type_switch = true
+      subject = tag.expr.obj
+    } else if tag.kind != "ExprStmt" { fail_at("switch expects an expression", t.line, t.col) } else { tag = tag.expr }
+  }
+  ps.expect("{", "\"{\" to open the switch")
+  ps.skip_nl()
+  cases := []*ast.Node{}
+  has_default := false
+  ps.switch_depth++
+  while !ps.is_op("}", 0) {
+    ct := ps.peek(0)
+    if ps.is_kw("default", 0) {
+      ps.p++
+      if has_default { fail_at("The switch already has a default", ct.line, ct.col) }
+      has_default = true
+      ps.expect(":", "\":\" after default")
+      c := nd("Case", ct)
+      c.is_default = true
+      c.stmts = ps.case_body()
+      cases = append(cases, c)
+      continue
+    }
+    ps.expect_kw("case", "\"case\" or \"default\" inside the switch")
+    c := nd("Case", ct)
+    if type_switch {
+      types := []str{}
+      for {
+        if ps.is_kw("nil", 0) {
+          ps.p++
+          types = append(types, "nil")
+        } else { types = append(types, ps.lang_type(false)) }
+        if !ps.is_op(",", 0) { break }
+        ps.p++
+      }
+      c.types = types
+    } else {
+      exprs := []*ast.Node{}
+      ps.no_lit++
+      for {
+        exprs = append(exprs, ps.expr())
+        if !ps.is_op(",", 0) { break }
+        ps.p++
+      }
+      ps.no_lit--
+      c.exprs = exprs
+    }
+    ps.expect(":", "\":\" after the case values")
+    body := ps.case_body()
+    if len(body) > 0 {
+      last := body[len(body) - 1]
+      if last.kind == "Fallthrough" && type_switch { fail_at("fallthrough is not allowed in a type switch", last.line, last.col) }
+    }
+    for i, s := range body {
+      if s.kind == "Fallthrough" && i != len(body) - 1 { fail_at("fallthrough must be the last statement of the case", s.line, s.col) }
+    }
+    c.stmts = body
+    cases = append(cases, c)
+  }
+  ps.switch_depth--
+  ps.p++
+  if len(cases) > 0 {
+    for _, s := range cases[len(cases) - 1].stmts {
+      if s.kind == "Fallthrough" { fail_at("The last case cannot have fallthrough", t.line, t.col) }
+    }
+  }
+  if type_switch {
+    n := nd("TypeSwitch", t)
+    n.init = init
+    n.bind = bind
+    n.subject = subject
+    n.cases = cases
+    return n
+  }
+  n := nd("Switch", t)
+  n.init = init
+  n.tag = tag
+  n.cases = cases
+  return n
+}
+fn (ps: *Parser) select_stmt() -> *ast.Node {
+  t := ps.next()
+  ps.expect("{", "\"{\" to open the select")
+  ps.skip_nl()
+  cases := []*ast.Node{}
+  ps.switch_depth++
+  while !ps.is_op("}", 0) {
+    ct := ps.peek(0)
+    if ps.is_kw("default", 0) {
+      ps.p++
+      ps.expect(":", "\":\" after default")
+      for _, c := range cases { if c.kind == "default" { fail_at("The select already has a default", ct.line, ct.col) } }
+      c := nd("default", ct)
+      c.stmts = ps.case_body()
+      cases = append(cases, c)
+      continue
+    }
+    ps.expect_kw("case", "\"case\" or \"default\" inside the select")
+    st := ps.simple_stmt(false)
+    c := nd("recv", ct)
+    rv := recv_of(st)
+    if st.kind == "Send" {
+      c = nd("send", ct)
+      c.ch = st.ch
+      c.value = st.value
+    } else if st.kind == "ExprStmt" && st.expr.kind == "Recv" {
+      c.ch = st.expr.arg
+    } else if (st.kind == "Assign" || st.kind == "VarDecl" || st.kind == "MultiAssign") && rv != nil {
+      vars := []*ast.Node{}
+      if st.kind == "Assign" {
+        v := ast.new_node("Var", st.line, st.col)
+        v.name = st.name
+        vars = append(vars, v)
+      } else if st.kind == "VarDecl" {
+        for _, nm := range st.names {
+          v := ast.new_node("Var", st.line, st.col)
+          v.name = nm
+          vars = append(vars, v)
+        }
+      } else { vars = st.targets }
+      c.ch = rv.arg
+      c.vars = vars
+      c.define = st.kind == "VarDecl" || st.decl == ":="
+    } else { fail_at("Each select case either receives (<-channel) or sends (channel <- value)", ct.line, ct.col) }
+    ps.expect(":", "\":\" after the case")
+    c.stmts = ps.case_body()
+    cases = append(cases, c)
+  }
+  ps.switch_depth--
+  ps.p++
+  n := nd("Select", t)
+  n.cases = cases
+  return n
+}
+fn recv_of(st: *ast.Node) -> *ast.Node {
+  let v: *ast.Node = nil
+  if st.kind == "Assign" { v = st.value } else if len(st.values) == 1 { v = st.values[0] }
+  if v != nil && v.kind == "Recv" { return v }
+  return nil
+}
+# fn (p: T) name(...) is a method; fn (a: int) { } would be a literal at the top level (not accepted as a declaration)
+fn (ps: *Parser) is_method_header() -> bool {
+  q := 1
+  depth := 0
+  for ; q < 12; q++ {
+    if ps.is_op("(", q) { depth++ }
+    if ps.is_op(")", q) {
+      depth--
+      if depth == 0 { break }
+    }
+  }
+  return ps.peek(q + 1).type == "NAME" && ps.is_op("(", q + 2)
+}
+
+# ---- expressions
+# binary operators of one precedence level: level 0 or, 1 and, 2 sum, 3 term
+fn (ps: *Parser) bin_next(level: int) -> *ast.Node {
+  if level == 0 { return ps.and_expr() }
+  if level == 1 { return ps.not_expr() }
+  if level == 2 { return ps.term() }
+  return ps.unary()
+}
+fn level_has(level: int, v: str) -> bool {
+  if level == 0 { return v == "or" || v == "||" }
+  if level == 1 { return v == "and" || v == "&&" }
+  if level == 2 { return v == "+" || v == "-" || v == "|" || v == "^" }
+  return v == "*" || v == "/" || v == "%" || v == "<<" || v == ">>" || v == "&" || v == "&^"
+}
+fn (ps: *Parser) bin_loop(level: int, kind: str) -> *ast.Node {
+  left := ps.bin_next(level)
+  while (ps.peek(0).type == "OP" || ps.peek(0).type == "KEYWORD") && level_has(level, ps.peek(0).value) {
+    t := ps.next()
+    op := t.value
+    if op == "&&" { op = "and" } else if op == "||" { op = "or" }
+    n := nd(kind, t)
+    n.op = op
+    n.left = left
+    n.right = ps.bin_next(level)
+    left = n
+  }
+  return left
+}
+fn (ps: *Parser) expr() -> *ast.Node { return ps.bin_loop(0, "Logical") }
+fn (ps: *Parser) and_expr() -> *ast.Node { return ps.bin_loop(1, "Logical") }
+fn (ps: *Parser) not_expr() -> *ast.Node {
+  if ps.is_kw("not", 0) || ps.is_op("!", 0) {
+    t := ps.next()
+    n := nd("Not", t)
+    n.arg = ps.not_expr()
+    return n
+  }
+  return ps.comparison()
+}
+fn (ps: *Parser) comparison() -> *ast.Node {
+  left := ps.sum()
+  v := ps.peek(0).value
+  if ps.peek(0).type == "OP" && (v == "==" || v == "!=" || v == "<" || v == ">" || v == "<=" || v == ">=") {
+    t := ps.next()
+    n := nd("Binary", t)
+    n.op = t.value
+    n.left = left
+    n.right = ps.sum()
+    return n
+  }
+  return left
+}
+fn (ps: *Parser) sum() -> *ast.Node { return ps.bin_loop(2, "Binary") }
+fn (ps: *Parser) term() -> *ast.Node { return ps.bin_loop(3, "Binary") }
+fn (ps: *Parser) unary() -> *ast.Node {
+  t := ps.peek(0)
+  kind := ""
+  if ps.is_op("-", 0) { kind = "Neg" } else if ps.is_op("^", 0) { kind = "BitNot" } else if ps.is_op("&", 0) { kind = "AddrOf" } else if ps.is_op("*", 0) { kind = "Deref" } else if ps.is_op("<-", 0) { kind = "Recv" }
+  if kind != "" {
+    ps.p++
+    n := nd(kind, t)
+    n.arg = ps.unary()
+    return n
+  }
+  if ps.is_op("+", 0) {
+    ps.p++
+    return ps.unary()
+  }
+  return ps.power()
+}
+fn (ps: *Parser) power() -> *ast.Node {
+  base := ps.primary()
+  if ps.is_op("**", 0) {
+    t := ps.next()
+    n := nd("Binary", t)
+    n.op = "**"
+    n.left = base
+    n.right = ps.unary()
+    return n
+  }
+  return base
+}
+fn (ps: *Parser) primary() -> *ast.Node { return ps.postfix(ps.atom()) }
+# p.field, p.method(...), x.(T), a[i], a[i:j] and f(x), chained
+fn (ps: *Parser) postfix(base: *ast.Node) -> *ast.Node {
+  for {
+    if ps.is_op(".", 0) {
+      ps.p++
+      nt := ps.peek(0)
+      if ps.is_op("(", 0) {
+        ps.p++
+        if ps.peek(0).type == "NAME" && ps.peek(0).value == "type" && ps.is_op(")", 1) {
+          ps.p += 2
+          n := nd("TypeOf", nt)
+          n.obj = base
+          base = n
+          continue
+        }
+        ty := ps.lang_type(false)
+        ps.expect(")", "\")\" after the type")
+        n := nd("TypeAssert", nt)
+        n.obj = base
+        n.type = ty
+        base = n
+        continue
+      }
+      nm := ps.name("a field or method name after \".\"")
+      if ps.is_op("(", 0) {
+        n := nd("MethodCall", nt)
+        n.obj = base
+        n.name = nm
+        n.args, n.args_spread = ps.call_args()
+        base = n
+      } else {
+        n := nd("Field", nt)
+        n.obj = base
+        n.name = nm
+        base = n
+      }
+      continue
+    }
+    if ps.is_op("[", 0) {
+      bt := ps.next()
+      saved := ps.no_lit
+      ps.no_lit = 0
+      let lo: *ast.Node = nil
+      if !ps.is_op(":", 0) { lo = ps.expr() }
+      if ps.is_op(":", 0) {
+        ps.p++
+        n := nd("SliceExpr", bt)
+        if !ps.is_op("]", 0) { n.hi = ps.expr() }
+        ps.expect("]", "\"]\" to close the slice")
+        n.obj = base
+        n.lo = lo
+        base = n
+      } else {
+        ps.expect("]", "\"]\" to close the index")
+        n := nd("Index", bt)
+        n.obj = base
+        n.index = lo
+        base = n
+      }
+      ps.no_lit = saved
+      continue
+    }
+    if ps.is_op("(", 0) && base.kind != "Var" && ps.peek(0).line == ps.toks[ps.p - 1].line {
+      ct := ps.peek(0)
+      n := nd("CallValue", ct)
+      n.fn_ = base
+      n.args, n.args_spread = ps.call_args()
+      base = n
+      continue
+    }
+    return base
+  }
+  return base
+}
+# "(" args ")": the arguments and whether the last is spread (f(xs...))
+fn (ps: *Parser) call_args() -> ([]*ast.Node, bool) {
+  saved := ps.no_lit
+  ps.no_lit = 0
+  ps.p++
+  args := []*ast.Node{}
+  spread := false
+  ps.skip_nl()
+  if !ps.is_op(")", 0) {
+    args = append(args, ps.expr())
+    ps.skip_nl()
+    while ps.is_op(",", 0) {
+      ps.p++
+      ps.skip_nl()
+      if ps.is_op(")", 0) { break }
+      args = append(args, ps.expr())
+      ps.skip_nl()
+    }
+  }
+  if ps.is_op("...", 0) {
+    ps.p++
+    spread = true
+    ps.skip_nl()
+  }
+  ps.expect(")", "\")\" to close the call")
+  ps.no_lit = saved
+  return args, spread
+}
+fn (ps: *Parser) struct_lit(type: str, t: *lexer.Token) -> *ast.Node {
+  saved := ps.no_lit
+  ps.no_lit = 0
+  ps.p++   # {
+  ps.skip_nl()
+  fields := []*ast.Node{}
+  while !ps.is_op("}", 0) {
+    ft := ps.peek(0)
+    fname := ps.name("a field name")
+    for _, f := range fields { if f.name == fname { fail_at("Field \"" + fname + "\" appears twice", ft.line, ft.col) } }
+    ps.expect(":", "\":\" after " + fname)
+    fi := nd("FieldInit", ft)
+    fi.name = fname
+    fi.value = ps.elem_value()
+    fields = append(fields, fi)
+    ps.skip_nl()
+    if ps.is_op(",", 0) {
+      ps.p++
+      ps.skip_nl()
+    } else if !ps.is_op("}", 0) { ps.fail("Expected \",\" or \"}\" in the field list") }
+  }
+  ps.p++
+  n := nd("StructLit", t)
+  n.type = type
+  n.fields = fields
+  ps.no_lit = saved
+  return n
+}
+# value inside a composite literal: may be a {...} without the type, which comes from context
+fn (ps: *Parser) elem_value() -> *ast.Node {
+  if ps.is_op("{", 0) { return ps.brace_lit("", ps.peek(0)) }
+  return ps.expr()
+}
+# {a, b, c}  or  {key: value, ...}  or  {field: value} when the type is a struct
+fn (ps: *Parser) brace_lit(type: str, t: *lexer.Token) -> *ast.Node {
+  saved := ps.no_lit
+  ps.no_lit = 0
+  ps.expect("{", "")
+  ps.skip_nl()
+  elems := []*ast.Node{}
+  while !ps.is_op("}", 0) {
+    et := ps.peek(0)
+    el := nd("Elem", et)
+    el.value = ps.elem_value()
+    if ps.is_op(":", 0) {
+      ps.p++
+      el.key = el.value
+      el.value = ps.elem_value()
+    }
+    elems = append(elems, el)
+    ps.skip_nl()
+    if ps.is_op(",", 0) {
+      ps.p++
+      ps.skip_nl()
+    } else if !ps.is_op("}", 0) { ps.fail("Expected \",\" or \"}\" in the element list") }
+  }
+  ps.p++
+  n := nd("CompositeLit", t)
+  n.type = type
+  n.elems = elems
+  ps.no_lit = saved
+  return n
+}
+fn has_float_mark(s: str) -> bool {
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c == 46 || c == 101 || c == 69 { return true }
+  }
+  return false
+}
+fn (ps: *Parser) atom() -> *ast.Node {
+  t := ps.peek(0)
+  if t.type == "NUMBER" {
+    ps.p++
+    n := nd("Number", t)
+    v, _ := strconv.parse_float(t.value)
+    n.num_value = v
+    n.int = !has_float_mark(t.value)
+    if n.int { n.raw = t.value }
+    return n
+  }
+  if t.type == "RUNE" {
+    ps.p++
+    n := nd("Number", t)
+    n.num_value = num(t.rune_value)
+    n.int = true
+    n.rune = true
+    return n
+  }
+  if t.type == "STRING" {
+    ps.p++
+    n := nd("String", t)
+    n.str_value = t.value
+    return n
+  }
+  if ps.is_kw("true", 0) || ps.is_kw("false", 0) {
+    ps.p++
+    n := nd("Bool", t)
+    n.bool_value = t.value == "true"
+    return n
+  }
+  if ps.is_kw("nil", 0) {
+    ps.p++
+    return nd("Nil", t)
+  }
+  # fn(...) -> T { ... }: anonymous function (closure)
+  if ps.is_kw("fn", 0) && ps.is_op("(", 1) {
+    ps.p++
+    f := ps.func_rest(t, "fn@" + str(ast.loc_line(t.line)) + ":" + str(t.col), nil)
+    n := nd("FuncLit", t)
+    n.fn_ = f
+    return n
+  }
+  # []int{...}, [3]int{...}, map[str]int{...}, []byte(s)
+  if ps.is_op("[", 0) || ps.is_kw("map", 0) {
+    ty := ps.lang_type(false)
+    if ps.is_op("{", 0) { return ps.brace_lit(ty, t) }
+    if ps.is_op("(", 0) {
+      n := nd("Conversion", t)
+      n.type = ty
+      n.args, n.args_spread = ps.call_args()
+      return n
+    }
+    ps.fail("Expected \"{\" or \"(\" after the type " + ty)
+  }
+  if t.type == "NAME" {
+    q := ps.qualified()
+    if q != "" {
+      ps.p++
+      if ps.is_op("(", 0) {
+        n := nd("Call", t)
+        n.name = q
+        n.args, n.args_spread = ps.call_args()
+        return n
+      }
+      if ps.lit_ahead() {
+        if ps.named_fields_ahead() { return ps.struct_lit(q, t) }
+        return ps.brace_lit(q, t)
+      }
+      n := nd("Var", t)
+      n.name = q
+      return n
+    }
+    ps.p++
+    # make(T, ...) and new(T): the first argument is a type
+    if (t.value == "make" || t.value == "new") && ps.is_op("(", 0) {
+      saved := ps.no_lit
+      ps.no_lit = 0
+      ps.p++
+      n := nd("Call", t)
+      n.name = t.value
+      n.type_arg = ps.lang_type(false)
+      args := []*ast.Node{}
+      while ps.is_op(",", 0) {
+        ps.p++
+        args = append(args, ps.expr())
+      }
+      ps.expect(")", "\")\" to close the call")
+      n.args = args
+      ps.no_lit = saved
+      return n
+    }
+    if ps.is_op("(", 0) {
+      n := nd("Call", t)
+      n.name = t.value
+      n.args, n.args_spread = ps.call_args()
+      return n
+    }
+    if ps.lit_ahead() {
+      if ps.named_fields_ahead() { return ps.struct_lit(t.value, t) }
+      return ps.brace_lit(t.value, t)
+    }
+    if ps.no_lit > 0 && ps.is_op("{", 0) {
+      k := 1
+      while ps.peek(k).type == "NEWLINE" { k++ }
+      if ps.peek(k).type == "NAME" && ps.is_op(":", k + 1) {
+        b := ps.peek(0)
+        fail_at("In an if, while, for or switch condition, \"" + t.value + " {\" opens the block. To create a struct there, use parentheses: (" + t.value + "{...})", b.line, b.col)
+      }
+    }
+    n := nd("Var", t)
+    n.name = t.value
+    return n
+  }
+  if ps.is_op("(", 0) {
+    ps.p++
+    saved := ps.no_lit
+    ps.no_lit = 0
+    e := ps.expr()
+    ps.no_lit = saved
+    ps.expect(")", "\")\" to close the parenthesis")
+    n := nd("Paren", t)
+    n.expr = e
+    return n
+  }
+  ps.fail("Expected a number, string, name or \"(\"")
+  return nil
+}

@@ -1,0 +1,2044 @@
+# The type checker: port of bootstrap/types.js.
+#
+# Gradual typing: whatever has a type (annotated or inferred) is checked at compile time, as in Go;
+# whatever doesn't becomes any and is only checked at run time. A type is a canonical string
+# ("int", "[]str", "map[str]int", "*Point", "fn(int) -> (int, error)", "chan int").
+#   integers: int int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 (byte = uint8, rune = int32)
+#   floats: num (= float64) float32      str (= string)     bool     any     error     void (no value)
+# Untyped numbers (5, 'a', 2.5) are constants that adapt to the requested type, as in Go
+# ("lit", "rlit", "flit" while untyped).
+#
+# typecheck(prog, intrinsics) -> *Result. The JavaScript closures of typecheck() are methods of
+# Checker; the JavaScript info objects are the structs below (JS property -> snake_case field):
+#
+#   Result         { struct_table, iface_table, global_celled }   (JS structTable, ifaceTable, globalCelled)
+#                  r.method_set(name, ptr) -> map[str]*MethodSetEntry   (JS methodSet(name, ptr))
+#   StructInfo     { node, fields: map name -> FieldDef node, methods: map name -> *MethodEntry }
+#   IfaceInfo      { node, methods: map name -> MethodSig node {name, params, ptypes, rtype}, builtin }
+#   MethodEntry    { info: *FuncInfo, ptr }                         (S.methods values)
+#   MethodSetEntry { info: *FuncInfo, ptr, path: []str, depth }     (methodSet values)
+#   FuncInfo       { node, name, params, ptypes, declared, ret, inferring, locals, parent, parent_sc,
+#                    is_lit, saw_ret }                              (fnInfo objects)
+#   TInfo          { k, elem, n, key, val, params, results, items } (tinfo(t) results)
+#
+# JavaScript null/undefined types are "" here.
+
+import "std/strings"
+import "ast"
+
+# =====================================================================
+# Helpers shared with the other modules (top level of types.js, compiler.js and values.js)
+# =====================================================================
+export let INT_KINDS = []str{"int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64"}
+export let FLOAT_KINDS = []str{"num", "float32"}
+# numeric kind code used by the IOP and CONV instructions
+export let KIND_CODE = map[str]int{"int": 0, "int8": 1, "int16": 2, "int32": 3, "int64": 4, "uint": 5, "uint8": 6, "uint16": 7, "uint32": 8, "uint64": 9, "float32": 10, "num": 11}
+export let KIND_NAMES = []str{"int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "float32", "num"}
+export let TYPE_ALIASES = map[str]str{"byte": "uint8", "rune": "int32", "string": "str", "float64": "num"}
+export let LANG_TYPES = []str{"int", "num", "str", "bool", "any", "error", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "float32"}
+export let PRIM_TYPES = map[str]bool{"int": true, "num": true, "str": true, "bool": true, "any": true, "error": true, "int8": true, "int16": true, "int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true, "float32": true, "void": true}
+export let FFI_ONLY = map[str]bool{"i32": true, "u32": true, "i64": true, "u64": true, "f32": true, "f64": true, "ptr": true, "wstr": true}
+# conversions written as a call: int(x), uint8(x), num(x), str(x), string(x)...
+export let CONVERSIONS = []str{"int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "num", "float32", "float64", "str", "string", "byte", "rune"}
+export let FFI_LANG = map[str]str{"void": "void", "i32": "int", "u32": "int", "i64": "int", "u64": "int", "ptr": "int", "f32": "num", "f64": "num", "bool": "bool", "str": "str", "wstr": "str"}
+# provisional result of a recursive call while the function's return type is being inferred
+export const NEVER = "never"
+# language functions with their own typing rules
+export let SPECIAL_BUILTINS = []str{"print", "len", "cap", "append", "copy", "delete", "make", "new", "panic", "recover", "close"}
+# values.js: built-in functions (the position is the number used by the CALL instruction)
+export let BUILTINS = []str{"print", "sleep", "alloc", "free", "peek8", "peek16", "peek32", "peek64", "poke8", "poke16", "poke32", "readstr", "readwstr"}
+export let BUILTIN_ARITY = map[str]int{"print": -1, "sleep": 1, "alloc": 1, "free": 1, "peek8": 1, "peek16": 1, "peek32": 1, "peek64": 1, "poke8": 2, "poke16": 2, "poke32": 2, "readstr": 1, "readwstr": 1}
+export let FFI_WORDS = map[str]int{"i32": 1, "u32": 1, "i64": 2, "u64": 2, "f32": 1, "f64": 2, "bool": 1, "ptr": 1, "str": 1, "wstr": 1}
+export const MAX_FFI_WORDS = 16
+
+export fn contains_str(xs: []str, s: str) -> bool {
+  for _, x := range xs {
+    if x == s { return true }
+  }
+  return false
+}
+export fn is_type_word(s: str) -> bool {
+  if PRIM_TYPES[s] { return true }
+  _, ok := TYPE_ALIASES[s]
+  return ok
+}
+export fn is_int_t(t: str) -> bool { return contains_str(INT_KINDS, t) || t == "lit" || t == "rlit" }
+export fn is_float_t(t: str) -> bool { return t == "num" || t == "float32" || t == "flit" }
+export fn is_num_t(t: str) -> bool { return is_int_t(t) || is_float_t(t) }
+export fn is_untyped(t: str) -> bool { return t == "lit" || t == "rlit" || t == "flit" }
+export fn loose(t: str) -> bool { return t == "any" || t == NEVER }
+export fn dflt(t: str) -> str {
+  if t == "lit" { return "int" }
+  if t == "rlit" { return "int32" }
+  if t == "flit" { return "num" }
+  return t
+}
+export fn show_t(t: str) -> str {
+  if t == "lit" || t == "rlit" { return "int" }
+  if t == "flit" { return "num" }
+  return t
+}
+fn is_space(c: int) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 }
+# strips the file from linked names: Point@geo.caju -> Point, Point@geo.caju.area -> Point.area
+# (the JavaScript regex /@[^@\s]*?\.caju/g)
+export fn bare(nm: str) -> str {
+  if strings.index_byte(nm, 64) < 0 { return nm }
+  b := strings.Builder{}
+  i := 0
+  n := len(nm)
+  while i < n {
+    if int(nm[i]) == 64 {
+      j := i + 1
+      found := -1
+      while true {
+        if j + 5 <= n && nm[j:j + 5] == ".caju" { found = j; break }
+        if j >= n { break }
+        c := int(nm[j])
+        if c == 64 || is_space(c) { break }
+        j++
+      }
+      if found >= 0 {
+        i = found + 5
+        continue
+      }
+    }
+    b.write_byte(int(nm[i]))
+    i++
+  }
+  return b.string()
+}
+export fn func_type_text(ps: []str, res: []str) -> str {
+  s := "fn(" + strings.join(ps, ", ") + ")"
+  if len(res) == 1 { return s + " -> " + res[0] }
+  if len(res) > 1 { return s + " -> (" + strings.join(res, ", ") + ")" }
+  return s
+}
+# compiler.js
+export fn plural(n: int, word: str) -> str {
+  if n == 1 { return str(n) + " " + word }
+  return str(n) + " " + word + "s"
+}
+# values.js forTop: the top-level statements of the program, including inside modules
+export fn top_stmts(body: []*ast.Node) -> []*ast.Node {
+  out := []*ast.Node{}
+  add_top(body, &out)
+  return out
+}
+fn add_top(body: []*ast.Node, out: *[]*ast.Node) {
+  for _, st := range body {
+    if st.kind == "Module" { add_top(st.stmts, out) } else { *out = append(*out, st) }
+  }
+}
+# a JavaScript number as String(v) prints it (integers as integers)
+export fn js_num(v: num) -> str {
+  if v == v && v > -1e21 && v < 1e21 && num(int(v)) == v { return str(int(v)) }
+  return str(v)
+}
+# JavaScript s.slice(a, b) with b possibly negative
+fn js_slice(s: str, a: int, b: int) -> str {
+  n := len(s)
+  if a < 0 { a = n + a }
+  if b < 0 { b = n + b }
+  if a < 0 { a = 0 }
+  if b > n { b = n }
+  if a > n { a = n }
+  if b <= a { return "" }
+  return s[a:b]
+}
+fn strip_star(t: str) -> str {
+  if strings.has_prefix(t, "*") { return t[1:] }
+  return t
+}
+fn with_str(xs: []str, s: str) -> []str {
+  out := []str{}
+  for _, x := range xs { out = append(out, x) }
+  return append(out, s)
+}
+
+# ---- type text -> parts: { k: "slice" | "array" | "map" | "ptr" | "chan" | "func" | "tuple" | "name", ... }
+export struct TInfo {
+  k: str
+  elem: str          # slice, array, ptr, chan
+  n: int             # array length
+  key: str           # map
+  val: str           # map
+  params: []str      # func
+  results: []str     # func
+  items: []str       # tuple
+}
+let tinfo_cache = map[str]*TInfo{}
+
+# splits on top-level commas
+fn split_top(s: str) -> []str {
+  out := []str{}
+  depth := 0
+  cur := strings.Builder{}
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c == 40 || c == 91 { depth++ }
+    if c == 41 || c == 93 { depth-- }
+    if c == 44 && depth == 0 {
+      out = append(out, strings.trim_space(cur.string()))
+      cur.reset()
+    } else {
+      cur.write_byte(c)
+    }
+  }
+  last := strings.trim_space(cur.string())
+  if last != "" { out = append(out, last) }
+  return out
+}
+# end of the first complete type inside s (for map[K]V and fn(...) -> R)
+fn close_at(s: str, i: int, open: int, shut: int) -> int {
+  d := 0
+  while i < len(s) {
+    c := int(s[i])
+    if c == open { d++ }
+    if c == shut {
+      d--
+      if d == 0 { return i }
+    }
+    i++
+  }
+  return -1
+}
+fn array_len_end(t: str) -> int {
+  # /^\[\d+\]/: the index of "]", or -1
+  if len(t) < 3 || int(t[0]) != 91 { return -1 }
+  i := 1
+  while i < len(t) && int(t[i]) >= 48 && int(t[i]) <= 57 { i++ }
+  if i == 1 || i >= len(t) || int(t[i]) != 93 { return -1 }
+  return i
+}
+export fn tinfo(t: str) -> *TInfo {
+  cached, ok := tinfo_cache[t]
+  if ok { return cached }
+  r := &TInfo{}
+  ae := array_len_end(t)
+  if strings.has_prefix(t, "[]") {
+    r.k = "slice"
+    r.elem = t[2:]
+  } else if ae > 0 {
+    r.k = "array"
+    nn := 0
+    for i := 1; i < ae; i++ { nn = nn * 10 + int(t[i]) - 48 }
+    r.n = nn
+    r.elem = t[ae + 1:]
+  } else if strings.has_prefix(t, "map[") {
+    e := close_at(t, 3, 91, 93)
+    r.k = "map"
+    r.key = js_slice(t, 4, e)
+    r.val = t[e + 1:]
+  } else if strings.has_prefix(t, "*") {
+    r.k = "ptr"
+    r.elem = t[1:]
+  } else if strings.has_prefix(t, "chan ") {
+    r.k = "chan"
+    r.elem = t[5:]
+  } else if strings.has_prefix(t, "fn(") {
+    e := close_at(t, 2, 40, 41)
+    r.k = "func"
+    r.params = split_top(js_slice(t, 3, e))
+    rest := strings.trim_space(t[e + 1:])
+    res := []str{}
+    if strings.has_prefix(rest, "->") {
+      rest = strings.trim_space(rest[2:])
+      if strings.has_prefix(rest, "(") { res = split_top(js_slice(rest, 1, -1)) } else { res = []str{rest} }
+    }
+    r.results = res
+  } else if strings.has_prefix(t, "(") {
+    r.k = "tuple"
+    r.items = split_top(js_slice(t, 1, -1))
+  } else {
+    r.k = "name"
+  }
+  tinfo_cache[t] = r
+  return r
+}
+export fn kind_of(t: str) -> str { return tinfo(t).k }
+export fn results_of(r: str) -> []str {
+  if r == "void" { return []str{} }
+  if strings.has_prefix(r, "(") { return tinfo(r).items }
+  return []str{r}
+}
+fn results_type(res: []str) -> str {
+  if len(res) == 0 { return "void" }
+  if len(res) == 1 { return res[0] }
+  return "(" + strings.join(res, ", ") + ")"
+}
+
+struct Sig {
+  ps: []str
+  r: str
+}
+let BUILTIN_SIG = map[str]*Sig{
+  "sleep": &Sig{[]str{"num"}, "void"}, "alloc": &Sig{[]str{"int"}, "int"}, "free": &Sig{[]str{"any"}, "void"},
+  "peek8": &Sig{[]str{"int"}, "int"}, "peek16": &Sig{[]str{"int"}, "int"}, "peek32": &Sig{[]str{"int"}, "int"}, "peek64": &Sig{[]str{"int"}, "int"},
+  "poke8": &Sig{[]str{"int", "int"}, "void"}, "poke16": &Sig{[]str{"int", "int"}, "void"}, "poke32": &Sig{[]str{"int", "int"}, "void"},
+  "readstr": &Sig{[]str{"int"}, "str"}, "readwstr": &Sig{[]str{"int"}, "str"},
+}
+# Low-level operations, only for the native compiler's runtime (written in Caju)
+let INTRINSIC_SIG = map[str]*Sig{
+  "__load8": &Sig{[]str{"int"}, "int"}, "__load64": &Sig{[]str{"int"}, "int"}, "__store8": &Sig{[]str{"int", "int"}, "void"}, "__store64": &Sig{[]str{"int", "int"}, "void"},
+  "__syscall": &Sig{[]str{"int", "int", "int", "int", "int", "int", "int"}, "int"}, "__argp": &Sig{[]str{}, "int"}, "__sp": &Sig{[]str{}, "int"}, "__calldefer": &Sig{[]str{"int"}, "void"}, "__jump": &Sig{[]str{"int", "int"}, "void"},
+  "__strp": &Sig{[]str{"str"}, "int"}, "__pstr": &Sig{[]str{"int"}, "str"}, "__fbits": &Sig{[]str{"num"}, "int"}, "__bitsf": &Sig{[]str{"int"}, "num"},
+  "__sqrt": &Sig{[]str{"num"}, "num"}, "__fmod": &Sig{[]str{"num", "num"}, "num"},
+  "__newstr": &Sig{[]str{"int"}, "int"}, "__flush": &Sig{[]str{}, "void"}, "__exit": &Sig{[]str{"int"}, "void"},
+}
+
+# does the statement always end in a return (or a panic, or an endless loop without break)?
+export fn always_returns(n: *ast.Node) -> bool {
+  if n == nil { return false }
+  if n.kind == "Return" { return true }
+  if n.kind == "Block" { return always_returns_list(n.stmts) }
+  if n.kind == "If" { return n.otherwise != nil && always_returns(n.then) && always_returns(n.otherwise) }
+  if n.kind == "ExprStmt" { return n.expr.kind == "Call" && n.expr.name == "panic" }
+  if n.kind == "ForC" { return n.cond == nil && !has_break(n.body.stmts) }
+  if n.kind == "Switch" || n.kind == "TypeSwitch" {
+    has_default := false
+    for _, c := range n.cases {
+      if c.is_default { has_default = true }
+    }
+    if !has_default { return false }
+    for _, c := range n.cases {
+      k := len(c.stmts)
+      if !(always_returns_list(c.stmts) || (k > 0 && c.stmts[k - 1].kind == "Fallthrough")) { return false }
+    }
+    for _, c := range n.cases {
+      if has_break(c.stmts) { return false }
+    }
+    return true
+  }
+  return false
+}
+fn always_returns_list(xs: []*ast.Node) -> bool {
+  for _, x := range xs {
+    if always_returns(x) { return true }
+  }
+  return false
+}
+fn has_break(xs: []*ast.Node) -> bool {
+  for _, x := range xs {
+    if break_walk(x, 0) { return true }
+  }
+  return false
+}
+fn break_walk(x: *ast.Node, depth: int) -> bool {
+  if x == nil { return false }
+  if x.kind == "FuncLit" { return false }
+  if x.kind == "Break" && (x.label != "" || depth == 0) { return true }
+  k := x.kind
+  d := depth
+  if k == "ForC" || k == "ForTo" || k == "While" || k == "Range" || k == "Switch" || k == "TypeSwitch" || k == "Select" { d = depth + 1 }
+  for _, y := range x.stmts {
+    if break_walk(y, d) { return true }
+  }
+  if break_walk(x.body, d) || break_walk(x.then, d) || break_walk(x.otherwise, d) { return true }
+  for _, y := range x.cases {
+    if break_walk(y, d) { return true }
+  }
+  return false
+}
+
+# a function's local names (parameters, named results and everything it declares), without entering anonymous functions
+export fn local_names_of(f: *ast.Node) -> []str {
+  names := []str{}
+  seen := map[str]bool{}
+  for _, p := range f.params {
+    names = append(names, p)
+    seen[p] = true
+  }
+  for _, p := range f.rnames {
+    names = append(names, p)
+    seen[p] = true
+  }
+  locals_walk(f.body, &names, seen)
+  return names
+}
+fn add_local(nm: str, names: *[]str, seen: map[str]bool) {
+  if nm != "" && nm != "_" && !seen[nm] {
+    *names = append(*names, nm)
+    seen[nm] = true
+  }
+}
+fn locals_walk(n: *ast.Node, names: *[]str, seen: map[str]bool) {
+  if n == nil || n.kind == "FuncLit" { return }
+  if (n.kind == "Assign" && n.decl != "") || n.kind == "ForTo" { add_local(n.name, names, seen) }
+  if n.kind == "VarDecl" {
+    for _, nm := range n.names { add_local(nm, names, seen) }
+  }
+  if n.kind == "Range" && n.define {
+    for _, v := range n.vars { add_local(v.name, names, seen) }
+  }
+  if n.kind == "TypeSwitch" { add_local(n.bind, names, seen) }
+  if n.kind == "Select" {
+    for _, c := range n.cases {
+      if c.kind == "recv" && c.define {
+        for _, v := range c.vars { add_local(v.name, names, seen) }
+      }
+    }
+  }
+  for _, s := range n.stmts { locals_walk(s, names, seen) }
+  locals_walk(n.body, names, seen)
+  locals_walk(n.then, names, seen)
+  locals_walk(n.otherwise, names, seen)
+  locals_walk(n.init, names, seen)
+  locals_walk(n.post, names, seen)
+  for _, c := range n.cases { locals_walk(c, names, seen) }
+}
+
+# =====================================================================
+# The checker
+# =====================================================================
+export struct VarEntry {
+  type: str
+  node: *ast.Node
+  pending: bool
+  inferred: bool
+}
+export struct Scope {
+  fn_: *FuncInfo
+  vars: map[str]*VarEntry
+  rets: str
+  infer: bool
+  parent: *Scope
+}
+export struct FuncInfo {
+  node: *ast.Node
+  name: str
+  params: []str
+  ptypes: []str
+  declared: str
+  ret: str
+  inferring: bool
+  locals: map[str]bool
+  parent: *Scope
+  parent_sc: *Scope
+  is_lit: bool
+  saw_ret: bool
+}
+# in a dllexport, messages show the C type as written (i32 is an int32)
+fn (f: *FuncInfo) show(t: str) -> str {
+  if f.node.dll_name != "" { return f.node.dll_ret }
+  return show_t(t)
+}
+export struct MethodEntry {
+  info: *FuncInfo
+  ptr: bool
+}
+export struct StructInfo {
+  node: *ast.Node
+  fields: map[str]*ast.Node
+  methods: map[str]*MethodEntry
+}
+export struct IfaceInfo {
+  node: *ast.Node
+  methods: map[str]*ast.Node
+  builtin: bool
+}
+export struct MethodSetEntry {
+  info: *FuncInfo
+  ptr: bool
+  path: []str
+  depth: int
+}
+struct Hit {
+  kind: str           # "field", "method", "ambiguous"
+  type: str
+  path: []str
+  owner: str
+  m: *MethodEntry
+}
+struct LevelItem {
+  s: str
+  path: []str
+}
+export struct Result {
+  struct_table: map[str]*StructInfo
+  iface_table: map[str]*IfaceInfo
+  global_celled: map[str]bool
+  checker: *Checker
+}
+# method set of T (or of *T): name -> { info, ptr, path }
+export fn (r: *Result) method_set(sname: str, ptr: bool) -> map[str]*MethodSetEntry {
+  return r.checker.method_set(sname, ptr)
+}
+
+export struct Checker {
+  intrinsics: bool
+  globals: map[str]*VarEntry
+  fns: map[str]*FuncInfo
+  externs: map[str]*ast.Node
+  structs: map[str]*StructInfo
+  ifaces: map[str]*IfaceInfo
+  top: *Scope
+  global_celled: map[str]bool
+}
+
+fn (c: *Checker) err(msg: str, n: *ast.Node) {
+  ast.fail("type", bare(msg), n.line, n.col)
+}
+
+fn (c: *Checker) fn_info(st: *ast.Node, parent: *Scope) -> *FuncInfo {
+  ps := []str{}
+  pts := []str{}
+  for i, p := range st.params {
+    ps = append(ps, bare(p))
+    t := "any"
+    if i < len(st.ptypes) && st.ptypes[i] != "" { t = st.ptypes[i] }
+    pts = append(pts, t)
+  }
+  locals := map[str]bool{}
+  for _, nm := range local_names_of(st) { locals[nm] = true }
+  return &FuncInfo{node: st, name: bare(st.name), params: ps, ptypes: pts, declared: st.rtype, ret: st.rtype, locals: locals, parent: parent}
+}
+
+export fn typecheck(prog: *ast.Node, intrinsics: bool) -> *Result {
+  c := &Checker{intrinsics: intrinsics, globals: map[str]*VarEntry{}, fns: map[str]*FuncInfo{}, externs: map[str]*ast.Node{},
+    structs: map[str]*StructInfo{}, ifaces: map[str]*IfaceInfo{}, global_celled: map[str]bool{}}
+  c.top = &Scope{vars: c.globals}
+  # the error interface is predefined: Error() -> str
+  enode := ast.new_node("Interface", 0, 0)
+  enode.name = "error"
+  esig := ast.new_node("MethodSig", 0, 0)
+  esig.name = "Error"
+  esig.params = []str{}
+  esig.ptypes = []str{}
+  esig.rtype = "str"
+  c.ifaces["error"] = &IfaceInfo{node: enode, methods: map[str]*ast.Node{"Error": esig}, builtin: true}
+  for _, st := range top_stmts(prog.stmts) {
+    if st.kind == "Struct" || st.kind == "Interface" {
+      prev_line := -1
+      S0, ok := c.structs[st.name]
+      if ok {
+        prev_line = S0.node.line
+      } else {
+        I0, ok2 := c.ifaces[st.name]
+        if ok2 { prev_line = I0.node.line }
+      }
+      if prev_line >= 0 { c.err("There is already a type named " + st.name + " (line " + str(ast.loc_line(prev_line)) + ")", st) }
+      if st.kind == "Struct" {
+        fm := map[str]*ast.Node{}
+        for _, f := range st.fields { fm[f.name] = f }
+        c.structs[st.name] = &StructInfo{node: st, fields: fm, methods: map[str]*MethodEntry{}}
+      } else {
+        mm := map[str]*ast.Node{}
+        for _, m := range st.methods { mm[m.name] = m }
+        c.ifaces[st.name] = &IfaceInfo{node: st, methods: mm}
+      }
+    }
+    if st.kind == "Extern" { c.externs[st.name] = st }
+    if st.kind == "Func" { c.fns[st.name] = c.fn_info(st, nil) }
+  }
+
+  # ---- validation of written types ----
+  for _, S := range c.structs {
+    for _, f := range S.node.fields {
+      c.check_type(f.type, f)
+      if f.embedded {
+        _, ok := c.structs[strip_star(f.type)]
+        if !ok { c.err("Only structs can be embedded; \"" + f.type + "\" is not a struct", f) }
+      }
+    }
+  }
+  # embedded interfaces: the methods of one are added to the other
+  for nm, I := range c.ifaces {
+    if I.builtin { continue }
+    for _, m := range I.node.methods {
+      for _, t := range m.ptypes { c.check_type(t, m) }
+      c.check_type(m.rtype, m)
+    }
+    c.merge_iface(nm, I, I, []str{nm})
+  }
+  # a struct cannot contain itself by value: its value would be infinite
+  for nm, S := range c.structs { c.self_walk(nm, S, nm, []str{nm}) }
+  for _, info := range c.fns {
+    st := info.node
+    for _, t := range info.ptypes { c.check_type(t, st) }
+    c.check_type(st.rtype, st)
+    if st.recv == nil { continue }
+    S, ok := c.structs[st.recv.type]
+    if !ok {
+      _, isi := c.ifaces[st.recv.type]
+      if isi { c.err(st.recv.type + " is an interface; methods can only be defined on structs", st.recv) }
+      c.err("Struct \"" + st.recv.type + "\" does not exist", st.recv)
+    }
+    if ast.loc_file(S.node.line) != ast.loc_file(st.line) { c.err("Methods of " + st.recv.type + " can only be defined in the file where the struct is declared", st.recv) }
+    _, hf := S.fields[st.method]
+    if hf { c.err(st.recv.type + " already has a field named " + st.method + "; the method needs a different name", st) }
+    prev, hm := S.methods[st.method]
+    if hm { c.err(st.recv.type + " already has a method named " + st.method + " (line " + str(ast.loc_line(prev.info.node.line)) + ")", st) }
+    S.methods[st.method] = &MethodEntry{info: info, ptr: st.recv.ptr}
+  }
+
+  c.stmt(prog, c.top)
+  all := []*FuncInfo{}
+  for _, info := range c.fns { all = append(all, info) }
+  for _, info := range all {
+    if !info.is_lit {
+      info.node.ret_ty = c.ret_of(info)
+      c.check_fn(info, false, nil)
+    }
+  }
+  r := &Result{struct_table: c.structs, iface_table: c.ifaces, global_celled: c.global_celled, checker: c}
+  return r
+}
+
+fn (c: *Checker) merge_iface(nm: str, I: *IfaceInfo, J: *IfaceInfo, seen: []str) {
+  for _, e := range J.node.embeds {
+    E, ok := c.ifaces[e.name]
+    if !ok { c.err("\"" + e.name + "\" is not an interface; an interface can only embed another interface", e) }
+    if contains_str(seen, e.name) { c.err("Interface " + nm + " includes itself", e) }
+    if !E.builtin { c.merge_iface(nm, I, E, with_str(seen, e.name)) }
+    for mn, m := range E.methods {
+      _, has := I.methods[mn]
+      if !has { I.methods[mn] = m }
+    }
+  }
+}
+fn (c: *Checker) self_walk(nm: str, S: *StructInfo, t: str, path: []str) {
+  T, ok := c.structs[t]
+  if !ok {
+    i := tinfo(t)
+    if i.k == "array" { c.self_walk(nm, S, i.elem, path) }
+    return
+  }
+  for _, f := range T.node.fields {
+    ft := f.type
+    if ft == nm { c.err("Struct " + nm + " contains itself (" + strings.join(with_str(path, f.name), ".") + "). Use a pointer (*" + nm + "), a slice or an interface", S.node) }
+    if !contains_str(path, f.name) { c.self_walk(nm, S, ft, with_str(path, f.name)) }
+  }
+}
+
+fn (c: *Checker) is_named_t(t: str) -> bool {
+  _, a := c.structs[t]
+  _, b := c.ifaces[t]
+  return a || b
+}
+fn (c: *Checker) is_iface(t: str) -> bool {
+  if t == "any" { return true }
+  _, ok := c.ifaces[t]
+  return ok
+}
+fn (c: *Checker) is_struct(t: str) -> bool {
+  _, ok := c.structs[t]
+  return ok
+}
+fn (c: *Checker) check_type(t: str, at: *ast.Node) {
+  if t == "" || t == "void" || t == NEVER { return }
+  i := tinfo(t)
+  if i.k == "slice" || i.k == "ptr" || i.k == "chan" || i.k == "array" {
+    c.check_type(i.elem, at)
+    return
+  }
+  if i.k == "map" {
+    c.check_type(i.key, at)
+    c.check_type(i.val, at)
+    if !is_num_t(i.key) && i.key != "str" && i.key != "bool" && !loose(i.key) { c.err("A map key must be a number, str or bool, not " + i.key, at) }
+    return
+  }
+  if i.k == "func" {
+    for _, p := range i.params { c.check_type(p, at) }
+    for _, r := range i.results { c.check_type(r, at) }
+    return
+  }
+  if i.k == "tuple" {
+    for _, x := range i.items { c.check_type(x, at) }
+    return
+  }
+  if !PRIM_TYPES[t] && !c.is_named_t(t) { c.err("Type \"" + t + "\" does not exist. The types are int, num, str, bool, any, error, the sized integers (int8 ... uint64), []T, map[K]V, *T, chan T, fn(...), or a declared struct or interface", at) }
+}
+
+# ---- promoted fields and methods (embedded structs) ----
+# breadth-first search: the shallowest wins; two at the same depth are ambiguous
+fn (c: *Checker) lookup(sname: str, member: str) -> *Hit {
+  level := []*LevelItem{&LevelItem{s: sname, path: []str{}}}
+  seen := map[str]bool{}
+  while len(level) > 0 {
+    hits := []*Hit{}
+    next := []*LevelItem{}
+    for _, it := range level {
+      if seen[it.s] { continue }
+      seen[it.s] = true
+      S, ok := c.structs[it.s]
+      if !ok { continue }
+      fd, hf := S.fields[member]
+      if hf {
+        hits = append(hits, &Hit{kind: "field", type: fd.type, path: it.path, owner: it.s})
+      } else {
+        me, hm := S.methods[member]
+        if hm { hits = append(hits, &Hit{kind: "method", m: me, path: it.path, owner: it.s}) }
+      }
+      for _, f := range S.node.fields {
+        if f.embedded { next = append(next, &LevelItem{s: strip_star(f.type), path: with_str(it.path, f.name)}) }
+      }
+    }
+    if len(hits) == 1 { return hits[0] }
+    if len(hits) > 1 { return &Hit{kind: "ambiguous"} }
+    level = next
+  }
+  return nil
+}
+# method set of T (or of *T): name -> { info, ptr, path }
+fn (c: *Checker) method_set(sname: str, ptr: bool) -> map[str]*MethodSetEntry {
+  out := map[str]*MethodSetEntry{}
+  c.ms_walk(out, sname, []str{}, ptr, 0, map[str]bool{})
+  return out
+}
+fn (c: *Checker) ms_walk(out: map[str]*MethodSetEntry, s: str, path: []str, addressable: bool, depth: int, seen: map[str]bool) {
+  S, ok := c.structs[s]
+  if !ok || seen[s] { return }
+  for mn, mm := range S.methods {
+    e, has := out[mn]
+    if has && e.depth <= depth { continue }
+    if mm.ptr && !addressable { continue }
+    out[mn] = &MethodSetEntry{info: mm.info, ptr: mm.ptr, path: path, depth: depth}
+  }
+  for _, f := range S.node.fields {
+    if f.embedded {
+      is_ptr := strings.has_prefix(f.type, "*")
+      seen2 := map[str]bool{}
+      for k, _ := range seen { seen2[k] = true }
+      seen2[s] = true
+      c.ms_walk(out, strip_star(f.type), with_str(path, f.name), addressable || is_ptr, depth + 1, seen2)
+    }
+  }
+}
+fn sig_text(ps: []str, r: str) -> str {
+  xs := []str{}
+  for _, p := range ps { xs = append(xs, show_t(p)) }
+  s := "(" + strings.join(xs, ", ") + ")"
+  if r != "" && r != "void" { s = s + " -> " + show_t(r) }
+  return s
+}
+fn same_strs(a: []str, b: []str) -> bool {
+  if len(a) != len(b) { return false }
+  for i, x := range a {
+    if x != b[i] { return false }
+  }
+  return true
+}
+# why src does not satisfy interface dst; "" if it does
+fn (c: *Checker) missing(src: str, dst: str) -> str {
+  I, ok := c.ifaces[dst]
+  if !ok { return "" }
+  has_ms := false
+  ms := map[str]*MethodSetEntry{}
+  base := strip_star(src)
+  if c.is_struct(base) {
+    ms = c.method_set(base, strings.has_prefix(src, "*"))
+    has_ms = true
+  }
+  for m, sig := range I.methods {
+    if has_ms {
+      mm, found := ms[m]
+      if !found {
+        if !strings.has_prefix(src, "*") {
+          _, inptr := c.method_set(base, true)[m]
+          if inptr { return "method " + m + " has receiver *" + base + "; store a pointer (&value) in the interface" }
+        }
+        return "missing method " + m + sig_text(sig.ptypes, sig.rtype)
+      }
+      sp := mm.info.ptypes[1:]
+      sr := c.ret_of(mm.info)
+      if !same_strs(sp, sig.ptypes) || sr != sig.rtype {
+        return "method " + m + " of " + base + " is " + sig_text(sp, sr) + ", but " + dst + " requires " + sig_text(sig.ptypes, sig.rtype)
+      }
+    } else if c.is_iface_name(src) {
+      other, has := c.ifaces[src].methods[m]
+      if !has { return "missing method " + m }
+      if strings.join(other.ptypes, ",") != strings.join(sig.ptypes, ",") || other.rtype != sig.rtype { return "method " + m + " has a different signature" }
+    } else {
+      return show_t(src) + " has no methods"
+    }
+  }
+  return ""
+}
+fn (c: *Checker) is_iface_name(t: str) -> bool {
+  _, ok := c.ifaces[t]
+  return ok
+}
+fn (c: *Checker) nilable(t: str) -> bool {
+  if c.is_iface(t) { return true }
+  k := kind_of(t)
+  return k == "slice" || k == "map" || k == "ptr" || k == "chan" || k == "func"
+}
+fn (c: *Checker) assignable(src: str, dst: str) -> bool {
+  if dst == "any" || loose(src) || src == dst || (src == "void" && dst == "void") { return true }
+  if src == "nil" { return c.nilable(dst) }
+  if src == "lit" || src == "rlit" { return is_num_t(dst) }
+  if src == "flit" { return is_float_t(dst) }
+  if dst == "num" && (contains_str(INT_KINDS, src) || src == "float32") { return true }   # Caju accepts an integer where a num is expected
+  if c.is_iface_name(dst) && (c.is_struct(strip_star(src)) || c.is_iface_name(src) || PRIM_TYPES[src] || kind_of(src) != "name") { return c.missing(src, dst) == "" }
+  return false
+}
+# extra error-message text when a value does not satisfy an interface
+fn (c: *Checker) why(src: str, dst: str) -> str {
+  if c.is_iface_name(dst) && !loose(src) && src != "nil" { return ": " + c.missing(src, dst) }
+  return ""
+}
+fn (c: *Checker) hint(src: str, dst: str) -> str {
+  if contains_str(INT_KINDS, dst) && is_float_t(src) { return ". Use " + dst + "(...) to convert" }
+  if is_num_t(dst) && is_num_t(src) { return ". Use " + show_t(dst) + "(...) to convert" }
+  if dst == "str" && src != "str" { return ". Use str(...) to convert to a string" }
+  return c.why(src, dst)
+}
+# a value stored in an interface carries its type along; some need a "box" so the exact type is not lost
+fn (c: *Checker) conv(node: *ast.Node, src: str, dst: str) {
+  if node == nil || !c.is_iface(dst) || c.is_iface(src) || loose(src) || src == "nil" { return }
+  s := dflt(src)
+  if (contains_str(INT_KINDS, s) && s != "int") || s == "num" || s == "float32" || (strings.has_prefix(s, "*") && c.is_struct(s[1:])) { node.box_t = s }
+}
+# checks and annotates a value binding (assignment, argument, return, field, element)
+fn (c: *Checker) bind_check(node: *ast.Node, t: str, dst: str, msg: str) {
+  if !c.assignable(t, dst) { c.err(msg + " is " + show_t(dst) + ", but got " + show_t(t) + c.hint(t, dst), node) }
+  c.conv(node, t, dst)
+}
+
+# ---- scopes ----
+fn add_capture(n: *ast.Node, name: str) {
+  if !contains_str(n.captures, name) { n.captures = append(n.captures, name) }
+}
+fn add_celled(n: *ast.Node, name: str) {
+  if n.celled == nil { n.celled = map[str]bool{} }
+  n.celled[name] = true
+}
+# looks up a name: local to the function, local to an enclosing function (captured by the closure), or global
+fn (c: *Checker) resolve(sc: *Scope, name: str) -> *VarEntry {
+  s := sc
+  chain := []*Scope{}
+  while s.fn_ != nil {
+    if s.fn_.locals[name] {
+      # captured: the variable leaves the stack and moves into a shared "cell"
+      if len(chain) > 0 {
+        add_celled(s.fn_.node, name)
+        for _, ch := range chain { add_capture(ch.fn_.node, name) }
+      }
+      e, ok := s.vars[name]
+      if ok { return e }
+      return &VarEntry{type: "any", pending: true}
+    }
+    chain = append(chain, s)
+    s = s.parent
+  }
+  ge, ok := c.globals[name]
+  # closure created in top-level code: the global moves into a cell, captured when the closure is created
+  if ok && len(chain) > 0 {
+    every := true
+    for _, ch := range chain {
+      if !ch.fn_.is_lit { every = false }
+    }
+    if every {
+      c.global_celled[name] = true
+      for _, ch := range chain { add_capture(ch.fn_.node, name) }
+    }
+  }
+  if ok { return ge }
+  return nil
+}
+fn (c: *Checker) is_var_name(sc: *Scope, name: str) -> bool {
+  s := sc
+  while s.fn_ != nil {
+    if s.fn_.locals[name] { return true }
+    s = s.parent
+  }
+  _, ok := c.globals[name]
+  return ok
+}
+fn (c: *Checker) declare(sc: *Scope, name: str, t: str, node: *ast.Node) -> str {
+  if name == "_" { return t }
+  m := c.globals
+  if sc.fn_ != nil && sc.fn_.locals[name] { m = sc.vars }
+  old, ok := m[name]
+  if ok && old.node != node {
+    if !c.assignable(t, old.type) { c.err("\"" + bare(name) + "\" was already declared as " + show_t(old.type) + " on line " + str(ast.loc_line(old.node.line)) + " and cannot become " + show_t(t), node) }
+    return old.type
+  }
+  m[name] = &VarEntry{type: t, node: node, inferred: node.type == "" && node.kind == "Assign"}
+  return t
+}
+
+fn (c: *Checker) ret_of(info: *FuncInfo) -> str {
+  if info.ret != "" { return info.ret }
+  if info.inferring { return NEVER }
+  info.inferring = true
+  r := c.check_fn(info, true, nil)
+  info.inferring = false
+  if r == NEVER {
+    if info.saw_ret { info.ret = "any" } else { info.ret = "void" }
+  } else {
+    info.ret = r
+  }
+  return info.ret
+}
+fn (c: *Checker) check_fn(info: *FuncInfo, infer: bool, parent_sc: *Scope) -> str {
+  if parent_sc == nil {
+    parent_sc = info.parent_sc
+    if parent_sc == nil { parent_sc = c.top }
+  }
+  sc := &Scope{fn_: info, vars: map[str]*VarEntry{}, rets: NEVER, infer: infer, parent: parent_sc}
+  for i, p := range info.node.params { sc.vars[p] = &VarEntry{type: info.ptypes[i], node: info.node} }
+  results := []str{}
+  if info.declared != "" { results = results_of(info.declared) }
+  for i, nm := range info.node.rnames {
+    rt := ""
+    if i < len(results) { rt = results[i] }
+    sc.vars[nm] = &VarEntry{type: rt, node: info.node}
+  }
+  c.stmt(info.node.body, sc)
+  ends := always_returns(info.node.body)
+  if !infer && info.declared != "" && info.declared != "void" && !ends {
+    ln := info.node.end_line
+    if ln == 0 { ln = info.node.line }
+    ast.fail("type", bare("Function " + info.name + " must return " + info.show(info.declared) + ", but can reach the end without a return"), ln, 0)
+  }
+  if ends { return sc.rets }
+  return join_t(sc.rets, "void")
+}
+fn join_t(a: str, b: str) -> str {
+  if a == NEVER { return b }
+  if b == NEVER { return a }
+  if a == b { return a }
+  if is_num_t(a) && is_num_t(b) {
+    if is_int_t(a) && is_int_t(b) {
+      if is_untyped(a) { return dflt(b) }
+      return dflt(a)
+    }
+    return "num"
+  }
+  return "any"
+}
+fn (c: *Checker) sig_type_of(info: *FuncInfo) -> str { return func_type_text(info.ptypes, results_of(c.ret_of(info))) }
+fn (c: *Checker) fn_type(info: *FuncInfo, skip_recv: bool) -> str {
+  ps := info.ptypes
+  if skip_recv { ps = ps[1:] }
+  return func_type_text(ps, results_of(c.ret_of(info)))
+}
+
+# type of an expression that must produce exactly one value
+fn (c: *Checker) val(n: *ast.Node, sc: *Scope, want: str) -> str {
+  t := c.ty(n, sc, want)
+  if t == "void" {
+    if n.kind == "Call" { c.err(bare(n.name) + "() returns no value, so its result cannot be used", n) }
+    c.err("This expression has no value", n)
+  }
+  if strings.has_prefix(t, "(") { c.err("This call returns " + str(len(tinfo(t).items)) + " values; use a, b := ... to receive them", n) }
+  return t
+}
+fn (c: *Checker) ty(n: *ast.Node, sc: *Scope, want: str) -> str {
+  t := c.ty_of(n, sc, want)
+  if t == NEVER { n.ty = "any" } else { n.ty = t }
+  return t
+}
+# arithmetic between two numbers: the result type
+fn (c: *Checker) unify_num(a: str, b: str, n: *ast.Node, op: str) -> str {
+  if a == b { return a }
+  if is_untyped(a) && is_untyped(b) {
+    if a == "flit" || b == "flit" { return "flit" }
+    if a == "rlit" || b == "rlit" { return "rlit" }
+    return "lit"
+  }
+  if is_untyped(a) || is_untyped(b) {
+    u := b
+    t := a
+    if is_untyped(a) {
+      u = a
+      t = b
+    }
+    if u != "flit" || is_float_t(t) { return t }
+    if is_int_t(t) { return "num" }                                  # integer with 1.5: Caju does the math in num
+  }
+  if (a == "num" && contains_str(INT_KINDS, b)) || (b == "num" && contains_str(INT_KINDS, a)) { return "num" }
+  if (a == "num" && b == "float32") || (b == "num" && a == "float32") { return "num" }
+  c.err("\"" + op + "\" between " + show_t(a) + " and " + show_t(b) + ": the types differ. Convert one of them, e.g. " + show_t(a) + "(x)", n)
+  return ""
+}
+# raw digits (decimal) >= 2^64?
+fn too_big(raw: str) -> bool {
+  i := 0
+  while i < len(raw) - 1 && int(raw[i]) == 48 { i++ }
+  d := raw[i:]
+  lim := "18446744073709551616"
+  if len(d) != len(lim) { return len(d) > len(lim) }
+  return d >= lim
+}
+fn is_safe_integer(v: num) -> bool {
+  return v >= -9007199254740991.0 && v <= 9007199254740991.0 && num(int(v)) == v
+}
+fn hash_names(k: int) -> []str {
+  out := []str{}
+  for i := 0; i < k; i++ { out = append(out, "#" + str(i + 1)) }
+  return out
+}
+
+fn (c: *Checker) ty_of(n: *ast.Node, sc: *Scope, want: str) -> str {
+  k := n.kind
+  if k == "Number" {
+    if n.rune { return "rlit" }
+    # integer literals are exact 64-bit values (up to the largest uint64)
+    if n.int && n.raw != "" {
+      if too_big(n.raw) { c.err("The integer " + n.raw + " does not fit in 64 bits", n) }
+      return "lit"
+    }
+    if n.int && is_safe_integer(n.num_value) { return "lit" }
+    return "flit"
+  }
+  if k == "String" { return "str" }
+  if k == "Bool" { return "bool" }
+  if k == "Nil" { return "nil" }
+  if k == "Paren" { return c.ty(n.expr, sc, want) }
+  if k == "Var" {
+    if n.name == "_" { c.err("\"_\" can only be used to discard a value in an assignment", n) }
+    ve := c.resolve(sc, n.name)
+    if ve != nil { return ve.type }
+    # function name used as a value
+    finfo, ok := c.fns[n.name]
+    if ok && !c.is_var_name(sc, n.name) {
+      n.fn_ref = true
+      return c.sig_type_of(finfo)
+    }
+    return "any"
+  }
+  if k == "Neg" {
+    a := c.val(n.arg, sc, "")
+    if !is_num_t(a) && !loose(a) { c.err("Unary minus only works with numbers, but got " + show_t(a), n) }
+    return a
+  }
+  if k == "BitNot" {
+    a := c.val(n.arg, sc, "")
+    if !is_int_t(a) && !loose(a) { c.err("^x flips the bits of an integer, but got " + show_t(a), n) }
+    return a
+  }
+  if k == "Not" {
+    c.val(n.arg, sc, "")
+    return "bool"
+  }
+  if k == "Logical" {
+    c.val(n.left, sc, "")
+    c.val(n.right, sc, "")
+    return "bool"
+  }
+  if k == "Binary" { return c.bin_type(n, sc) }
+  if k == "Call" { return c.call_type(n, sc) }
+  if k == "StructLit" {
+    elems := []*ast.Node{}
+    for _, f := range n.fields {
+      e := ast.new_node("Elem", f.line, f.col)
+      key := ast.new_node("Var", f.line, f.col)
+      key.name = f.name
+      e.key = key
+      e.value = f.value
+      elems = append(elems, e)
+    }
+    return c.struct_lit_type(n, sc, n.type, elems)
+  }
+  if k == "CompositeLit" { return c.composite_type(n, sc, want) }
+  if k == "Field" { return c.field_type(n, sc) }
+  if k == "MethodCall" { return c.method_type(n, sc) }
+  if k == "CallValue" { return c.call_value_type(n, sc) }
+  if k == "FuncLit" { return c.func_lit_type(n, sc) }
+  if k == "Index" { return c.index_type(n, sc) }
+  if k == "SliceExpr" { return c.slice_type(n, sc) }
+  if k == "AddrOf" { return c.addr_type(n, sc) }
+  if k == "Deref" {
+    p := c.val(n.arg, sc, "")
+    if loose(p) { return "any" }
+    if kind_of(p) != "ptr" { c.err("Only pointers can be dereferenced with *, and this value is " + show_t(p), n) }
+    return tinfo(p).elem
+  }
+  if k == "Recv" {
+    ch := c.val(n.arg, sc, "")
+    if loose(ch) { return "any" }
+    if kind_of(ch) != "chan" { c.err("<- receives from a channel, and this value is " + show_t(ch), n) }
+    return tinfo(ch).elem
+  }
+  if k == "TypeAssert" {
+    o := c.val(n.obj, sc, "")
+    c.check_type(n.type, n)
+    if !c.is_iface(o) && !loose(o) { c.err("x.(T) only works on interfaces and any, and this value is " + show_t(o), n) }
+    return n.type
+  }
+  if k == "Conversion" { return c.conversion_type(n, sc, n.type, n.args) }
+  if k == "TypeOf" { c.err("x.(type) can only appear in a type switch: switch v := x.(type) { ... }", n) }
+  return "any"
+}
+fn (c: *Checker) call_value_type(n: *ast.Node, sc: *Scope) -> str {
+  f := c.val(n.fn_, sc, "")
+  if loose(f) {
+    for _, a := range n.args { c.val(a, sc, "") }
+    return "any"
+  }
+  fi := tinfo(f)
+  if fi.k != "func" { c.err("Only functions can be called, and this value is " + show_t(f), n) }
+  c.check_args(n, sc, fi.params, hash_names(len(fi.params)), "the function")
+  return results_type(fi.results)
+}
+fn (c: *Checker) func_lit_type(n: *ast.Node, sc: *Scope) -> str {
+  info := c.fn_info(n.fn_, sc)
+  info.parent_sc = sc
+  info.is_lit = true
+  c.fns[n.fn_.name] = info
+  for _, t := range info.ptypes { c.check_type(t, n) }
+  c.check_type(n.fn_.rtype, n)
+  c.ret_of(info)
+  c.check_fn(info, false, sc)
+  info.node.ret_ty = info.ret
+  return c.fn_type(info, false)
+}
+fn (c: *Checker) index_type(n: *ast.Node, sc: *Scope) -> str {
+  o := c.val(n.obj, sc, "")
+  if loose(o) {
+    c.val(n.index, sc, "")
+    return "any"
+  }
+  base := o
+  if strings.has_prefix(o, "*") && kind_of(o[1:]) == "array" { base = o[1:] }
+  oi := tinfo(base)
+  if oi.k == "map" {
+    kt := c.val(n.index, sc, "")
+    c.bind_check(n.index, kt, oi.key, "The map key")
+    return oi.val
+  }
+  i := c.val(n.index, sc, "")
+  if !is_int_t(i) && !loose(i) { c.err("The index must be an integer, not " + show_t(i), n.index) }
+  if o == "str" { return "uint8" }
+  if oi.k == "slice" || oi.k == "array" {
+    if oi.k == "array" && n.index.kind == "Number" && (n.index.num_value < 0.0 || n.index.num_value >= num(oi.n)) {
+      c.err("Index " + js_num(n.index.num_value) + " out of range for array of length " + str(oi.n), n.index)
+    }
+    return oi.elem
+  }
+  c.err("[ ] only works with slices, arrays, maps and strings, and this value is " + show_t(o), n)
+  return "any"
+}
+fn (c: *Checker) slice_type(n: *ast.Node, sc: *Scope) -> str {
+  o := c.val(n.obj, sc, "")
+  for _, x := range []*ast.Node{n.lo, n.hi} {
+    if x != nil {
+      t := c.val(x, sc, "")
+      if !is_int_t(t) && !loose(t) { c.err("Slice bounds must be integers, not " + show_t(t), x) }
+    }
+  }
+  if loose(o) || o == "str" { return o }
+  oi := tinfo(strip_star(o))
+  if oi.k == "slice" { return o }
+  if oi.k == "array" { return "[]" + oi.elem }
+  c.err("Only slices, arrays and strings can be sliced, and this value is " + show_t(o), n)
+  return "any"
+}
+fn (c: *Checker) addr_type(n: *ast.Node, sc: *Scope) -> str {
+  a := n.arg
+  if a.kind == "StructLit" || a.kind == "CompositeLit" { return "*" + c.val(a, sc, "") }
+  if !(a.kind == "Var" || a.kind == "Field" || a.kind == "Index" || a.kind == "Deref" || a.kind == "Paren") { c.err("You can only take the address (&) of a variable, a field, an element or a new struct", n) }
+  t := c.val(a, sc, "")
+  if a.kind == "Index" {
+    ot := a.obj.ty
+    if ot == "" { ot = "any" }
+    if kind_of(ot) == "map" { c.err("Cannot take the address of a value inside a map", n) }
+  }
+  if a.kind == "Var" { c.mark_addr(sc, a.name, t) }
+  return "*" + dflt(t)
+}
+fn (c: *Checker) mark_addr(sc: *Scope, name: str, t: str) {
+  # pointer to a local variable: it moves into a cell (structs and arrays are already objects)
+  s := sc
+  while s.fn_ != nil {
+    if s.fn_.locals[name] {
+      if !c.is_struct(t) && kind_of(t) != "array" { add_celled(s.fn_.node, name) }
+      if s != sc { c.resolve(sc, name) }
+      return
+    }
+    s = s.parent
+  }
+}
+fn (c: *Checker) bin_type(n: *ast.Node, sc: *Scope) -> str {
+  op := n.op
+  a := c.val(n.left, sc, "")
+  b := c.val(n.right, sc, "")
+  if op == "==" || op == "!=" {
+    ok := loose(a) || loose(b) || c.assignable(a, b) || c.assignable(b, a) || (is_num_t(a) && is_num_t(b))
+    if !ok {
+      res := "true"
+      if op == "==" { res = "false" }
+      c.err("Comparing " + show_t(a) + " with " + show_t(b) + " using \"" + op + "\" is always " + res + ", because the types differ", n)
+    }
+    for _, pr := range [][]str{[]str{a, b}, []str{b, a}} {
+      kx := kind_of(pr[0])
+      if (kx == "slice" || kx == "map" || kx == "func") && pr[1] != "nil" && !loose(pr[1]) { c.err("Slices, maps and functions can only be compared with nil", n) }
+    }
+    if is_num_t(a) && is_num_t(b) && !loose(a) && !loose(b) { n.nk = KIND_CODE[dflt(c.unify_num(a, b, n, op))] }
+    # interface compared with a concrete value: the value gets boxed so the comparison takes the type into account
+    if c.is_iface(a) && !c.is_iface(b) && !loose(b) { c.conv(n.right, b, a) }
+    if c.is_iface(b) && !c.is_iface(a) && !loose(a) { c.conv(n.left, a, b) }
+    return "bool"
+  }
+  if op == "<" || op == ">" || op == "<=" || op == ">=" {
+    if loose(a) || loose(b) { return "bool" }
+    if a == "str" && b == "str" { return "bool" }
+    if is_num_t(a) && is_num_t(b) {
+      n.nk = KIND_CODE[dflt(c.unify_num(a, b, n, op))]
+      return "bool"
+    }
+    c.err("Cannot compare " + show_t(a) + " with " + show_t(b) + " using \"" + op + "\"", n)
+  }
+  if op == "+" && (a == "str" || b == "str") { return "str" }
+  if loose(a) || loose(b) {
+    if op == "/" || op == "**" {
+      if op == "/" && (is_int_t(a) || is_int_t(b)) { return "any" }
+      return "num"
+    }
+    return "any"
+  }
+  if op == "&" || op == "|" || op == "^" || op == "&^" || op == "<<" || op == ">>" {
+    if !is_int_t(a) || !is_int_t(b) { c.err("\"" + op + "\" works on the bits of integers, but got " + show_t(a) + " and " + show_t(b), n) }
+    r := a
+    if !(op == "<<" || op == ">>") { r = c.unify_num(a, b, n, op) }
+    if !is_untyped(r) { n.ik = KIND_CODE[r] } else { n.ik = 0 }
+    return r
+  }
+  if !is_num_t(a) || !is_num_t(b) {
+    if op == "+" { c.err("\"+\" adds numbers or concatenates strings, but got " + show_t(a) + " and " + show_t(b), n) }
+    c.err("Operator \"" + op + "\" only works with numbers, but got " + show_t(a) + " and " + show_t(b), n)
+  }
+  if op == "**" {
+    if a == "lit" && b == "lit" { return "lit" }
+    return "num"
+  }
+  r := c.unify_num(a, b, n, op)
+  if is_int_t(r) {
+    n.ik = KIND_CODE[dflt(r)]               # integer math: division truncates, and the value wraps around at the limit
+  } else if r == "float32" {
+    n.fk = 10
+  }
+  return r
+}
+fn label_who(label: str) -> str {
+  low := strings.to_lower(label)
+  for _, p := range []str{"function ", "method ", "field "} {
+    if strings.has_prefix(low, p) { return label[len(p):] }
+  }
+  return label
+}
+fn is_hash_num(s: str) -> bool {
+  if len(s) < 2 || int(s[0]) != 35 { return false }
+  for i := 1; i < len(s); i++ {
+    if int(s[i]) < 48 || int(s[i]) > 57 { return false }
+  }
+  return true
+}
+fn upper_first(s: str) -> str {
+  if len(s) == 0 { return s }
+  ch := int(s[0])
+  if ch >= 97 && ch <= 122 { return strings.from_byte(ch - 32) + s[1:] }
+  return s
+}
+fn (c: *Checker) check_args(n: *ast.Node, sc: *Scope, ptypes: []str, pnames: []str, label: str) {
+  args := n.args
+  if n.args_spread { c.err("... can only be used on the last argument of append", n) }
+  if len(args) != len(ptypes) { c.err(upper_first(label) + " expects " + plural(len(ptypes), "argument") + ", but got " + str(len(args)), n) }
+  for i, a := range args {
+    t := c.val(a, sc, ptypes[i])
+    who := label_who(label)
+    pn := ""
+    if i < len(pnames) { pn = pnames[i] }
+    msg := "Parameter \"" + pn + "\" of " + who
+    if is_hash_num(pn) { msg = "Argument " + pn[1:] + " of " + who }
+    c.bind_check(a, t, ptypes[i], msg)
+  }
+}
+fn (c: *Checker) call_type(n: *ast.Node, sc: *Scope) -> str {
+  args := n.args
+  nm := n.name
+  # a variable holding a function: call the value
+  if c.is_var_name(sc, nm) {
+    n.call_kind = "value"
+    fake := ast.new_node("Var", n.line, n.col)
+    fake.name = nm
+    f := c.val(fake, sc, "")
+    if loose(f) {
+      for _, a := range args { c.val(a, sc, "") }
+      return "any"
+    }
+    fi := tinfo(f)
+    if fi.k != "func" { c.err("\"" + bare(nm) + "\" is " + show_t(f) + ", not a function", n) }
+    c.check_args(n, sc, fi.params, hash_names(len(fi.params)), "function " + bare(nm))
+    return results_type(fi.results)
+  }
+  _, is_fn := c.fns[nm]
+  if contains_str(CONVERSIONS, nm) && !is_fn {
+    n.call_kind = "conv"
+    ct, al := TYPE_ALIASES[nm]
+    if !al { ct = nm }
+    return c.conversion_type(n, sc, ct, args)
+  }
+  if c.is_named_t(nm) && !is_fn {
+    n.call_kind = "conv"
+    return c.conversion_type(n, sc, nm, args)
+  }
+  if contains_str(SPECIAL_BUILTINS, nm) && !is_fn {
+    n.call_kind = "builtin"
+    return c.builtin_type(n, sc)
+  }
+  bsig, hb := BUILTIN_SIG[nm]
+  if !hb && (c.intrinsics || n.privileged) { bsig, hb = INTRINSIC_SIG[nm] }
+  if hb {
+    n.call_kind = "builtin"
+    ps := bsig.ps
+    if len(args) != len(ps) { c.err(nm + " expects " + plural(len(ps), "argument") + ", but got " + str(len(args)), n) }
+    for i, a := range args {
+      t := c.val(a, sc, "")
+      ok_bool := i == 1 && strings.has_prefix(nm, "poke") && t == "bool"
+      if !c.assignable(t, ps[i]) && !ok_bool && !(is_num_t(t) && is_num_t(ps[i])) {
+        extra := ""
+        if len(ps) > 1 { extra = " as argument " + str(i + 1) }
+        c.err(nm + " expects " + ps[i] + extra + ", but got " + show_t(t), a)
+      }
+    }
+    return bsig.r
+  }
+  ext, is_ext := c.externs[nm]
+  if is_ext {
+    n.call_kind = "extern"
+    if len(args) != len(ext.params) { c.err(ext.symbol + " expects " + plural(len(ext.params), "argument") + ", but got " + str(len(args)), n) }
+    for i, a := range args {
+      t := c.val(a, sc, "")
+      pt := ext.ptypes[i]
+      text := pt == "str" || pt == "wstr"
+      ok := loose(t)
+      if !ok {
+        if text {
+          ok = t == "str" || is_num_t(t) || t == "nil"
+        } else if pt == "bool" {
+          ok = true
+        } else {
+          ok = is_num_t(t) || t == "bool" || t == "nil"
+        }
+      }
+      if !ok {
+        what := " (number)"
+        if text { what = " (string or pointer)" }
+        c.err("Parameter \"" + ext.params[i] + "\" of " + ext.symbol + " is " + pt + what + ", but got " + show_t(t), a)
+      }
+    }
+    return FFI_LANG[ext.ret]
+  }
+  info, has := c.fns[nm]
+  if !has {
+    n.call_kind = "unknown"
+    for _, a := range args { c.val(a, sc, "") }
+    return "any"
+  }
+  n.call_kind = "func"
+  c.check_args(n, sc, info.ptypes, info.params, "function " + info.name)
+  return c.ret_of(info)
+}
+fn (c: *Checker) conversion_type(n: *ast.Node, sc: *Scope, tt: str, args: []*ast.Node) -> str {
+  if len(args) != 1 { c.err("Conversion " + show_t(tt) + "(x) takes one value", n) }
+  c.check_type(tt, n)
+  a := args[0]
+  t := c.val(a, sc, tt)
+  n.conv_to = tt
+  if loose(t) { return tt }
+  if tt == "str" {
+    n.conv_mode = "fmt"
+    if n.name == "string" {
+      if is_int_t(t) {
+        n.conv_mode = "rune"
+      } else if t == "[]uint8" {
+        n.conv_mode = "bytes"
+      } else if t == "[]int32" {
+        n.conv_mode = "runes"
+      } else if t != "str" {
+        c.err("string(x) converts a rune, []byte or []rune; for other values use str(x)", n)
+      }
+    } else if n.kind == "Conversion" {
+      c.err("Use str(x)", n)
+    }
+    return "str"
+  }
+  if is_num_t(tt) {
+    if !is_num_t(t) { c.err(show_t(tt) + "(x) converts numbers, but got " + show_t(t), n) }
+    n.conv_mode = "num"
+    return tt
+  }
+  if tt == "[]uint8" || tt == "[]int32" {
+    if t == "str" {
+      if tt == "[]uint8" { n.conv_mode = "tobytes" } else { n.conv_mode = "torunes" }
+      return tt
+    }
+    if t == tt {
+      n.conv_mode = "same"
+      return tt
+    }
+    c.err(tt + "(x) converts a string, but got " + show_t(t), n)
+  }
+  if c.is_iface(tt) {
+    c.bind_check(a, t, tt, "The converted value")
+    n.conv_mode = "same"
+    return tt
+  }
+  if t == tt {
+    n.conv_mode = "same"
+    return tt
+  }
+  c.err("Cannot convert " + show_t(t) + " tt " + show_t(tt), n)
+  return tt
+}
+fn (c: *Checker) want_args(n: *ast.Node, k: int) {
+  if len(n.args) != k { c.err(n.name + " expects " + plural(k, "argument") + ", but got " + str(len(n.args)), n) }
+}
+fn (c: *Checker) builtin_type(n: *ast.Node, sc: *Scope) -> str {
+  nm := n.name
+  args := n.args
+  if nm == "print" {
+    for _, a := range args {
+      t := c.ty(a, sc, "")
+      if t == "void" { c.err("This value does not exist: the function returns nothing", a) }
+    }
+    return "void"
+  }
+  if nm == "len" || nm == "cap" {
+    c.want_args(n, 1)
+    t := c.val(args[0], sc, "")
+    k := kind_of(strip_star(t))
+    ok := loose(t)
+    if !ok {
+      if nm == "len" {
+        ok = t == "str" || k == "slice" || k == "array" || k == "map" || k == "chan"
+      } else {
+        ok = k == "slice" || k == "array" || k == "chan"
+      }
+    }
+    if !ok {
+      what := "slices, arrays and channels"
+      if nm == "len" { what = "strings, slices, arrays, maps and channels" }
+      c.err(nm + "(x) works with " + what + ", not with " + show_t(t), n)
+    }
+    return "int"
+  }
+  if nm == "append" {
+    if len(args) == 0 { c.err("append(s, values...) needs at least the slice", n) }
+    s := c.val(args[0], sc, "")
+    if loose(s) {
+      for _, a := range args[1:] { c.val(a, sc, "") }
+      n.append_t = "[]any"
+      return "any"
+    }
+    if kind_of(s) != "slice" { c.err("The first argument of append must be a slice, not " + show_t(s), args[0]) }
+    elem := tinfo(s).elem
+    n.append_t = s
+    if n.args_spread {
+      if len(args) != 2 { c.err("With ..., append takes only two arguments: append(a, b...)", n) }
+      t := c.val(args[1], sc, "")
+      if !(t == s || (elem == "uint8" && t == "str") || loose(t)) { c.err("append(a, b...) joins two slices of the same type, but got " + show_t(s) + " and " + show_t(t), args[1]) }
+      return s
+    }
+    for _, a := range args[1:] {
+      t := c.val(a, sc, elem)
+      c.bind_check(a, t, elem, "The element")
+    }
+    return s
+  }
+  if nm == "copy" {
+    c.want_args(n, 2)
+    d := c.val(args[0], sc, "")
+    s := c.val(args[1], sc, "")
+    if !loose(d) && kind_of(d) != "slice" { c.err("copy(dst, src) copies into a slice, not into " + show_t(d), args[0]) }
+    if !loose(d) && !loose(s) && s != d && !(s == "str" && d == "[]uint8") { c.err("copy needs slices of the same type, but got " + show_t(d) + " and " + show_t(s), n) }
+    return "int"
+  }
+  if nm == "delete" {
+    c.want_args(n, 2)
+    m := c.val(args[0], sc, "")
+    if loose(m) {
+      c.val(args[1], sc, "")
+      return "void"
+    }
+    if kind_of(m) != "map" { c.err("delete(m, key) deletes from a map, not from " + show_t(m), args[0]) }
+    kt := c.val(args[1], sc, "")
+    c.bind_check(args[1], kt, tinfo(m).key, "The key")
+    return "void"
+  }
+  if nm == "make" {
+    t := n.type_arg
+    if t == "" { c.err("make(T, ...) takes a type: make([]int, 10), make(map[str]int) or make(chan int)", n) }
+    c.check_type(t, n)
+    k := kind_of(t)
+    if !(k == "slice" || k == "map" || k == "chan") { c.err("make creates slices, maps and channels, not " + show_t(t), n) }
+    if k == "slice" && (len(args) < 1 || len(args) > 2) { c.err("Use make([]T, length) or make([]T, length, capacity)", n) }
+    if k != "slice" && len(args) > 1 { c.err("make(" + t + ") takes at most one number", n) }
+    for _, a := range args {
+      x := c.val(a, sc, "")
+      if !is_int_t(x) && !loose(x) { c.err("make sizes must be integers, not " + show_t(x), a) }
+    }
+    return t
+  }
+  if nm == "new" {
+    if n.type_arg == "" || len(args) > 0 { c.err("new(T) takes only a type, like new(int) or new(Point)", n) }
+    c.check_type(n.type_arg, n)
+    return "*" + n.type_arg
+  }
+  if nm == "panic" {
+    c.want_args(n, 1)
+    c.val(args[0], sc, "")
+    return "void"
+  }
+  if nm == "recover" {
+    c.want_args(n, 0)
+    return "any"
+  }
+  if nm == "close" {
+    c.want_args(n, 1)
+    ch := c.val(args[0], sc, "")
+    if !loose(ch) && kind_of(ch) != "chan" { c.err("close closes a channel, not " + show_t(ch), args[0]) }
+    return "void"
+  }
+  return ""
+}
+fn (c: *Checker) struct_lit_type(n: *ast.Node, sc: *Scope, sname: str, elems: []*ast.Node) -> str {
+  S, ok := c.structs[sname]
+  if !ok {
+    if c.is_iface_name(sname) { c.err(sname + " is an interface; only structs can be created with {...}", n) }
+    c.err("Struct \"" + sname + "\" does not exist", n)
+  }
+  seen := map[str]bool{}
+  keyed := len(elems) > 0
+  some_key := false
+  for _, e := range elems {
+    if e.key == nil { keyed = false } else { some_key = true }
+  }
+  if len(elems) > 0 && !keyed {
+    # Point{1, 2}: all fields, in order
+    if some_key { c.err("Either all fields are named or none are", n) }
+    if len(elems) != len(S.node.fields) { c.err(sname + "{...} without field names needs all " + str(len(S.node.fields)) + " fields, in order", n) }
+  }
+  sf := []*ast.Node{}
+  for i, e := range elems {
+    f := ""
+    if keyed { f = e.key.name } else { f = S.node.fields[i].name }
+    if keyed && e.key.kind != "Var" { c.err("In a struct literal, the key is the field name", e) }
+    fd, has := S.fields[f]
+    if !has { c.err("struct " + sname + " has no field \"" + f + "\"", e) }
+    if seen[f] { c.err("Field \"" + f + "\" appears twice", e) }
+    seen[f] = true
+    t := c.val(e.value, sc, fd.type)
+    c.bind_check(e.value, t, fd.type, "Field " + f + " of " + sname)
+    x := ast.new_node("SField", 0, 0)
+    x.name = f
+    x.value = e.value
+    sf = append(sf, x)
+  }
+  n.sfields = sf
+  n.stype = sname
+  return sname
+}
+fn (c: *Checker) composite_type(n: *ast.Node, sc: *Scope, want: str) -> str {
+  t := n.type
+  if t == "" && want != "" && !loose(want) { t = strip_star(want) }
+  if t == "" { c.err("An untyped {...} can only appear inside another literal, like []Point{{1, 2}}", n) }
+  if n.type == "" { n.type = t }
+  c.check_type(t, n)
+  if c.is_struct(t) {
+    r := c.struct_lit_type(n, sc, t, n.elems)
+    if want != "" && strings.has_prefix(want, "*") { return want }
+    return r
+  }
+  ti := tinfo(t)
+  if ti.k == "slice" || ti.k == "array" {
+    for _, e := range n.elems {
+      if e.key != nil { c.err("Indexed elements ({2: x}) are not supported; write the values in order", e) }
+      et := c.val(e.value, sc, ti.elem)
+      c.bind_check(e.value, et, ti.elem, "The element")
+    }
+    if ti.k == "array" && len(n.elems) > ti.n { c.err("The array has " + str(ti.n) + " elements, but got " + str(len(n.elems)) + " values", n) }
+    return t
+  }
+  if ti.k == "map" {
+    for _, e := range n.elems {
+      if e.key == nil { c.err("Each map element must be key: value", e) }
+      kt := c.val(e.key, sc, ti.key)
+      c.bind_check(e.key, kt, ti.key, "The key")
+      vt := c.val(e.value, sc, ti.val)
+      c.bind_check(e.value, vt, ti.val, "The value")
+    }
+    return t
+  }
+  c.err("Cannot create " + show_t(t) + " with {...}", n)
+  return t
+}
+fn (c: *Checker) field_type(n: *ast.Node, sc: *Scope) -> str {
+  # errors.New and other package names do not exist as variables
+  t := c.val(n.obj, sc, "")
+  if loose(t) { return "any" }
+  base := strip_star(t)
+  if !c.is_struct(base) {
+    if c.is_iface_name(t) { c.err(show_t(t) + " is an interface: interfaces have methods, not fields", n) }
+    c.err("Only structs have fields, and this value is " + show_t(t), n)
+  }
+  hit := c.lookup(base, n.name)
+  if hit == nil { c.err("struct " + base + " has no field \"" + n.name + "\"", n) }
+  if hit.kind == "ambiguous" { c.err("\"" + n.name + "\" is ambiguous: it exists in more than one embedded struct", n) }
+  n.field_path = hit.path
+  if hit.kind == "method" {
+    # method as a value (p.method without calling it): a function with the receiver already bound
+    n.bound_method = hit.m.info.node.name
+    n.recv_ptr = hit.m.ptr
+    return c.fn_type(hit.m.info, true)
+  }
+  return hit.type
+}
+fn (c: *Checker) method_type(n: *ast.Node, sc: *Scope) -> str {
+  if n.obj.kind == "Var" && n.obj.name == "errors" && !c.is_var_name(sc, "errors") && n.name == "New" {
+    n.call_kind = "errnew"
+    if len(n.args) != 1 { c.err("errors.New takes the error message", n) }
+    t := c.val(n.args[0], sc, "")
+    if t != "str" && !loose(t) { c.err("errors.New takes a string, not " + show_t(t), n.args[0]) }
+    return "error"
+  }
+  t := c.val(n.obj, sc, "")
+  n.target_name = ""
+  if loose(t) {
+    for _, a := range n.args { c.val(a, sc, "") }
+    return "any"
+  }
+  base := strip_star(t)
+  if c.is_struct(base) {
+    hit := c.lookup(base, n.name)
+    if hit == nil { c.err("struct " + base + " has no method \"" + n.name + "\"", n) }
+    if hit.kind == "ambiguous" { c.err("\"" + n.name + "\" is ambiguous: it exists in more than one embedded struct", n) }
+    n.field_path = hit.path
+    if hit.kind == "field" {
+      # field holding a function: load the field and call the value
+      n.field_call = true
+      fi := tinfo(hit.type)
+      if loose(hit.type) {
+        for _, a := range n.args { c.val(a, sc, "") }
+        return "any"
+      }
+      if fi.k != "func" { c.err(n.name + " is a field of type " + show_t(hit.type) + ", not a method", n) }
+      c.check_args(n, sc, fi.params, hash_names(len(fi.params)), "field " + n.name)
+      return results_type(fi.results)
+    }
+    mm := hit.m
+    c.check_args(n, sc, mm.info.ptypes[1:], mm.info.params[1:], "method " + base + "." + n.name)
+    # known type: the call goes straight to the function, without looking up the method at run time
+    n.target_name = mm.info.node.name
+    n.recv_ptr = mm.ptr
+    n.recv_is_ptr = strings.has_prefix(t, "*")
+    return c.ret_of(mm.info)
+  }
+  I, isi := c.ifaces[t]
+  if isi {
+    sig, has := I.methods[n.name]
+    if !has { c.err("Interface " + show_t(t) + " has no method \"" + n.name + "\"", n) }
+    c.check_args(n, sc, sig.ptypes, sig.params, "method " + show_t(t) + "." + n.name)
+    return sig.rtype
+  }
+  c.err("Only structs and interfaces have methods, and this value is " + show_t(t), n)
+  return "any"
+}
+
+# ---- statements ----
+# types of the values on the right-hand side of a multiple assignment
+fn (c: *Checker) rhs_types(values: []*ast.Node, count: int, sc: *Scope, node: *ast.Node, wants: []str) -> []str {
+  if len(values) == 1 && count == 2 && (values[0].kind == "Index" || values[0].kind == "TypeAssert" || values[0].kind == "Recv") {
+    # v, ok := m[k]   v, ok := x.(T)   v, ok := <-ch
+    v := values[0]
+    t := c.val(v, sc, "")
+    if v.kind == "Index" && !loose(v.obj.ty) && kind_of(v.obj.ty) != "map" { c.err("The form v, ok := a[i] only works with maps", v) }
+    v.comma_ok = true
+    return []str{t, "bool"}
+  }
+  if len(values) == 1 && count > 1 {
+    t := c.ty(values[0], sc, "")
+    if !strings.has_prefix(t, "(") {
+      if loose(t) {
+        out := []str{}
+        for i := 0; i < count; i++ { out = append(out, "any") }
+        return out
+      }
+      if node.kind == "Return" { c.err("The function returns " + str(count) + " values, but the return has only one", node) }
+      c.err(str(count) + " variables receiving a single value", node)
+    }
+    items := tinfo(t).items
+    if len(items) != count { c.err("The call returns " + str(len(items)) + " values, but there are " + str(count) + " variables", node) }
+    values[0].unpack = count
+    return items
+  }
+  if len(values) != count {
+    if node.kind == "Return" { c.err("The function returns " + plural(count, "value") + ", but the return has " + str(len(values)), node) }
+    vw := "variables"
+    if count == 1 { vw = "variable" }
+    lw := "values"
+    if len(values) == 1 { lw = "value" }
+    c.err(str(count) + " " + vw + " and " + str(len(values)) + " " + lw, node)
+  }
+  out := []str{}
+  for i, v := range values {
+    w := ""
+    if i < len(wants) { w = wants[i] }
+    out = append(out, c.val(v, sc, w))
+  }
+  return out
+}
+fn (c: *Checker) target_type(e: *ast.Node, sc: *Scope) -> str {
+  if e.kind == "Var" {
+    if e.name == "_" { return "any" }
+    v := c.resolve(sc, e.name)
+    if v != nil { e.ty = v.type } else { e.ty = "any" }
+    return e.ty
+  }
+  t := c.val(e, sc, "")
+  if e.kind == "Index" && e.obj.ty == "str" { c.err("Strings are immutable: s[i] = x is not allowed", e) }
+  return t
+}
+fn decl_own(n: *ast.Node, t: str) -> str {
+  if n.decl == "let" && is_int_t(t) && (t == "int" || is_untyped(t)) { return "num" }
+  if n.decl == "const" { return t }
+  return dflt(t)
+}
+fn discard_of(t: str) -> int {
+  if strings.has_prefix(t, "(") { return len(tinfo(t).items) }
+  if t == "void" { return 0 }
+  return 1
+}
+fn (c: *Checker) stmt(n: *ast.Node, sc: *Scope) {
+  if n == nil { return }
+  k := n.kind
+  if k == "ExprStmt" {
+    t := c.ty(n.expr, sc, "")
+    n.expr.discard = discard_of(t)
+    return
+  }
+  if k == "Block" || k == "Module" || k == "Program" {
+    for _, s := range n.stmts { c.stmt(s, sc) }
+    return
+  }
+  if k == "Func" || k == "Extern" || k == "Struct" || k == "Interface" || k == "Import" { return }
+  if k == "Return" { c.return_stmt(n, sc); return }
+  if k == "FieldAssign" {
+    fake := ast.new_node("Field", n.line, n.col)
+    fake.obj = n.obj
+    fake.name = n.name
+    want := c.field_type(fake, sc)
+    n.field_path = nil
+    if n.obj.ty != "" {
+      h := c.lookup(strip_star(n.obj.ty), n.name)
+      if h != nil { n.field_path = h.path }
+    }
+    n.fty = want
+    t := c.val(n.value, sc, want)
+    c.bind_check(n.value, t, want, "Field " + n.name)
+    return
+  }
+  if k == "Assign" { c.assign_stmt(n, sc); return }
+  if k == "VarDecl" {
+    ts := c.rhs_types(n.values, len(n.names), sc, n, []str{})
+    types := []str{}
+    for i, nm := range n.names {
+      if ts[i] == "nil" { c.err("nil has no type; specify one with let x: T = nil", n) }
+      dt := dflt(ts[i])
+      if ts[i] == NEVER { dt = "any" }
+      types = append(types, c.declare(sc, nm, dt, n))
+    }
+    n.types = types
+    for i, _ := range n.names {
+      if len(n.values) == len(n.names) { c.conv(n.values[i], ts[i], types[i]) }
+    }
+    return
+  }
+  if k == "MultiAssign" {
+    tts := []str{}
+    for _, e := range n.targets { tts = append(tts, c.target_type(e, sc)) }
+    ts := c.rhs_types(n.values, len(n.targets), sc, n, tts)
+    for i, t := range ts {
+      if n.targets[i].kind == "Var" && n.targets[i].name == "_" { continue }
+      v := n
+      if len(n.values) == len(n.targets) { v = n.values[i] }
+      if !c.assignable(t, tts[i]) {
+        who := "The target"
+        if len(n.targets) > 1 { who = "Target " + str(i + 1) }
+        c.err(who + " is " + show_t(tts[i]) + ", but got " + show_t(t) + c.hint(t, tts[i]), v)
+      }
+      if v != n { c.conv(v, t, tts[i]) }
+    }
+    return
+  }
+  if k == "OpAssign" {
+    tt := c.target_type(n.target, sc)
+    fake := ast.new_node("Binary", n.line, n.col)
+    fake.op = n.op
+    fake.left = n.target
+    fake.right = n.value
+    r := c.bin_type(fake, sc)
+    n.ik = fake.ik
+    n.fk = fake.fk
+    if !c.assignable(r, tt) { c.err("\"" + n.op + "=\" would produce " + show_t(r) + ", which does not fit in " + show_t(tt), n) }
+    return
+  }
+  if k == "If" {
+    if n.init != nil { c.stmt(n.init, sc) }
+    c.val(n.cond, sc, "")
+    c.stmt(n.then, sc)
+    if n.otherwise != nil { c.stmt(n.otherwise, sc) }
+    return
+  }
+  if k == "While" {
+    c.val(n.cond, sc, "")
+    c.stmt(n.body, sc)
+    return
+  }
+  if k == "ForC" {
+    if n.init != nil { c.stmt(n.init, sc) }
+    if n.cond != nil { c.val(n.cond, sc, "") }
+    if n.post != nil { c.stmt(n.post, sc) }
+    c.stmt(n.body, sc)
+    return
+  }
+  if k == "ForTo" {
+    a := c.val(n.from_, sc, "")
+    b := c.val(n.to_, sc, "")
+    if !is_num_t(a) && !loose(a) { c.err("The for loop counts with numbers, but got " + show_t(a), n.from_) }
+    if !is_num_t(b) && !loose(b) { c.err("The for loop counts with numbers, but got " + show_t(b), n.to_) }
+    vt := "num"
+    if is_float_t(a) || is_float_t(b) {
+      vt = "num"
+    } else if is_int_t(a) && is_int_t(b) {
+      if is_untyped(a) { vt = dflt(b) } else { vt = dflt(a) }
+    }
+    n.ty = c.declare(sc, n.name, vt, n)
+    c.stmt(n.body, sc)
+    return
+  }
+  if k == "Range" { c.range_stmt(n, sc); return }
+  if k == "Switch" {
+    if n.init != nil { c.stmt(n.init, sc) }
+    tag := "bool"
+    if n.tag != nil { tag = c.val(n.tag, sc, "") }
+    for _, cs := range n.cases {
+      for _, e := range cs.exprs {
+        t := c.val(e, sc, "")
+        if n.tag == nil {
+          if t != "bool" && !loose(t) { c.err("In a switch without a value, each case is a condition (bool), not " + show_t(t), e) }
+          continue
+        }
+        if !(loose(t) || loose(tag) || c.assignable(t, tag) || c.assignable(tag, t) || (is_num_t(t) && is_num_t(tag))) {
+          c.err("The case compares " + show_t(t) + " with the switch value, which is " + show_t(tag), e)
+        }
+        if c.is_iface(tag) && !c.is_iface(t) { c.conv(e, t, tag) }
+      }
+      for _, s := range cs.stmts { c.stmt(s, sc) }
+    }
+    return
+  }
+  if k == "TypeSwitch" {
+    if n.init != nil { c.stmt(n.init, sc) }
+    subj := c.val(n.subject, sc, "")
+    if !c.is_iface(subj) && !loose(subj) { c.err("A type switch needs an interface or any, and this value is " + show_t(subj), n.subject) }
+    for _, cs := range n.cases {
+      for _, t := range cs.types {
+        if t != "nil" { c.check_type(t, cs) }
+      }
+      if n.bind != "" {
+        bt := subj
+        if len(cs.types) == 1 && cs.types[0] != "nil" { bt = cs.types[0] }
+        # each case has its own variable, with the case's type
+        cs.bind_type = bt
+        src := c.globals
+        if sc.fn_ != nil { src = sc.vars }
+        saved, had := src[n.bind]
+        dst := c.globals
+        if sc.fn_ != nil && sc.fn_.locals[n.bind] { dst = sc.vars }
+        dst[n.bind] = &VarEntry{type: bt, node: cs}
+        for _, x := range cs.stmts { c.stmt(x, sc) }
+        if had {
+          dst2 := c.globals
+          if sc.fn_ != nil && sc.fn_.locals[n.bind] { dst2 = sc.vars }
+          dst2[n.bind] = saved
+        }
+      } else {
+        for _, x := range cs.stmts { c.stmt(x, sc) }
+      }
+    }
+    return
+  }
+  if k == "Select" { c.select_stmt(n, sc); return }
+  if k == "Send" {
+    ch := c.val(n.ch, sc, "")
+    if loose(ch) {
+      c.val(n.value, sc, "")
+      return
+    }
+    if kind_of(ch) != "chan" { c.err("You can only send on a channel, and this value is " + show_t(ch), n.ch) }
+    et := tinfo(ch).elem
+    vt := c.val(n.value, sc, et)
+    c.bind_check(n.value, vt, et, "The sent value")
+    return
+  }
+  if k == "Defer" || k == "Go" {
+    t := c.ty(n.call, sc, "")
+    n.call.discard = discard_of(t)
+    if n.call.kind == "Call" && n.call.call_kind == "conv" {
+      w := "go"
+      if k == "Defer" { w = "defer" }
+      c.err(w + " must be followed by a function call, not a conversion", n)
+    }
+    return
+  }
+}
+fn (c: *Checker) return_stmt(n: *ast.Node, sc: *Scope) {
+  info := sc.fn_
+  if info.declared != "" {
+    results := results_of(info.declared)
+    r := info.declared
+    if len(n.values) == 0 {
+      if len(results) > 0 && len(info.node.rnames) == 0 {
+        what := "the values"
+        if len(results) == 1 { what = "a value" }
+        c.err("Function " + info.name + " must return " + info.show(r) + "; write return followed by " + what, n)
+      }
+      n.named = len(info.node.rnames) > 0
+      return
+    }
+    if len(results) == 0 { c.err("Function " + info.name + " returns no value, so the return cannot return anything", n) }
+    ts := c.rhs_types(n.values, len(results), sc, n, results)
+    if len(n.values) == 1 && len(results) == 1 {
+      c.bind_check(n.values[0], ts[0], results[0], "Function " + info.name + " must return " + info.show(r) + ", but this return gives " + show_t(ts[0]) + ". The result")
+    } else {
+      for i, t := range ts {
+        var_node := n
+        if i < len(n.values) { var_node = n.values[i] }
+        if !c.assignable(t, results[i]) { c.err("Result " + str(i + 1) + " of " + info.name + " is " + show_t(results[i]) + ", but got " + show_t(t) + c.hint(t, results[i]), var_node) }
+        if i < len(n.values) { c.conv(n.values[i], t, results[i]) }
+      }
+    }
+    n.nres = len(results)
+  } else {
+    ts := []str{}
+    for _, v := range n.values { ts = append(ts, c.val(v, sc, "")) }
+    t := "void"
+    if len(ts) == 1 {
+      t = dflt(ts[0])
+    } else if len(ts) > 1 {
+      ds := []str{}
+      for _, x := range ts { ds = append(ds, dflt(x)) }
+      t = "(" + strings.join(ds, ", ") + ")"
+    }
+    sc.rets = join_t(sc.rets, t)
+    sc.fn_.saw_ret = true
+    n.nres = len(ts)
+  }
+}
+fn (c: *Checker) assign_stmt(n: *ast.Node, sc: *Scope) {
+  c.check_type(n.type, n)
+  if n.value == nil {
+    n.ty = c.declare(sc, n.name, n.type, n)
+    return
+  }
+  t := c.val(n.value, sc, n.type)
+  if n.decl != "" {
+    if n.type != "" { c.bind_check(n.value, t, n.type, "\"" + bare(n.name) + "\"") }
+    if n.decl == "const" && !(is_num_t(t) || t == "str" || t == "bool") { c.err("A constant can only hold numbers, strings or bool; for other values, use let", n) }
+    if t == "nil" && n.type == "" { c.err("nil has no type; specify one: let x: *Point = nil", n.value) }
+    dt := n.type
+    if dt == "" {
+      if t == NEVER { dt = "any" } else { dt = decl_own(n, t) }
+    }
+    n.ty = c.declare(sc, n.name, dt, n)
+  } else {
+    e := c.resolve(sc, n.name)
+    if e != nil && e.node != nil && e.node.decl == "const" && e.node.kind == "Assign" { return }      # the compiler reports it
+    if e != nil {
+      where := ""
+      if e.node != nil { where = " (line " + str(ast.loc_line(e.node.line)) + ")" }
+      c.bind_check(n.value, t, e.type, "\"" + bare(n.name) + "\"" + where)
+      n.ty = e.type
+    }
+  }
+}
+fn (c: *Checker) range_stmt(n: *ast.Node, sc: *Scope) {
+  s := c.val(n.subject, sc, "")
+  kt := "any"
+  vt := "any"
+  vt_null := false
+  rk := "any"
+  if !loose(s) {
+    base := s
+    if strings.has_prefix(s, "*") && kind_of(s[1:]) == "array" { base = s[1:] }
+    si := tinfo(base)
+    if s == "str" {
+      kt = "int"
+      vt = "int32"
+      rk = "str"
+    } else if is_int_t(s) {
+      kt = dflt(s)
+      vt_null = true
+      rk = "int"
+    } else if si.k == "slice" || si.k == "array" {
+      kt = "int"
+      vt = si.elem
+      rk = si.k
+    } else if si.k == "map" {
+      kt = si.key
+      vt = si.val
+      rk = "map"
+    } else if si.k == "chan" {
+      kt = si.elem
+      vt_null = true
+      rk = "chan"
+    } else {
+      c.err("range iterates over strings, slices, arrays, maps, channels and integers, not " + show_t(s), n.subject)
+    }
+  }
+  n.rk = rk
+  if len(n.vars) == 2 && vt_null {
+    what := "a channel"
+    if rk == "int" { what = "an integer" }
+    c.err("range over " + what + " yields only one value", n)
+  }
+  types := []str{kt, vt}
+  for i, v := range n.vars {
+    if n.define {
+      if v.name != "_" { v.ty = c.declare(sc, v.name, types[i], n) }
+    } else {
+      tt := c.target_type(v, sc)
+      if !c.assignable(types[i], tt) { c.err("range yields " + show_t(types[i]) + ", which does not fit in " + show_t(tt), v) }
+    }
+  }
+  c.stmt(n.body, sc)
+}
+fn (c: *Checker) select_stmt(n: *ast.Node, sc: *Scope) {
+  for _, cs := range n.cases {
+    if cs.kind == "send" {
+      ch := c.val(cs.ch, sc, "")
+      if !loose(ch) {
+        if kind_of(ch) != "chan" { c.err("You can only send on a channel, and this value is " + show_t(ch), cs.ch) }
+        vt := c.val(cs.value, sc, tinfo(ch).elem)
+        c.bind_check(cs.value, vt, tinfo(ch).elem, "The sent value")
+      } else {
+        c.val(cs.value, sc, "")
+      }
+    } else if cs.kind == "recv" {
+      ch := c.val(cs.ch, sc, "")
+      et := "any"
+      if !loose(ch) {
+        if kind_of(ch) == "chan" {
+          et = tinfo(ch).elem
+        } else {
+          c.err("You can only receive from a channel, and this value is " + show_t(ch), cs.ch)
+        }
+      }
+      ts := []str{et, "bool"}
+      if len(cs.vars) > 2 { c.err("A case receives at most two values: v, ok", cs) }
+      for i, v := range cs.vars {
+        if cs.define {
+          if v.name != "_" { v.ty = c.declare(sc, v.name, ts[i], cs) }
+        } else {
+          tt := c.target_type(v, sc)
+          if !c.assignable(ts[i], tt) { c.err("The channel yields " + show_t(ts[i]) + ", which does not fit in " + show_t(tt), v) }
+        }
+      }
+    }
+    for _, s := range cs.stmts { c.stmt(s, sc) }
+  }
+}

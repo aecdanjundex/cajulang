@@ -1,0 +1,11 @@
+import "std/os"
+import "std/strings"
+p, err := os.run([]str{"echo", "hello", "from", "a child"}, nil, false)
+print(err, p.code, strings.trim_space(p.output))
+p2, _ := os.run([]str{"sh", "-c", "echo out; echo err 1>&2; exit 7"}, nil, true)
+print(p2.code, strings.split(strings.trim_space(p2.output), "\n"))
+p3, _ := os.run([]str{"sh", "-c", "kill -9 $$"}, nil, false)
+print(p3.code, p3.signal)
+_, err4 := os.run([]str{"/no/such/program"}, nil, false)
+print(err4)
+print(strings.has_suffix(os.executable(), "") && len(os.executable()) > 0)

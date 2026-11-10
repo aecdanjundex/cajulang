@@ -1,0 +1,2 @@
+fn descend(n: int) -> int { return descend(n + 1) }
+print(descend(0))

@@ -1,0 +1,21 @@
+# floating-point loops
+w := 600
+h := 400
+inside := 0
+for y := 0; y < h; y++ {
+  for x := 0; x < w; x++ {
+    cr := 3.0 * num(x) / num(w) - 2.0
+    ci := 2.0 * num(y) / num(h) - 1.0
+    zr := 0.0
+    zi := 0.0
+    k := 0
+    while k < 100 && zr * zr + zi * zi < 4.0 {
+      t := zr * zr - zi * zi + cr
+      zi = 2.0 * zr * zi + ci
+      zr = t
+      k++
+    }
+    if k == 100 { inside++ }
+  }
+}
+print(inside)

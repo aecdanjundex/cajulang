@@ -1,0 +1,39 @@
+# Mandelbrot set drawn with text.
+# Lots of floating-point math inside three nested loops.
+# The constants DX and DY are computed by the optimizer before running.
+const WIDTH = 64
+const HEIGHT = 24
+const MAX_ITER = 60
+const X_MIN = -2.2
+const X_MAX = 1.0
+const Y_MIN = -1.2
+const Y_MAX = 1.2
+const DX = (X_MAX - X_MIN) / WIDTH
+const DY = (Y_MAX - Y_MIN) / HEIGHT
+
+for row = 0 to HEIGHT - 1 {
+  let text = ""
+  let ci = Y_MIN + row * DY
+  for col = 0 to WIDTH - 1 {
+    let cr = X_MIN + col * DX
+    let zr = 0
+    let zi = 0
+    let n = 0
+    while n < MAX_ITER and zr * zr + zi * zi <= 4 {
+      let tmp = zr * zr - zi * zi + cr
+      zi = 2 * zr * zi + ci
+      zr = tmp
+      n = n + 1
+    }
+    if n == MAX_ITER {
+      text = text + "#"
+    } else if n > 12 {
+      text = text + "+"
+    } else if n > 6 {
+      text = text + "."
+    } else {
+      text = text + " "
+    }
+  }
+  print(text)
+}

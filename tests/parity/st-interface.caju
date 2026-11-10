@@ -1,0 +1,13 @@
+interface F { area() -> num
+ name() -> str }
+struct Q { l: num }
+struct R { a: num, b: num }
+fn (q: Q) area() -> num { return q.l ** 2 }
+fn (q: Q) name() -> str { return "square" }
+fn (r: R) area() -> num { return r.a * r.b }
+fn (r: R) name() -> str { return "rect" }
+fn total(a: F, b: F) -> num { return a.area() + b.area() }
+let f: F = Q{l: 3}
+print(f.name(), f.area(), total(f, R{a: 2, b: 5}))
+f = R{a: 1, b: 1}
+print(f.name(), f)

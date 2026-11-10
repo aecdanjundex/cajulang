@@ -1,0 +1,15 @@
+export const PI = 3.141592653589793
+
+dllexport fn circle_area(radius: f64) -> f64 { return PI * radius ** 2 }
+
+dllexport fn circle_perimeter(radius: f64) -> f64 { return 2 * PI * radius }
+
+dllexport fn hypotenuse(a: f64, b: f64) -> f64 { return (a ** 2 + b ** 2) ** 0.5 }
+
+# wstr returns UTF-16, the native text of Windows
+dllexport fn polygon_name(sides: i32) -> wstr {
+  if sides == 3 { return "triangle" }
+  if sides == 4 { return "quadrilateral" }
+  if sides == 5 { return "pentagon" }
+  return "polygon with " + sides + " sides"
+}

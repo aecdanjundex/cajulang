@@ -1,0 +1,1 @@
+Compile error in hidden-error.caju, line 12: The variable "bonus" does not exist. Use let bonus = ... or bonus := ... the first time.

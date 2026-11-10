@@ -1,6 +1,4 @@
 build/
-runtime/rs/build/
-runtime/rs/target/
-*.pdb
-*.lib
-*.exp
+/caju-bin
+*.tmp
+/hello-server

@@ -1,0 +1,24 @@
+# Collatz conjecture: if n is even, divide by 2; if it is odd, do 3n + 1.
+# Every number seems to reach 1. Which number up to 5 000 takes the most steps?
+# Lots of while, % and comparisons: great for the superinstructions.
+const LIMIT = 5_000
+let best = 1
+let most = 0
+
+for start = 1 to LIMIT {
+  let n = start
+  let steps = 0
+  while n != 1 {
+    if n % 2 == 0 {
+      n = n / 2
+    } else {
+      n = 3 * n + 1
+    }
+    steps = steps + 1
+  }
+  if steps > most {
+    most = steps
+    best = start
+  }
+}
+print("Up to", LIMIT, "the record holder is", best, "with", most, "steps")

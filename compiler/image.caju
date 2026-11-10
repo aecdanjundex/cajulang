@@ -1,0 +1,185 @@
+# Executable writers: ELF x86-64 (Linux) and PE32+ (Windows x64). Port of resolveFixups,
+# writeELF and writePE of bootstrap/native.js.
+
+import "std/bytes"
+import "x64"
+
+# the 64-bit words of the data section that hold the absolute address of a symbol
+export struct Relocs {
+  off: []int
+  sym: []str
+}
+
+fn sym_addr(a: *x64.X64, sym: str, text_va: int, data_va: int) -> int {
+  s, ok := a.syms[sym]
+  if !ok { panic("undefined symbol: " + sym) }
+  if (s & 1) == x64.SEC_TEXT { return text_va + (s >> 1) }
+  return data_va + (s >> 1)
+}
+
+# resolves jumps and references once the section addresses are known; returns the entry point
+fn resolve_fixups(a: *x64.X64, text_va: int, data_va: int, data: *bytes.Buffer, relocs: *Relocs) -> int {
+  for i := 0; i < len(a.fix_at); i++ {
+    v := sym_addr(a, a.fix_sym[i], text_va, data_va) - (text_va + a.fix_end[i])
+    a.b.set_u32(a.fix_at[i], v)
+  }
+  for i := 0; i < len(relocs.off); i++ {
+    data.set_u64(relocs.off[i], sym_addr(a, relocs.sym[i], text_va, data_va))
+  }
+  return sym_addr(a, "start", text_va, data_va)
+}
+
+fn align_up(n: int, a: int) -> int { return (n + a - 1) / a * a }
+
+# ---- ELF x86-64 (Linux): two segments, code and data ----
+export fn write_elf(a: *x64.X64, data: *bytes.Buffer, relocs: *Relocs) -> *bytes.Buffer {
+  base := 0x400000
+  text_off := 0x1000
+  text_len := a.b.len()
+  text_va := base + text_off
+  data_off := align_up(text_off + text_len, 0x1000)
+  data_va := base + data_off
+  entry := resolve_fixups(a, text_va, data_va, data, relocs)
+  dlen := data.len()
+  if dlen < 8 { dlen = 8 }
+  size := data_off + dlen
+  out := bytes.new_buffer(size)
+  out.zeros(text_off)
+  hdr := []int{0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0}
+  for i, x := range hdr { out.set(i, x) }
+  out.set_u16(16, 2)
+  out.set_u16(18, 0x3E)
+  out.set_u32(20, 1)
+  out.set_u64(24, entry)
+  out.set_u64(32, 64)
+  out.set_u64(40, 0)
+  out.set_u16(52, 64)
+  out.set_u16(54, 56)
+  out.set_u16(56, 2)
+  out.set_u16(58, 64)
+  phdr(out, 64, 5, text_off, text_va, text_len)
+  phdr(out, 64 + 56, 6, data_off, data_va, dlen)
+  out.append(a.b)
+  out.zeros(data_off - text_off - text_len)
+  out.append(data)
+  out.zeros(size - out.len())
+  return out
+}
+fn phdr(out: *bytes.Buffer, at: int, flags: int, off: int, va: int, sz: int) {
+  out.set_u32(at, 1)
+  out.set_u32(at + 4, flags)
+  out.set_u64(at + 8, off)
+  out.set_u64(at + 16, va)
+  out.set_u64(at + 24, va)
+  out.set_u64(at + 32, sz)
+  out.set_u64(at + 40, sz)
+  out.set_u64(at + 48, 0x1000)
+}
+
+# ---- PE32+ (Windows x64): .text and .data, with the import table inside .data ----
+fn put_align(data: *bytes.Buffer, align: int) -> int {
+  while data.len() % align != 0 { data.byte(0) }
+  return data.len()
+}
+fn put_u64(data: *bytes.Buffer, v: int) {
+  data.u32(v)
+  data.u32(0)
+}
+
+# dlls: the DLL names in order; imports[dll]: its symbols in order
+export fn write_pe(a: *x64.X64, data: *bytes.Buffer, dlls: []str, imports: map[str][]str, relocs: *Relocs) -> *bytes.Buffer {
+  IMAGE_BASE := 0x140000000
+  SA := 0x1000
+  FA := 0x200
+  HDR := 0x400
+  text_rva := SA
+  text_size := a.b.len()
+  data_rva := align_up(text_rva + text_size, SA)
+  # import table: descriptors, name lists (ILT), addresses (IAT) and names
+  desc_at := put_align(data, 4)
+  data.zeros(20 * (len(dlls) + 1))
+  for di, dll := range dlls {
+    syms := imports[dll]
+    name_rva := data_rva + put_align(data, 2)
+    data.write(dll)
+    data.byte(0)
+    hints := []int{}
+    for _, s := range syms {
+      hints = append(hints, data_rva + put_align(data, 2))
+      data.byte(0)
+      data.byte(0)
+      data.write(s)
+      data.byte(0)
+    }
+    ilt := put_align(data, 8)
+    for _, h := range hints { put_u64(data, h) }
+    put_u64(data, 0)
+    iat := put_align(data, 8)
+    for _, h := range hints { put_u64(data, h) }
+    put_u64(data, 0)
+    for i, s := range syms { a.bind_data("iat." + dll + "." + s, iat + 8 * i) }
+    d := desc_at + 20 * di
+    data.set_u32(d, data_rva + ilt)
+    data.set_u32(d + 4, 0)
+    data.set_u32(d + 8, 0)
+    data.set_u32(d + 12, name_rva)
+    data.set_u32(d + 16, data_rva + iat)
+  }
+  if data.len() == 0 { data.byte(0) }
+  entry := resolve_fixups(a, IMAGE_BASE + text_rva, IMAGE_BASE + data_rva, data, relocs) - IMAGE_BASE
+  text_raw := align_up(text_size, FA)
+  data_raw := align_up(data.len(), FA)
+  size_of_image := align_up(data_rva + data.len(), SA)
+  out := bytes.new_buffer(HDR + text_raw + data_raw)
+  out.zeros(HDR)
+  out.set(0, 0x4D)
+  out.set(1, 0x5A)
+  out.set_u32(0x3C, 0x80)
+  pe := 0x80
+  out.set(pe, 0x50)
+  out.set(pe + 1, 0x45)
+  out.set_u16(pe + 4, 0x8664)
+  out.set_u16(pe + 6, 2)
+  out.set_u16(pe + 20, 240)
+  out.set_u16(pe + 22, 0x0023)
+  o := pe + 24
+  out.set_u16(o, 0x20B)
+  out.set(o + 2, 14)
+  out.set_u32(o + 4, text_raw)
+  out.set_u32(o + 8, data_raw)
+  out.set_u32(o + 16, entry)
+  out.set_u32(o + 20, text_rva)
+  out.set_u64(o + 24, IMAGE_BASE)
+  out.set_u32(o + 32, SA)
+  out.set_u32(o + 36, FA)
+  out.set_u16(o + 40, 6)
+  out.set_u16(o + 48, 6)
+  out.set_u32(o + 56, size_of_image)
+  out.set_u32(o + 60, HDR)
+  out.set_u16(o + 68, 3)
+  out.set_u16(o + 70, 0x8100)
+  out.set_u64(o + 72, 64 << 20)
+  out.set_u64(o + 80, 0x10000)
+  out.set_u64(o + 88, 0x100000)
+  out.set_u64(o + 96, 0x1000)
+  out.set_u32(o + 108, 16)
+  if len(dlls) > 0 {
+    out.set_u32(o + 112 + 8, data_rva + desc_at)
+    out.set_u32(o + 112 + 12, 20 * (len(dlls) + 1))
+  }
+  section(out, o + 240, ".text", text_size, text_rva, text_raw, HDR, 0x60000020)
+  section(out, o + 280, ".data", data.len(), data_rva, data_raw, HDR + text_raw, 0xC0000040)
+  out.append(a.b)
+  out.zeros(text_raw - text_size)
+  out.append(data)
+  out.zeros(data_raw - data.len())
+  return out
+}
+fn section(out: *bytes.Buffer, at: int, name: str, vsize: int, rva: int, raw: int, raw_at: int, ch: int) {
+  for i := 0; i < len(name); i++ { out.set(at + i, int(name[i])) }
+  out.set_u32(at + 8, vsize)
+  out.set_u32(at + 12, rva)
+  out.set_u32(at + 16, raw)
+  out.set_u32(at + 20, raw_at)
+  out.set_u32(at + 36, ch)
+}

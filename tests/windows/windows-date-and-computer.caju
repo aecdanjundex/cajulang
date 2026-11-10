@@ -1,0 +1,25 @@
+# Functions that fill memory: the program reserves a buffer
+# with alloc and reads the result with peek and readwstr.
+extern "kernel32.dll" fn GetLocalTime(time: ptr)
+extern "kernel32.dll" fn GetComputerNameW(name: ptr, size: ptr) -> bool
+extern "kernel32.dll" fn GetTickCount() -> u32
+
+# SYSTEMTIME: 8 16-bit numbers (year, month, day of week, day, hour, minute, second, ms)
+let st = alloc(16)
+GetLocalTime(st)
+print("Today is", peek16(st + 6) + "/" + peek16(st + 2) + "/" + peek16(st), "and it is", peek16(st + 8) + "h" + peek16(st + 10))
+free(st)
+
+let name = alloc(64)
+let size = alloc(4)
+poke32(size, 32)           # room for 32 characters
+if GetComputerNameW(name, size) {
+  print("This computer is called", readwstr(name))
+}
+free(name)
+free(size)
+
+let t0 = GetTickCount()
+let x = 0
+for i = 1 to 300_000 { x = x + i % 7 }
+print("A loop of 300 thousand iterations took", GetTickCount() - t0, "ms")

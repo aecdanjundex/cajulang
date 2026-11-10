@@ -1,0 +1,15 @@
+# Compare the Original and Optimized views in the Bytecode tab
+const SECONDS_PER_DAY = 60 * 60 * 24   # computed before running
+const DEBUG = false
+
+if DEBUG {
+  print("this never runs and disappears from the bytecode")
+}
+
+let days = 0
+let total = 0
+while days < 7 {
+  days = days + 1          # becomes a single UPDATE_K instruction
+  total = total + SECONDS_PER_DAY
+}
+print("Seconds in a week:", total)
