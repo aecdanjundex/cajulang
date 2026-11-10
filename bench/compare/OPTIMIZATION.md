@@ -28,6 +28,7 @@ garantida pela suíte de testes e pela autocompilação.
 | 2 | operando direito simples direto no RCX; condições viram cmp + jcc; &&, \|\|, ! viram desvios | 94 ms | 370 ms | 725 ms | 251 ms | 209 ms | 484 ms | 1.65 s |
 | 3 | a[i] com índice simples e leitura num só mov; atribuição única sem temporários; constantes como imediato; teste de int sem normalizar para 0/1 | 92 ms | 317 ms | 576 ms | 237 ms | 212 ms | 390 ms | 1.60 s |
 | 4 | expressões num avaliadas em registradores XMM; comparações de num viram ucomisd + jcc | 91 ms | 320 ms | 532 ms | 127 ms | 214 ms | 397 ms | 1.60 s |
+| 5 | profundidade de chamadas no registrador R15 em vez de uma global em memória | 65 ms | 304 ms | 516 ms | 128 ms | 213 ms | 394 ms | 1.53 s |
 
 Para comparar: Go faz 39 / 24 / 172 / 38 / 32 / 141 / 599 ms e Rust 21 / 24 / 66 / 38 / 11 / 135 / 359 ms
 (`RESULTS.md`).
@@ -35,29 +36,29 @@ Para comparar: Go faz 39 / 24 / 172 / 38 / 32 / 141 / 599 ms e Rust 21 / 24 / 66
 ## Todas as medições
 
 <!-- python3 bench/compare/rounds/table.py -->
-| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | total gain |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 1.22× |
-| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 1.35× |
-| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 1.38× |
-| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 1.54× |
-| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 1.42× |
-| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 1.36× |
-| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 1.24× |
-| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 1.37× |
-| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 1.39× |
-| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 1.83× |
-| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 1.91× |
-| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 1.92× |
-| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 1.18× |
-| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 1.19× |
-| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 1.20× |
-| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 1.56× |
-| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 1.58× |
-| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 1.60× |
-| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 1.44× |
-| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 1.38× |
-| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.25× |
+| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | total gain |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 1.40× |
+| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 1.77× |
+| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 1.94× |
+| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 1.50× |
+| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 1.52× |
+| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 1.43× |
+| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 1.29× |
+| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 1.40× |
+| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 1.43× |
+| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 1.77× |
+| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 1.87× |
+| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 1.91× |
+| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 1.18× |
+| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 1.17× |
+| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 1.20× |
+| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 1.59× |
+| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 1.60× |
+| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 1.62× |
+| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 1.45× |
+| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 1.50× |
+| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.31× |
 
 A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
 código dela não foi salvo à parte).
@@ -149,3 +150,22 @@ O núcleo do mandelbrot (`rounds/float_kernel.caju`) caiu de 110 para 69 instru�
 (`rounds/round3-float.asm` → `rounds/round4-float.asm`).
 **Resultado:** mandelbrot −46% (237 → 127 ms), nbody −8% (o resto é a chamada a `math.sqrt`
 a cada par de corpos, que ainda é uma chamada de função comum).
+
+## Rodada 5: profundidade de chamadas num registrador
+
+**Hipótese:** a linguagem limita a recursão a 10.000 chamadas aninhadas (a mensagem de erro cita
+o número, então o limite fica). Cada chamada fazia `mov rax,[rt_depth]; cmp rax,10000; jl;
+inc [rt_depth]; call; dec [rt_depth]`: duas leituras-e-escritas no mesmo endereço de memória
+por chamada, uma dependência em série de uma chamada para a outra.
+**Mudança:**
+- A profundidade vive no R15, que o gerador nunca usava e que as convenções do Linux e do
+  Windows preservam (código externo não o apaga): `cmp r15,10000; jl ok; ...; inc r15; call;
+  dec r15`. O programa zera o R15 na entrada.
+- O registro de `defer` guarda o R15, e a volta de um `recover` o restaura.
+- O runtime (`rt/panic.caju`) lê e muda a profundidade com duas funções internas novas,
+  `__depth()` e `__set_depth(x)`.
+- Como o compilador em JavaScript não conhece essas funções, ele passou a usar uma cópia
+  congelada do runtime (`bootstrap/rt/`); ele só compila o primeiro estágio.
+
+`rounds/round4-fib.asm` → `rounds/round5-fib.asm`.
+**Resultado:** fib −29% (91 → 65 ms); maps −4%, sieve −5% (todos chamam funções).

@@ -1,0 +1,70 @@
+# Native runtime, phase 5: defer, panic and recover.
+#
+# A function with defer keeps a 6-word record in its frame:
+# [0] previous record, [8] list of defers, [16] the function's RBP, [24] address of its "recovered"
+# landing, [32] call depth, [40] unused. rt_dtop points to the most recent record.
+# Each defer is a node [next, closure, n, arguments...] (the closure is called with the already
+# evaluated arguments, by __calldefer).
+#
+# A panic (or a runtime error) runs the defers of the records, newest to oldest.
+# If one of them calls recover(), the program jumps to that function's "recovered" landing, which
+# returns the results (zeros, or the named ones) after running the remaining defers.
+
+let rt_depth: int = 0          # open function calls (for "Too much recursion")
+let rt_dtop: int = 0
+let rt_pactive: bool = false
+let rt_precovered: bool = false
+let rt_pval: int = 0           # the panic value (an any)
+let rt_pwhere: str = ""
+let rt_pmsg: str = ""
+let rt_pdepth: int = -1        # depth at which recover works (that of the deferred function)
+
+# defers of a function that is returning normally
+fn rt_run_defers(rec: int) {
+  while __load64(rec + 8) != 0 {
+    nd := __load64(rec + 8)
+    __store64(rec + 8, __load64(nd))
+    __calldefer(nd)
+  }
+  rt_dtop = __load64(rec)
+}
+fn rt_panic(where: str, v: int, msg: str) {
+  rt_pactive = true
+  rt_precovered = false
+  rt_pval = v
+  rt_pwhere = where
+  rt_pmsg = msg
+  while rt_dtop != 0 {
+    rec := rt_dtop
+    while __load64(rec + 8) != 0 {
+      nd := __load64(rec + 8)
+      __store64(rec + 8, __load64(nd))
+      rt_depth = __load64(rec + 32)
+      rt_pdepth = rt_depth
+      __calldefer(nd)
+      if rt_precovered {
+        rt_pactive = false
+        rt_precovered = false
+        rt_pdepth = -1
+        __jump(__load64(rec + 16), __load64(rec + 24))
+      }
+    }
+    rt_dtop = __load64(rec)
+  }
+  rt_fatal(rt_pwhere, rt_pmsg)
+}
+# runtime error: becomes a panic whose value is an error with the message
+fn rt_fail(where: str, msg: str) {
+  rt_panic(where, rt_box(__strp(msg), rt_d_err), msg)
+}
+fn rt_panic_val(where: str, v: int) {
+  rt_panic(where, v, "panic: " + rt_val_str(v, rt_d_any))
+}
+fn rt_recover() -> int {
+  if rt_pactive and not rt_precovered and rt_depth == rt_pdepth {
+    rt_precovered = true
+    return rt_pval
+  }
+  return 0
+}
+fn rt_defer_nil(where: str) { rt_fail(where, "defer and go need a function") }

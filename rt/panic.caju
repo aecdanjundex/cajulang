@@ -2,7 +2,7 @@
 #
 # A function with defer keeps a 6-word record in its frame:
 # [0] previous record, [8] list of defers, [16] the function's RBP, [24] address of its "recovered"
-# landing, [32] call depth, [40] unused. rt_dtop points to the most recent record.
+# landing, [32] call depth (R15, see depth_in in compiler/native.caju), [40] unused. rt_dtop points to the most recent record.
 # Each defer is a node [next, closure, n, arguments...] (the closure is called with the already
 # evaluated arguments, by __calldefer).
 #
@@ -10,7 +10,6 @@
 # If one of them calls recover(), the program jumps to that function's "recovered" landing, which
 # returns the results (zeros, or the named ones) after running the remaining defers.
 
-let rt_depth: int = 0          # open function calls (for "Too much recursion")
 let rt_dtop: int = 0
 let rt_pactive: bool = false
 let rt_precovered: bool = false
@@ -39,8 +38,8 @@ fn rt_panic(where: str, v: int, msg: str) {
     while __load64(rec + 8) != 0 {
       nd := __load64(rec + 8)
       __store64(rec + 8, __load64(nd))
-      rt_depth = __load64(rec + 32)
-      rt_pdepth = rt_depth
+      __set_depth(__load64(rec + 32))
+      rt_pdepth = __depth()
       __calldefer(nd)
       if rt_precovered {
         rt_pactive = false
@@ -61,7 +60,7 @@ fn rt_panic_val(where: str, v: int) {
   rt_panic(where, v, "panic: " + rt_val_str(v, rt_d_any))
 }
 fn rt_recover() -> int {
-  if rt_pactive and not rt_precovered and rt_depth == rt_pdepth {
+  if rt_pactive and not rt_precovered and __depth() == rt_pdepth {
     rt_precovered = true
     return rt_pval
   }

@@ -1,0 +1,282 @@
+# Native runtime, phase 4: size-class allocator and garbage collector (mark and sweep).
+#
+# Memory is a large address range reserved at startup (the arena), split into 64 KB pages.
+# A small page holds objects of a single size (16 to 16384 bytes); its first 2 KB hold the
+# mark, "in use" and "no pointers" bits of each object. A larger object takes whole
+# consecutive pages.
+#
+# The collector is conservative: any word on the stack, in the globals or inside an object that
+# points into an object in use keeps that object alive. Strings are marked "no pointers" and
+# are not scanned. Objects never move.
+
+let rt_arena: int = 0          # start of the arena (64 KB aligned)
+let rt_npages: int = 0         # pages in the arena
+let rt_top_page: int = 0       # pages used at least once
+let rt_pg_kind: int = 0        # byte per page: 0 free, 1 small, 2 start of large, 3 rest of large
+let rt_pg_info: int = 0        # word per page: object size, number of pages, or the starting page
+let rt_pg_flag: int = 0        # byte per large page: 1 marked, 2 no pointers, 4 in use
+let rt_free_pages: int = 0     # free pages below rt_top_page
+let rt_cls_size: int = 0       # size of each class
+let rt_cls_of: int = 0         # byte per (size + 15) / 16 → class
+let rt_free: int = 0           # free list of each class
+let rt_ncls: int = 0
+let rt_alloced: int = 0        # bytes requested since the last collection
+let rt_gc_limit: int = 0       # the next collection happens when rt_alloced exceeds this
+let rt_live: int = 0
+let rt_gcs: int = 0            # collections done
+let rt_mstack: int = 0         # mark stack
+let rt_mstack_cap: int = 0
+let rt_mstack_n: int = 0
+let rt_stack_top: int = 0      # top of the program stack (saved at entry)
+let rt_data_lo: int = 0        # globals of the program and the runtime
+let rt_data_hi: int = 0
+
+fn rt_gc_init() {
+  size := 1 << 34
+  rt_npages = size >> 16
+  base := rt_os_reserve(size + 65536)
+  rt_arena = (base + 65535) & -65536
+  rt_pg_kind = rt_os_mem(rt_npages)
+  rt_pg_flag = rt_os_mem(rt_npages)
+  rt_pg_info = rt_os_mem(8 * rt_npages)
+  rt_ncls = 0
+  rt_cls_size = rt_os_mem(8 * 64)
+  rt_free = rt_os_mem(8 * 64)
+  rt_cls_of = rt_os_mem(1040)
+  # 16 to 256 in steps of 16; then about 4 sizes per power of 2
+  s := 16
+  while s <= 16384 {
+    __store64(rt_cls_size + 8 * rt_ncls, s)
+    rt_ncls++
+    if s < 256 {
+      s += 16
+    } else {
+      step := 64
+      while step * 8 <= s { step *= 2 }
+      s += step
+    }
+  }
+  c := 0
+  i := 1
+  while i <= 1024 {
+    while __load64(rt_cls_size + 8 * c) < 16 * i { c++ }
+    __store8(rt_cls_of + i, c)
+    i++
+  }
+  rt_mstack_cap = 1 << 16
+  rt_mstack = rt_os_mem(8 * rt_mstack_cap)
+  rt_gc_limit = 8 << 20
+}
+
+# a new page (or a previously freed one) for small objects or for the start of a large one
+fn rt_take_pages(n: int) -> int {
+  if rt_free_pages >= n {
+    run := 0
+    i := 0
+    while i < rt_top_page {
+      if __load8(rt_pg_kind + i) == 0 {
+        run++
+        if run == n {
+          rt_free_pages -= n
+          return i - n + 1
+        }
+      } else {
+        run = 0
+      }
+      i++
+    }
+  }
+  if rt_top_page + n > rt_npages { rt_fail("runtime", "Out of memory") }
+  p := rt_top_page
+  rt_top_page += n
+  rt_os_commit(rt_arena + (p << 16), n << 16)
+  return p
+}
+fn rt_zero_mem(p: int, n: int) {
+  e := p + n
+  while p < e {
+    __store64(p, 0)
+    p += 8
+  }
+}
+fn rt_bit_set(base: int, i: int) {
+  w := base + 8 * (i >> 6)
+  __store64(w, __load64(w) | (1 << (i & 63)))
+}
+fn rt_bit_clr(base: int, i: int) {
+  w := base + 8 * (i >> 6)
+  __store64(w, __load64(w) &^ (1 << (i & 63)))
+}
+fn rt_bit(base: int, i: int) -> bool { return (__load64(base + 8 * (i >> 6)) >> (i & 63)) & 1 != 0 }
+
+# new page for class c: every slot goes to the free list
+fn rt_refill(c: int) {
+  size := __load64(rt_cls_size + 8 * c)
+  pi := rt_take_pages(1)
+  __store8(rt_pg_kind + pi, 1)
+  __store64(rt_pg_info + 8 * pi, size)
+  page := rt_arena + (pi << 16)
+  rt_zero_mem(page, 2048)
+  n := (65536 - 2048) / size
+  head := __load64(rt_free + 8 * c)
+  i := n - 1
+  while i >= 0 {
+    o := page + 2048 + size * i
+    __store64(o, head)
+    head = o
+    i--
+  }
+  __store64(rt_free + 8 * c, head)
+}
+fn rt_alloc_x(n: int, noscan: bool) -> int {
+  if n < 16 { n = 16 }
+  rt_alloced += n
+  if rt_alloced > rt_gc_limit { rt_gc() }
+  if n <= 16384 {
+    c := __load8(rt_cls_of + ((n + 15) >> 4))
+    p := __load64(rt_free + 8 * c)
+    if p == 0 {
+      rt_refill(c)
+      p = __load64(rt_free + 8 * c)
+    }
+    __store64(rt_free + 8 * c, __load64(p))
+    size := __load64(rt_cls_size + 8 * c)
+    page := p & -65536
+    slot := (p - page - 2048) / size
+    rt_bit_set(page + 512, slot)
+    if noscan { rt_bit_set(page + 1024, slot) } else { rt_bit_clr(page + 1024, slot) }
+    rt_zero_mem(p, size)
+    return p
+  }
+  np := (n + 65535) >> 16
+  pi := rt_take_pages(np)
+  __store8(rt_pg_kind + pi, 2)
+  __store64(rt_pg_info + 8 * pi, np)
+  f := 4
+  if noscan { f = 6 }
+  __store8(rt_pg_flag + pi, f)
+  i := 1
+  while i < np {
+    __store8(rt_pg_kind + pi + i, 3)
+    __store64(rt_pg_info + 8 * (pi + i), pi)
+    i++
+  }
+  p := rt_arena + (pi << 16)
+  rt_zero_mem(p, np << 16)
+  return p
+}
+fn rt_alloc(n: int) -> int { return rt_alloc_x(n, false) }
+fn rt_alloc_ns(n: int) -> int { return rt_alloc_x(n, true) }
+
+# ---------------------------------------------------------------- collection
+fn rt_mpush(o: int) {
+  if rt_mstack_n == rt_mstack_cap {
+    nc := 2 * rt_mstack_cap
+    ns := rt_os_mem(8 * nc)
+    rt_copy(ns, rt_mstack, 8 * rt_mstack_n)
+    rt_mstack = ns
+    rt_mstack_cap = nc
+  }
+  __store64(rt_mstack + 8 * rt_mstack_n, o)
+  rt_mstack_n++
+}
+# does w seem to point into an object in use and not yet marked? then mark it
+fn rt_mark_word(w: int) {
+  if w < rt_arena { return }
+  pi := (w - rt_arena) >> 16
+  if pi >= rt_top_page { return }
+  k := __load8(rt_pg_kind + pi)
+  if k == 1 {
+    page := rt_arena + (pi << 16)
+    off := w - page - 2048
+    if off < 0 { return }
+    size := __load64(rt_pg_info + 8 * pi)
+    slot := off / size
+    if slot >= (65536 - 2048) / size { return }
+    if not rt_bit(page + 512, slot) or rt_bit(page, slot) { return }
+    rt_bit_set(page, slot)
+    rt_live += size
+    if not rt_bit(page + 1024, slot) { rt_mpush(page + 2048 + size * slot) }
+    return
+  }
+  if k == 3 { pi = __load64(rt_pg_info + 8 * pi) } else if k != 2 { return }
+  f := __load8(rt_pg_flag + pi)
+  if f & 4 == 0 or f & 1 != 0 { return }
+  __store8(rt_pg_flag + pi, f | 1)
+  rt_live += __load64(rt_pg_info + 8 * pi) << 16
+  if f & 2 == 0 { rt_mpush(rt_arena + (pi << 16)) }
+}
+fn rt_scan(lo: int, hi: int) {
+  while lo + 8 <= hi {
+    rt_mark_word(__load64(lo))
+    lo += 8
+  }
+}
+fn rt_gc() {
+  rt_gcs++
+  rt_live = 0
+  # roots: the stack (from here to the top) and the globals
+  rt_scan(__sp(), rt_stack_top)
+  rt_scan(rt_data_lo, rt_data_hi)
+  while rt_mstack_n > 0 {
+    rt_mstack_n--
+    o := __load64(rt_mstack + 8 * rt_mstack_n)
+    pi := (o - rt_arena) >> 16
+    if __load8(rt_pg_kind + pi) == 1 {
+      rt_scan(o, o + __load64(rt_pg_info + 8 * pi))
+    } else {
+      rt_scan(o, o + (__load64(rt_pg_info + 8 * pi) << 16))
+    }
+  }
+  rt_sweep()
+  rt_alloced = 0
+  rt_gc_limit = rt_live
+  if rt_gc_limit < 8 << 20 { rt_gc_limit = 8 << 20 }
+}
+fn rt_sweep() {
+  pi := 0
+  while pi < rt_top_page {
+    k := __load8(rt_pg_kind + pi)
+    if k == 1 {
+      page := rt_arena + (pi << 16)
+      size := __load64(rt_pg_info + 8 * pi)
+      c := __load8(rt_cls_of + ((size + 15) >> 4))
+      n := (65536 - 2048) / size
+      w := 0
+      while w * 64 < n {
+        used := __load64(page + 512 + 8 * w)
+        dead := used &^ __load64(page + 8 * w)
+        if dead != 0 {
+          b := 0
+          while b < 64 {
+            if (dead >> b) & 1 != 0 {
+              o := page + 2048 + size * (64 * w + b)
+              __store64(o, __load64(rt_free + 8 * c))
+              __store64(rt_free + 8 * c, o)
+            }
+            b++
+          }
+          __store64(page + 512 + 8 * w, used &^ dead)
+        }
+        __store64(page + 8 * w, 0)
+        w++
+      }
+    } else if k == 2 {
+      f := __load8(rt_pg_flag + pi)
+      np := __load64(rt_pg_info + 8 * pi)
+      if f & 1 == 0 {
+        i := 0
+        while i < np {
+          __store8(rt_pg_kind + pi + i, 0)
+          i++
+        }
+        __store8(rt_pg_flag + pi, 0)
+        rt_free_pages += np
+      } else {
+        __store8(rt_pg_flag + pi, f &^ 1)
+      }
+      pi += np - 1
+    }
+    pi++
+  }
+}

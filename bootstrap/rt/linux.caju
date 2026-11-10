@@ -1,0 +1,32 @@
+# Native runtime: the Linux part (direct system calls)
+let rt_argp: int = 0
+
+fn rt_os_init() {
+  p := __argp()
+  argc := __load64(p)
+  e := p + 8 * (argc + 2)
+  while __load64(e) != 0 {
+    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=") { rt_skip_sleep = true }
+    e += 8
+  }
+}
+fn rt_os_write(p: int, n: int) {
+  while n > 0 {
+    w := __syscall(1, 1, p, n, 0, 0, 0)
+    if w <= 0 { return }
+    p += w
+    n -= w
+  }
+}
+fn rt_os_mem(n: int) -> int { return __syscall(9, 0, n, 3, 34, -1, 0) }
+# reserves addresses without using memory (MAP_NORESERVE); a page only exists once it is touched
+fn rt_os_reserve(n: int) -> int { return __syscall(9, 0, n, 3, 16418, -1, 0) }
+fn rt_os_commit(p: int, n: int) { }
+fn rt_os_exit(c: int) { __syscall(231, c, 0, 0, 0, 0, 0) }
+fn rt_os_sleep(s: num) {
+  ts := rt_tmp + 64
+  sec := int(s)
+  __store64(ts, sec)
+  __store64(ts + 8, int((s - num(sec)) * 1000000000.0))
+  __syscall(35, ts, 0, 0, 0, 0, 0)
+}

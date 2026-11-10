@@ -30,6 +30,7 @@ const R8 = 8
 const R9 = 9
 const R10 = 10
 const R11 = 11
+const R15 = 15
 
 const CC_B = 2
 const CC_AE = 3
@@ -677,6 +678,7 @@ export fn compile_native(files: []*ast.SourceFile, rt_sources: []str, target: st
   # ---- program entry point ----
   A.bind("start")
   if target == "linux" { A.store_sym("g.argp", RSP) }
+  A.rr32(0x31, R15, R15)                         # call depth = 0
   A.byte4(0x48, 0x83, 0xE4, 0xF0)
   A.call("r.top")
   # the collector needs the stack top and the globals range
@@ -1005,8 +1007,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     A.store(RCX, 16, RBP)
     A.lea(RAX, f.landing)
     A.store(RCX, 24, RAX)
-    A.load_sym(RAX, "r.g.rt_depth")
-    A.store(RCX, 32, RAX)
+    A.store(RCX, 32, R15)                          # the call depth
     A.store_sym("r.g.rt_dtop", RCX)
   }
   # named results start at the zero value
@@ -1040,8 +1041,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     land_at = A.pos() - 4
     f.rec_addr(RCX)
     A.store_sym("r.g.rt_dtop", RCX)
-    A.load(RAX, RCX, 32)
-    A.store_sym("r.g.rt_depth", RAX)
+    A.load(R15, RCX, 32)
     if !f.has_rn {
       for i, t := range results_of_t(ret_t) {
         f.push_desc(t, fnode)
@@ -2124,30 +2124,25 @@ fn (f: *Fn) call_value(n: *ast.Node, mode: int, v: *Var, ft: str, args: []*ast.N
   f.depth_out()
   A.add_imm(RSP, 8 * (len(args) + 1))
 }
+# the depth of nested calls of the program (not of the runtime) lives in R15 (callee-saved in
+# both the System V and the Windows conventions, and never used otherwise by the generated code)
 fn (f: *Fn) depth_in(n: *ast.Node) {
   if f.u.is_runtime { return }
   A := f.a
-  A.load_sym(RAX, "r.g.rt_depth")
-  A.cmp_imm(RAX, 10000)
+  A.cmp_imm(R15, 10000)
   ok := A.label()
   A.jcc(CC_L, ok)
   f.fail_here(n, "Too much recursion: more than 10,000 nested function calls")
   A.bind(ok)
-  A.rip(0xFF, 0, "r.g.rt_depth")
+  A.byte3(0x49, 0xFF, 0xC7)                       # inc r15
 }
-fn (f: *Fn) depth_out() { if !f.u.is_runtime { f.a.rip(0xFF, 1, "r.g.rt_depth") } }
+fn (f: *Fn) depth_out() { if !f.u.is_runtime { f.a.byte3(0x49, 0xFF, 0xCF) } }   # dec r15
 fn (f: *Fn) call_user(nm: str, n: *ast.Node, nargs: int) {
   A := f.a
   if !f.u.is_runtime {
-    A.load_sym(RAX, "r.g.rt_depth")
-    A.cmp_imm(RAX, 10000)
-    ok := A.label()
-    A.jcc(CC_L, ok)
-    f.fail_here(n, "Too much recursion: more than 10,000 nested function calls")
-    A.bind(ok)
-    A.rip(0xFF, 0, "r.g.rt_depth")
+    f.depth_in(n)
     A.call(f.u.p + ".f." + nm)
-    A.rip(0xFF, 1, "r.g.rt_depth")
+    f.depth_out()
   } else {
     A.call(f.u.p + ".f." + nm)
   }
@@ -2573,6 +2568,13 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     return
   case "__sp":
     A.mov(RAX, RSP)
+    return
+  case "__depth":
+    A.mov(RAX, R15)
+    return
+  case "__set_depth":
+    f.expr(args[0])
+    A.mov(R15, RAX)
     return
   case "__sqrt":
     f.expr(args[0])

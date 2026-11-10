@@ -284,6 +284,7 @@ let INTRINSIC_SIG = map[str]*Sig{
   "__strp": &Sig{[]str{"str"}, "int"}, "__pstr": &Sig{[]str{"int"}, "str"}, "__fbits": &Sig{[]str{"num"}, "int"}, "__bitsf": &Sig{[]str{"int"}, "num"},
   "__sqrt": &Sig{[]str{"num"}, "num"}, "__fmod": &Sig{[]str{"num", "num"}, "num"},
   "__newstr": &Sig{[]str{"int"}, "int"}, "__flush": &Sig{[]str{}, "void"}, "__exit": &Sig{[]str{"int"}, "void"},
+  "__depth": &Sig{[]str{}, "int"}, "__set_depth": &Sig{[]str{"int"}, "void"},
 }
 
 # does the statement always end in a return (or a panic, or an endless loop without break)?

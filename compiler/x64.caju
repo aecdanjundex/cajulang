@@ -17,6 +17,10 @@ export const R8 = 8
 export const R9 = 9
 export const R10 = 10
 export const R11 = 11
+export const R12 = 12
+export const R13 = 13
+export const R14 = 14
+export const R15 = 15
 
 # condition codes
 export const CC_O = 0
