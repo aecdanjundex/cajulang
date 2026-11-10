@@ -1304,6 +1304,138 @@ fn (f: *Fn) expr_to(n: *ast.Node, t: str) {
   f.expr(n)
   f.g.coerce(n.ty, t, n)
 }
+# ---- inlining ----
+# A call to a function whose body is `return E`, where E calls no function of the program, is
+# replaced by a copy of E with the parameters replaced by the arguments (math.sqrt(x) becomes
+# __sqrt(x)), so the rest of the generator (registers, fexpr) sees through it.
+
+# E of an inlinable function, or nil
+fn (f: *Fn) inline_expr(fd: *ast.Node) -> *ast.Node {
+  if fd == nil || fd.body == nil || len(fd.body.stmts) != 1 || len(fd.rnames) > 0 || fd.recv != nil { return nil }
+  if fd.celled != nil && len(fd.celled) > 0 { return nil }
+  r := fd.body.stmts[0]
+  if r.kind != "Return" || len(r.values) != 1 || len(results_of_t(ret_of(fd))) != 1 { return nil }
+  e := r.values[0]
+  if optional(e.unpack) { return nil }
+  size := []int{0}
+  if !f.inline_ok(e, size) { return nil }
+  return e
+}
+
+fn (f: *Fn) inline_ok(n: *ast.Node, size: []int) -> bool {
+  if n == nil { return true }
+  size[0] = size[0] + 1
+  if size[0] > 40 { return false }
+  switch n.kind {
+  case "Number", "Bool", "Nil", "String": return true
+  case "Var":
+    if n.fn_ref { return false }
+    return true                                  # (globals hidden by the caller's locals: try_inline)
+  case "Paren": return f.inline_ok(n.expr, size)
+  case "Neg", "Not", "BitNot": return f.inline_ok(n.arg, size)
+  case "Binary", "Logical": return f.inline_ok(n.left, size) && f.inline_ok(n.right, size)
+  case "Index": return f.inline_ok(n.obj, size) && f.inline_ok(n.index, size)
+  case "Field": return n.bound_method == "" && f.inline_ok(n.obj, size)
+  case "Call":
+    if n.call_kind != "builtin" && n.call_kind != "conv" { return false }
+    # these depend on the call they are in (recover works only in the deferred function itself)
+    if n.name == "recover" || n.name == "__depth" || n.name == "__set_depth" || n.name == "__sp" || n.name == "__jump" || n.name == "__calldefer" { return false }
+    for _, a := range n.args { if !f.inline_ok(a, size) { return false } }
+    return true
+  }
+  return false
+}
+
+fn count_var(n: *ast.Node, name: str) -> int {
+  if n == nil { return 0 }
+  c := 0
+  if n.kind == "Var" && n.name == name { c = 1 }
+  c += count_var(n.expr, name) + count_var(n.arg, name) + count_var(n.left, name) + count_var(n.right, name)
+  c += count_var(n.obj, name) + count_var(n.index, name)
+  for _, a := range n.args { c += count_var(a, name) }
+  return c
+}
+
+# a copy of e with the parameters replaced
+fn subst(e: *ast.Node, params: map[str]*ast.Node) -> *ast.Node {
+  if e == nil { return nil }
+  if e.kind == "Var" {
+    if a, ok := params[e.name]; ok { return a }
+    return e
+  }
+  c := clone_node(e)
+  c.expr = subst(e.expr, params)
+  c.arg = subst(e.arg, params)
+  c.left = subst(e.left, params)
+  c.right = subst(e.right, params)
+  c.obj = subst(e.obj, params)
+  c.index = subst(e.index, params)
+  if len(e.args) > 0 {
+    c.args = []*ast.Node{}
+    for _, a := range e.args { c.args = append(c.args, subst(a, params)) }
+  }
+  return c
+}
+
+# the inlined expression for a call, or nil if it cannot be inlined here
+fn (f: *Fn) try_inline(n: *ast.Node) -> *ast.Node {
+  if n.kind != "Call" || n.call_kind != "func" || n.args_spread { return nil }
+  fd, ok := f.u.funcs[n.name]
+  if !ok { return nil }
+  e := f.inline_expr(fd)
+  if e == nil || len(n.args) != len(fd.params) { return nil }
+  pt := param_types(fd)
+  m := map[str]*ast.Node{}
+  complex := 0
+  for i, a := range n.args {
+    if a.ty != pt[i] || !f.no_calls(a) { return nil }
+    uses := count_var(e, fd.params[i])
+    if !is_simple(a) {
+      if uses != 1 { return nil }
+      complex++
+    }
+    m[fd.params[i]] = a
+  }
+  if complex > 1 { return nil }                  # keeps the order in which arguments may fail
+  # names of the callee's globals must not be taken by locals of the caller
+  for _, name := range free_vars(e, fd.params) {
+    if _, l := f.locals[name]; l { return nil }
+    if _, c := f.caps[name]; c { return nil }
+  }
+  r := subst(e, m)
+  # the call's value has the function's result type, as with a return
+  if r.ty != ret_of(fd) {
+    w := ast.new_node("Paren", r.line, r.col)
+    w.expr = r
+    w.ty = ret_of(fd)
+    return w
+  }
+  return r
+}
+
+fn free_vars(n: *ast.Node, params: []str) -> []str {
+  out := []str{}
+  collect_vars(n, params, out)
+  return free_out
+}
+let free_out: []str = nil
+fn collect_vars(n: *ast.Node, params: []str, out: []str) {
+  if n == nil { return }
+  if out != nil { free_out = out }
+  if n.kind == "Var" {
+    is_param := false
+    for _, p := range params { if p == n.name { is_param = true } }
+    if !is_param { free_out = append(free_out, n.name) }
+  }
+  collect_vars(n.expr, params, nil)
+  collect_vars(n.arg, params, nil)
+  collect_vars(n.left, params, nil)
+  collect_vars(n.right, params, nil)
+  collect_vars(n.obj, params, nil)
+  collect_vars(n.index, params, nil)
+  for _, a := range n.args { collect_vars(a, params, nil) }
+}
+
 # ---- floating point in XMM registers ----
 # fexpr(n, d) leaves a num expression in xmm d, using xmm d..15 and RAX/RCX/RDX. A call clobbers
 # every XMM register, so a subexpression with calls can only be evaluated when nothing is held in
@@ -1353,8 +1485,16 @@ fn (f: *Fn) fpure(n: *ast.Node) -> bool {
   case "Paren": return f.fpure(n.expr)
   case "Neg": return n.ty == "num" && n.arg.ty == "num" && f.fpure(n.arg)
   case "Index", "Field": return f.no_calls(n)
+  case "Call":
+    if is_sqrt(n) { return f.fpure(n.args[0]) }
+    inl := f.try_inline(n)
+    if inl != nil && inl.ty == "num" { return f.fpure(inl) }
   }
   return false
+}
+
+fn is_sqrt(n: *ast.Node) -> bool {
+  return n.kind == "Call" && n.call_kind == "builtin" && n.name == "__sqrt" && len(n.args) == 1 && n.args[0].ty == "num"
 }
 
 fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
@@ -1367,6 +1507,18 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
   if n.kind == "Paren" && n.ty == "num" && n.expr.ty == "num" {
     f.fexpr(n.expr, d)
     return
+  }
+  if is_sqrt(n) {
+    f.fexpr(n.args[0], d)
+    A.sse(0x51, d, d)                             # sqrtsd
+    return
+  }
+  if n.kind == "Call" && n.ty == "num" {
+    inl := f.try_inline(n)
+    if inl != nil && inl.ty == "num" {
+      f.fexpr(inl, d)
+      return
+    }
   }
   if n.kind == "Neg" && n.ty == "num" && n.arg.ty == "num" {
     f.fexpr(n.arg, d)
@@ -2028,29 +2180,22 @@ fn (f: *Fn) index(n: *ast.Node) {
   if f.g.kind_of_t(ot) == "map" {
     ti := types.tinfo(ot)
     vt := ti.val
-    mh := f.hidden()
     f.expr(n.obj)
-    f.store_slot(mh)
     A.push(RAX)
     f.expr_to(n.index, ti.key)
     A.push(RAX)
-    f.rt("rt_map_find", 2)
-    miss := A.label()
-    done := A.label()
-    A.alu("test", RAX, RAX)
-    A.jcc(CC_S, miss)
-    A.mov(RCX, RAX)
-    f.load_slot(mh)
-    A.push(RAX)
-    A.push(RCX)
-    f.rt("rt_map_val", 2)
-    A.mov_imm(RCX, 1)
-    A.jmp(done)
-    A.bind(miss)
-    f.push_desc(vt, n)
-    f.rt("rt_zero", 1)
-    A.mov_imm(RCX, 0)
-    A.bind(done)
+    f.rt("rt_map_get", 2)                         # the value, or 0 when the key is missing
+    A.load_sym(RCX, "r.g.rt_map_ok")
+    # texts and structs have a zero value that is not 0
+    if f.g.cls(vt, n) == "s" || f.g.is_value_type(vt) {
+      done := A.label()
+      A.alu("test", RCX, RCX)
+      A.jcc(CC_NE, done)
+      f.push_desc(vt, n)
+      f.rt("rt_zero", 1)
+      A.mov_imm(RCX, 0)
+      A.bind(done)
+    }
     return                                        # rax = value, rcx = found
   }
   f.elem_check(n, false)
@@ -2220,6 +2365,11 @@ fn (f: *Fn) call(n: *ast.Node) {
     return
   }
   if n.call_kind == "func" {
+    inl := f.try_inline(n)
+    if inl != nil {
+      f.expr(inl)
+      return
+    }
     fd, ok := f.u.funcs[nm]
     if !ok { nfail("function " + types.bare(nm) + " not found", n) }
     pt := param_types(fd)

@@ -37,9 +37,8 @@ node bootstrap/caju.js build -o build/caju compiler/main.caju   # estágio 1 (co
 build/caju build -o build/caju2 compiler/main.caju              # estágio 2 (compilado por ele mesmo)
 build/caju2 build -o build/caju3 compiler/main.caju && cmp build/caju2 build/caju3   # tem que ser igual
 
-build/caju test                   # todos os *_test.caju (≈25 s); -v mostra cada teste
+build/caju test                   # todos os *_test.caju (≈30 s); -v mostra cada teste
 build/caju test lib/fs_test.caju --run "mkdir_all"
-tools/compare-compilers.sh        # JS × Caju (≈1 min); tem que terminar com "different: 0"
 build/caju run programa.caju      # compila em memória e roda
 ```
 
@@ -49,17 +48,30 @@ comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
 
-Resultado esperado hoje: **518 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+Resultado esperado hoje: **544 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
 receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
 confere a quantidade de argumentos).
 
-**Regra de ouro do port:** enquanto o JS existir, o compilador em Caju tem que gerar binários
-idênticos aos do `bootstrap/caju.js` (`tools/compare-compilers.sh`, também com `--target
-windows`). Ao mudar o compilador, mude os dois lados ou aposente o JS de vez (decisão do dono).
+**O compilador em JS é só o estágio 0.** Desde as otimizações (bench/compare/OPTIMIZATION.md), o
+compilador em Caju gera código melhor que o do JS; o JS só compila o primeiro estágio e usa uma
+cópia congelada do runtime (`bootstrap/rt/`). A correção é garantida pela suíte e pela
+autocompilação (estágio 2 == estágio 3). `tools/compare-compilers.sh` ficou como histórico.
+Mudou o gerador de código ou o `rt/`? Rode a suíte, a autocompilação e
+`python3 bench/compare/run.py --langs=caju`; registre a medição em OPTIMIZATION.md.
 
-Crash no código gerado: `gdb -batch -ex run -ex 'info registers rip' binário`; os rótulos
-(`u.f.nome`, `r.f.rt_x`, `u.top`, `u.l.N`) estão descritos em `docs/arquitetura-nativo.md`.
+Ver o código gerado: `tools/disasm.sh programa.caju função` (usa `CAJU_SYMS=arquivo`, que grava
+o endereço de cada símbolo). Crash: `gdb -batch -ex run -ex 'info registers rip' binário` e
+procure o endereço no arquivo do `CAJU_SYMS`.
+
+**Convenções do código gerado que as otimizações criaram** (respeite ao mexer no gerador):
+- R15 guarda a profundidade de chamadas (limite de 10.000); `__depth`/`__set_depth` no runtime.
+- RBX, R12, R13, R14 guardam até 4 variáveis por função que nunca são ponteiro (`alloc_regs`);
+  funções com `defer` guardam os 4 e os restauram no `recover`.
+- xmm0..14 seguram valores durante uma expressão `num` (`fexpr`); xmm15 é rascunho (`coerce`,
+  `float32`, divisão). Nada pode chamar função enquanto um XMM guarda valor.
+- Variáveis do nível de cima que nenhuma função usa (nem `&x`) são locais do `u.top`.
+- Chamadas a funções `return E` pequenas viram a expressão (`try_inline`).
 
 ## O que falta
 

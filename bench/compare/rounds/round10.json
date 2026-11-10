@@ -1,0 +1,286 @@
+{
+ "date": "2026-11-10 20:25",
+ "machine": "x86_64",
+ "versions": {
+  "caju": "caju 0.1.0",
+  "go": "go version go1.27.3 linux/amd64",
+  "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "python": "Python 3.12.3"
+ },
+ "challenges": [
+  {
+   "name": "fib",
+   "description": "recursive calls (fib(n), exponential)",
+   "build": {
+    "caju": {
+     "compile_s": 0.13024932999996963,
+     "size": 101432
+    }
+   },
+   "sizes": [
+    {
+     "n": 25,
+     "caju": {
+      "time": 0.001999500999772863,
+      "mem_kb": 2364
+     },
+     "output": "75025",
+     "agree": true
+    },
+    {
+     "n": 30,
+     "caju": {
+      "time": 0.007466510000085691,
+      "mem_kb": 704
+     },
+     "output": "832040",
+     "agree": true
+    },
+    {
+     "n": 35,
+     "caju": {
+      "time": 0.06865975099935895,
+      "mem_kb": 704
+     },
+     "output": "9227465",
+     "agree": true
+    }
+   ]
+  },
+  {
+   "name": "sieve",
+   "description": "sieve of Eratosthenes up to n",
+   "build": {
+    "caju": {
+     "compile_s": 0.12660246300038125,
+     "size": 101464
+    }
+   },
+   "sizes": [
+    {
+     "n": 100000,
+     "caju": {
+      "time": 0.002896392999900854,
+      "mem_kb": 3008
+     },
+     "output": "9592",
+     "agree": true
+    },
+    {
+     "n": 1000000,
+     "caju": {
+      "time": 0.016976107000118645,
+      "mem_kb": 11964
+     },
+     "output": "78498",
+     "agree": true
+    },
+    {
+     "n": 10000000,
+     "caju": {
+      "time": 0.18806546499945398,
+      "mem_kb": 81924
+     },
+     "output": "664579",
+     "agree": true
+    }
+   ]
+  },
+  {
+   "name": "nbody",
+   "description": "5-body simulation, n steps (floating point)",
+   "build": {
+    "caju": {
+     "compile_s": 0.13492450400008238,
+     "size": 106384
+    }
+   },
+   "sizes": [
+    {
+     "n": 10000,
+     "caju": {
+      "time": 0.005722464000427863,
+      "mem_kb": 704
+     },
+     "output": "-169016441",
+     "agree": true
+    },
+    {
+     "n": 100000,
+     "caju": {
+      "time": 0.04414287800045713,
+      "mem_kb": 2688
+     },
+     "output": "-169079859",
+     "agree": true
+    },
+    {
+     "n": 1000000,
+     "caju": {
+      "time": 0.4188138989993604,
+      "mem_kb": 2752
+     },
+     "output": "-169086184",
+     "agree": true
+    }
+   ]
+  },
+  {
+   "name": "mandelbrot",
+   "description": "Mandelbrot set on an n\u00d7n grid (floating point)",
+   "build": {
+    "caju": {
+     "compile_s": 0.12846907899984217,
+     "size": 102000
+    }
+   },
+   "sizes": [
+    {
+     "n": 250,
+     "caju": {
+      "time": 0.007335807999879762,
+      "mem_kb": 2684
+     },
+     "output": "15966",
+     "agree": true
+    },
+    {
+     "n": 500,
+     "caju": {
+      "time": 0.025032642999576638,
+      "mem_kb": 2364
+     },
+     "output": "63701",
+     "agree": true
+    },
+    {
+     "n": 1000,
+     "caju": {
+      "time": 0.0944881940004052,
+      "mem_kb": 2556
+     },
+     "output": "254700",
+     "agree": true
+    }
+   ]
+  },
+  {
+   "name": "matmul",
+   "description": "n\u00d7n integer matrix product (nested loops)",
+   "build": {
+    "caju": {
+     "compile_s": 0.1278977700003452,
+     "size": 101656
+    }
+   },
+   "sizes": [
+    {
+     "n": 100,
+     "caju": {
+      "time": 0.007124982000277669,
+      "mem_kb": 2304
+     },
+     "output": "81003250",
+     "agree": true
+    },
+    {
+     "n": 200,
+     "caju": {
+      "time": 0.044842088999757834,
+      "mem_kb": 3644
+     },
+     "output": "647996200",
+     "agree": true
+    },
+    {
+     "n": 300,
+     "caju": {
+      "time": 0.14473039499989682,
+      "mem_kb": 4484
+     },
+     "output": "2186980200",
+     "agree": true
+    }
+   ]
+  },
+  {
+   "name": "sort",
+   "description": "quicksort of n pseudo-random integers",
+   "build": {
+    "caju": {
+     "compile_s": 0.13219316499998968,
+     "size": 101856
+    }
+   },
+   "sizes": [
+    {
+     "n": 100000,
+     "caju": {
+      "time": 0.013370728000154486,
+      "mem_kb": 3516
+     },
+     "output": "934008025",
+     "agree": true
+    },
+    {
+     "n": 500000,
+     "caju": {
+      "time": 0.0675448760002837,
+      "mem_kb": 8248
+     },
+     "output": "849362033",
+     "agree": true
+    },
+    {
+     "n": 2000000,
+     "caju": {
+      "time": 0.2841607840000506,
+      "mem_kb": 18428
+     },
+     "output": "256922202",
+     "agree": true
+    }
+   ]
+  },
+  {
+   "name": "maps",
+   "description": "n inserts and n lookups in a hash map (int keys)",
+   "build": {
+    "caju": {
+     "compile_s": 0.12083799599986378,
+     "size": 101568
+    }
+   },
+   "sizes": [
+    {
+     "n": 100000,
+     "caju": {
+      "time": 0.010624258999996528,
+      "mem_kb": 10100
+     },
+     "output": "50000 999949972",
+     "agree": true
+    },
+    {
+     "n": 1000000,
+     "caju": {
+      "time": 0.253258134999669,
+      "mem_kb": 40132
+     },
+     "output": "500000 999496507",
+     "agree": true
+    },
+    {
+     "n": 3000000,
+     "caju": {
+      "time": 0.9664999990000069,
+      "mem_kb": 147668
+     },
+     "output": "1500000 998468507",
+     "agree": true
+    }
+   ]
+  }
+ ],
+ "cpu": "AMD Ryzen 7 5700G with Radeon Graphics"
+}

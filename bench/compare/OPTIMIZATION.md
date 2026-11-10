@@ -32,36 +32,54 @@ garantida pela suíte de testes e pela autocompilação.
 | 6 | variáveis locais inteiras, bool e num mais usadas em RBX, R12, R13, R14 | 66 ms | 218 ms | 449 ms | 125 ms | 210 ms | 287 ms | 1.28 s |
 | 7 | variáveis do nível de cima que nenhuma função usa viram locais (e podem ir para registradores) | 66 ms | 185 ms | 438 ms | 92 ms | 202 ms | 280 ms | 1.33 s |
 | 8 | a[i] op= v direto; lado composto sem chamadas calculado primeiro (sem push/pop) | 65 ms | 185 ms | 435 ms | 93 ms | 133 ms | 283 ms | 1.21 s |
+| 9 | inline de funções `return E` pequenas; `__sqrt` vira sqrtsd no registrador | 66 ms | 187 ms | 427 ms | 94 ms | 136 ms | 287 ms | 1.26 s |
+| 10 | mapas: caminho de chave inteira sem chamadas; leitura `m[k]` numa só chamada | 69 ms | 188 ms | 419 ms | 94 ms | 145 ms | 284 ms | 966 ms |
 
-Para comparar: Go faz 39 / 24 / 172 / 38 / 32 / 141 / 599 ms e Rust 21 / 24 / 66 / 38 / 11 / 135 / 359 ms
-(`RESULTS.md`).
+**Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
+matmul 1,8×, sort 2,2×, maps 2,1×.
+
+**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho):
+
+| desafio | Caju antes | Caju depois | Go | Rust | Python | Caju ÷ Go antes → depois |
+|---|--:|--:|--:|--:|--:|--:|
+| fib 35 | 126 ms | 67 ms | 39 ms | 21 ms | 1.29 s | 3.2× → 1.7× |
+| sieve 10M | 435 ms | 207 ms | 33 ms | 44 ms | 2.11 s | 13× → 6.3× |
+| nbody 1M | 737 ms | 418 ms | 173 ms | 68 ms | 9.13 s | 4.3× → 2.4× |
+| mandelbrot 1k | 243 ms | 94 ms | 38 ms | 39 ms | 6.63 s | 6.4× → 2.5× |
+| matmul 300 | 256 ms | 145 ms | 32 ms | 12 ms | 5.91 s | 8.0× → 4.5× |
+| sort 2M | 637 ms | 287 ms | 140 ms | 136 ms | 7.65 s | 4.5× → 2.0× |
+| maps 3M | 2.00 s | 935 ms | 612 ms | 354 ms | 2.04 s | 3.3× → 1.5× |
+
+Contra Python, a Caju passou de 3 a 25 vezes mais rápida para 2 a 70 vezes (e nos mapas, de empate
+para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuções (o matmul variou de
+133 a 145 ms sem mudança no código dele).
 
 ## Todas as medições
 
 <!-- python3 bench/compare/rounds/table.py -->
-| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | total gain |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.33× |
-| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.81× |
-| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 1.93× |
-| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 1.90× |
-| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 2.49× |
-| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 2.36× |
-| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 1.57× |
-| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 1.69× |
-| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 1.69× |
-| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 2.38× |
-| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 2.51× |
-| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 2.62× |
-| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 1.69× |
-| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 1.90× |
-| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 1.92× |
-| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 2.09× |
-| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 2.25× |
-| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 2.25× |
-| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 2.69× |
-| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 1.77× |
-| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.66× |
+| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | total gain |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.23× |
+| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.70× |
+| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 1.83× |
+| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2.03× |
+| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 2.38× |
+| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 2.31× |
+| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 1.55× |
+| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 1.70× |
+| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 1.76× |
+| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 2.32× |
+| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 2.48× |
+| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 2.58× |
+| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 1.63× |
+| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 1.73× |
+| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 1.77× |
+| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 2.12× |
+| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 2.23× |
+| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 2.24× |
+| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 3.26× |
+| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 2.22× |
+| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 2.07× |
 
 A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
 código dela não foi salvo à parte).
@@ -234,3 +252,52 @@ o lado composto é calculado primeiro e o simples é carregado depois direto no 
 É seguro porque em Caju atribuição é comando, não expressão: uma expressão sem chamadas não muda
 nenhuma variável, então a ordem não altera o resultado.
 **Resultado:** matmul −34% (202 → 133 ms), maps −9%.
+
+## Rodada 9: inline de funções pequenas
+
+**Hipótese:** no nbody, `math.sqrt(d2)` é uma chamada de função comum por par de corpos
+(`math.sqrt` é `return __sqrt(x)`), com o custo de chamada e com o valor saindo dos registradores
+XMM.
+**Mudança:** `try_inline` troca a chamada a uma função cujo corpo é só `return E` (sem chamar
+funções do programa, até 40 nós) por uma cópia de `E` com os parâmetros trocados pelos
+argumentos. Para não mudar o significado: os argumentos não podem chamar funções, o tipo de cada
+um tem que ser o do parâmetro, um parâmetro usado mais de uma vez (ou nenhuma) só aceita
+argumento simples, e o inline é recusado se uma variável local de quem chama tiver o nome de uma
+global usada no corpo. `fexpr` entende chamadas inline que devolvem `num`, e `__sqrt` vira
+`sqrtsd` direto no registrador.
+- A primeira versão fez inline de `fn helper() -> any { return recover() }`: o `recover` só vale
+  na própria função adiada, e o inline mudou isso (um teste de `panic` acusou). Funções internas
+  que dependem da chamada em que estão (`recover`, `__depth`, `__sp`...) ficaram fora.
+- Testes novos: `tests/lang/inline_test.caju`.
+
+**Resultado:** nbody −2%: o `sqrt` não era o custo principal. O que sobra no nbody: cada `x[i]`
+de uma lista global lê o ponteiro da memória e confere nil e limite; há 8 variáveis `num` para 4
+registradores; e ainda há 156 `push` na função `advance`.
+
+## Rodada 10: mapas
+
+**Hipótese:** ler `m[k]` eram duas chamadas ao runtime (`rt_map_find` e `rt_map_val`), e cada
+tentativa da busca chamava `rt_hash` e `rt_keq`, mesmo com chave inteira.
+**Mudança:**
+- `rt_map_find` (runtime, `rt/values.caju`) tem um caminho para chaves inteiras com o hash e a
+  comparação escritos no próprio laço, sem chamadas; `rt_hash` testa a chave inteira primeiro.
+- `rt_map_get` devolve o valor (ou 0) e se a chave foi achada; o código gerado faz uma chamada só
+  e só chama `rt_zero` quando o valor zero do tipo não é 0 (textos, structs).
+- Testes novos: `tests/lang/map_values_test.caju` (valores zero de cada tipo, `v, ok`, chaves
+  negativas e grandes, `0.0` e `-0.0`, 50 mil chaves, structs como valores).
+
+**Resultado:** maps −23% (1,26 s → 966 ms).
+
+## O que ficou para depois
+
+Em ordem de ganho esperado:
+1. **`[]bool` e `[]uint8` com 1 byte por elemento** (hoje 8): o crivo de 10 milhões varre 80 MB
+   em vez de 10 MB; é o maior atraso que sobrou (6× o Go). Mexe em todas as operações de lista
+   do runtime.
+2. **Mais registradores para `num`** (XMM preservados não existem no Linux: precisaria guardar em
+   volta das chamadas) e carregar `num` da memória direto para XMM (`movsd xmm, [rbp-x]`).
+3. **Tirar verificações repetidas** de laço (nil e limite de uma lista que não muda dentro do
+   laço), e manter o ponteiro de dados de uma lista local num registrador.
+4. **Desvios curtos** (`jcc rel8`) e código frio (chamadas de erro) fora do caminho quente.
+5. **Uma representação intermediária** com alocação de registradores de verdade: o salto maior,
+   mas é reescrever o gerador.

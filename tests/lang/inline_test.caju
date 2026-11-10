@@ -1,0 +1,46 @@
+# Calls to small functions (body: return E) are inlined by the native compiler (try_inline);
+# these tests check that the result is the same as a real call.
+import "std/math"
+import { describe, it, expect, run_source } from "std/testing"
+
+let scale: int = 10
+
+fn sq(x: int) -> int { return x * x }
+fn scaled(x: int) -> int { return x * scale }
+fn first(xs: []int) -> int { return xs[0] }
+fn half(x: int) -> num { return num(x) / 2.0 }
+fn hyp(a: num, b: num) -> num { return math.sqrt(a * a + b * b) }
+fn pick(c: bool, a: int, b: int) -> bool { return c && a > b || !c && b > a }
+
+describe("inlined functions", fn() {
+  it("give the same result as a call, with simple and composite arguments", fn() {
+    i := 3
+    expect(sq(i)).to_equal(9)
+    expect(sq(i + 1)).to_equal(16)
+    expect(sq(sq(2))).to_equal(16)
+  })
+  it("see their own globals even when the caller has a local with the same name", fn() {
+    scale := 2
+    expect(scaled(3) + scale).to_equal(32)
+  })
+  it("convert the result to the function's type", fn() {
+    expect(half(5)).to_equal(2.5)
+    x := 7
+    expect(half(x) * 2.0).to_equal(7)
+  })
+  it("work inside float expressions (math.sqrt)", fn() {
+    a := 3.0
+    expect(hyp(a, 4.0)).to_equal(5)
+    expect(1.0 + hyp(a, 4.0) * 2.0).to_equal(11)
+    expect(math.sqrt(a * 12.0) / 2.0).to_equal(3)
+  })
+  it("report runtime errors at the line of the function's body", fn() {
+    r := run_source("fn first(xs: []int) -> int { return xs[0] }\nempty := []int{}\nprint(first(empty))\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 1: Index 0 out of range (length 0).")
+  })
+  it("keep the logic of boolean bodies", fn() {
+    expect(pick(true, 3, 2)).to_equal(true)
+    expect(pick(false, 3, 2)).to_equal(false)
+    expect(first([]int{8, 9})).to_equal(8)
+  })
+})

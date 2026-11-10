@@ -469,6 +469,7 @@ fn rt_mix(h: int) -> int {
   return h
 }
 fn rt_hash(k: int, kk: int) -> int {
+  if kk == 0 { return rt_mix(k) }
   if kk == 1 {
     x := __bitsf(k)
     if x == 0.0 { return rt_mix(0) }
@@ -503,6 +504,18 @@ fn rt_map_find(m: int, k: int) -> int {
   idx := __load64(m + 32)
   mask := __load64(m + 40) - 1
   e := __load64(m + 8)
+  if kk == 0 {
+    # integer keys (the common case): the hash and the comparison without calls
+    h0 := k ^ (k >> 33)
+    h0 = h0 * -(49064778 * 1000000000 + 989728563)
+    h0 = (h0 ^ (h0 >> 33)) & mask
+    for {
+      s0 := __load64(idx + 8 * h0)
+      if s0 == 0 { return -1 }
+      if s0 > 0 and __load64(e + 24 * (s0 - 1)) == k { return s0 - 1 }
+      h0 = (h0 + 1) & mask
+    }
+  }
   h := rt_hash(k, kk) & mask
   for {
     s := __load64(idx + 8 * h)
@@ -511,6 +524,17 @@ fn rt_map_find(m: int, k: int) -> int {
     h = (h + 1) & mask
   }
   return -1
+}
+# m[k]: the value (0 if k is not there); rt_map_ok tells whether it was found
+let rt_map_ok: bool = false
+fn rt_map_get(m: int, k: int) -> int {
+  i := rt_map_find(m, k)
+  if i < 0 {
+    rt_map_ok = false
+    return 0
+  }
+  rt_map_ok = true
+  return __load64(__load64(m + 8) + 24 * i + 8)
 }
 fn rt_map_reindex(m: int, size: int) {
   idx := rt_alloc(8 * size)

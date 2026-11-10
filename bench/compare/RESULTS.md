@@ -1,6 +1,6 @@
 # Caju × Go × Rust × Python
 
-2026-11-10 19:47 — AMD Ryzen 7 5700G with Radeon Graphics
+2026-11-10 20:26 — AMD Ryzen 7 5700G with Radeon Graphics
 
 Versions: caju 0.1.0, go version go1.27.3 linux/amd64, rustc 1.99.1 (58cf8f9c3 2026-10-13), Python 3.12.3.
 Same algorithm and the same order of operations in every language (see the sources next to this
@@ -11,51 +11,51 @@ clock, including process start. Rust: `rustc -C opt-level=3`; Go: `go build`; Ca
 
 | challenge | n | Caju | Go | Rust | Python | Caju ÷ Go | Caju ÷ Rust | Python ÷ Caju |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 3 ms | 3 ms | 2 ms | 27 ms | 0.9× | 1.6× | 10.6× |
-| fib | 30 | 13 ms | 6 ms | 3 ms | 127 ms | 2.4× | 4.1× | 9.7× |
-| fib | 35 | 125 ms | 39 ms | 21 ms | 1.22 s | 3.2× | 6.0× | 9.8× |
-| sieve | 100k | 6 ms | 2 ms | 1 ms | 36 ms | 2.5× | 3.9× | 6.5× |
-| sieve | 1M | 42 ms | 4 ms | 4 ms | 218 ms | 10.7× | 11.4× | 5.2× |
-| sieve | 10M | 438 ms | 24 ms | 24 ms | 2.10 s | 18.1× | 18.1× | 4.8× |
-| nbody | 10k | 9 ms | 4 ms | 2 ms | 109 ms | 2.3× | 4.0× | 12.3× |
-| nbody | 100k | 75 ms | 20 ms | 8 ms | 920 ms | 3.8× | 9.3× | 12.3× |
-| nbody | 1M | 727 ms | 172 ms | 66 ms | 9.08 s | 4.2× | 11.0× | 12.5× |
-| mandelbrot | 250 | 17 ms | 5 ms | 4 ms | 436 ms | 3.7× | 4.3× | 25.5× |
-| mandelbrot | 500 | 65 ms | 12 ms | 11 ms | 1.58 s | 5.3× | 5.8× | 24.3× |
-| mandelbrot | 1k | 243 ms | 38 ms | 38 ms | 6.18 s | 6.5× | 6.4× | 25.5× |
-| matmul | 100 | 12 ms | 4 ms | 2 ms | 217 ms | 3.3× | 6.5× | 18.6× |
-| matmul | 200 | 78 ms | 11 ms | 4 ms | 1.65 s | 7.0× | 17.5× | 21.0× |
-| matmul | 300 | 253 ms | 32 ms | 11 ms | 5.72 s | 7.9× | 22.3× | 22.7× |
-| sort | 100k | 28 ms | 8 ms | 8 ms | 244 ms | 3.5× | 3.8× | 8.6× |
-| sort | 500k | 151 ms | 37 ms | 34 ms | 1.47 s | 4.1× | 4.5× | 9.7× |
-| sort | 2M | 635 ms | 141 ms | 135 ms | 6.94 s | 4.5× | 4.7× | 10.9× |
-| maps | 100k | 34 ms | 9 ms | 6 ms | 69 ms | 3.7× | 5.6× | 2.0× |
-| maps | 1M | 558 ms | 163 ms | 99 ms | 593 ms | 3.4× | 5.6× | 1.1× |
-| maps | 3M | 2.04 s | 599 ms | 359 ms | 1.91 s | 3.4× | 5.7× | 0.9× |
+| fib | 25 | 2 ms | 2 ms | 2 ms | 27 ms | 0.8× | 1.2× | 14.4× |
+| fib | 30 | 8 ms | 6 ms | 3 ms | 127 ms | 1.4× | 2.4× | 16.7× |
+| fib | 35 | 67 ms | 39 ms | 21 ms | 1.29 s | 1.7× | 3.1× | 19.4× |
+| sieve | 100k | 3 ms | 2 ms | 2 ms | 41 ms | 1.5× | 1.7× | 13.4× |
+| sieve | 1M | 17 ms | 4 ms | 4 ms | 221 ms | 4.3× | 4.7× | 12.7× |
+| sieve | 10M | 207 ms | 33 ms | 44 ms | 2.11 s | 6.3× | 4.7× | 10.2× |
+| nbody | 10k | 6 ms | 4 ms | 2 ms | 109 ms | 1.3× | 2.6× | 18.8× |
+| nbody | 100k | 44 ms | 20 ms | 8 ms | 925 ms | 2.2× | 5.4× | 21.2× |
+| nbody | 1M | 418 ms | 173 ms | 68 ms | 9.13 s | 2.4× | 6.2× | 21.8× |
+| mandelbrot | 250 | 7 ms | 5 ms | 4 ms | 434 ms | 1.5× | 1.9× | 58.3× |
+| mandelbrot | 500 | 25 ms | 12 ms | 11 ms | 1.61 s | 2.1× | 2.3× | 65.3× |
+| mandelbrot | 1k | 94 ms | 38 ms | 39 ms | 6.63 s | 2.4× | 2.4× | 70.4× |
+| matmul | 100 | 7 ms | 4 ms | 2 ms | 221 ms | 2.0× | 3.1× | 31.7× |
+| matmul | 200 | 45 ms | 11 ms | 5 ms | 1.67 s | 4.1× | 9.4× | 37.0× |
+| matmul | 300 | 145 ms | 32 ms | 12 ms | 5.91 s | 4.5× | 12.0× | 40.7× |
+| sort | 100k | 14 ms | 8 ms | 8 ms | 259 ms | 1.6× | 1.8× | 18.7× |
+| sort | 500k | 67 ms | 37 ms | 33 ms | 1.62 s | 1.8× | 2.0× | 24.0× |
+| sort | 2M | 287 ms | 140 ms | 136 ms | 7.65 s | 2.0× | 2.1× | 26.7× |
+| maps | 100k | 12 ms | 10 ms | 7 ms | 77 ms | 1.2× | 1.7× | 6.5× |
+| maps | 1M | 275 ms | 175 ms | 103 ms | 582 ms | 1.6× | 2.7× | 2.1× |
+| maps | 3M | 935 ms | 612 ms | 354 ms | 2.04 s | 1.5× | 2.6× | 2.2× |
 
 ## Peak memory (largest size)
 
 | challenge | n | Caju | Go | Rust | Python |
 |---|--:|--:|--:|--:|--:|
-| fib | 35 | 0.7 MB | 5.7 MB | 2.1 MB | 10.2 MB |
-| sieve | 10M | 78.8 MB | 15.6 MB | 11.6 MB | 86.3 MB |
-| nbody | 1M | 2.5 MB | 5.7 MB | 2.2 MB | 10.6 MB |
-| mandelbrot | 1k | 2.4 MB | 5.7 MB | 2.2 MB | 10.2 MB |
-| matmul | 300 | 5.8 MB | 7.7 MB | 4.0 MB | 14.9 MB |
-| sort | 2M | 17.4 MB | 20.3 MB | 17.2 MB | 86.6 MB |
-| maps | 3M | 146.0 MB | 50.5 MB | 53.2 MB | 215.8 MB |
+| fib | 35 | 2.6 MB | 5.7 MB | 2.2 MB | 10.3 MB |
+| sieve | 10M | 78.4 MB | 15.1 MB | 11.6 MB | 86.3 MB |
+| nbody | 1M | 2.2 MB | 5.7 MB | 2.2 MB | 10.6 MB |
+| mandelbrot | 1k | 2.5 MB | 5.7 MB | 2.2 MB | 10.2 MB |
+| matmul | 300 | 5.7 MB | 7.7 MB | 4.0 MB | 14.9 MB |
+| sort | 2M | 19.6 MB | 21.3 MB | 17.3 MB | 86.7 MB |
+| maps | 3M | 145.5 MB | 48.6 MB | 53.2 MB | 215.7 MB |
 
 ## Executable size and compile time
 
 | challenge | Caju | Go | Rust |
 |---|--:|--:|--:|
-| fib | 136 KB, 248 ms | 2298 KB, 2078 ms | 4436 KB, 187 ms |
-| sieve | 136 KB, 260 ms | 2297 KB, 271 ms | 4435 KB, 169 ms |
-| nbody | 148 KB, 273 ms | 2303 KB, 259 ms | 4438 KB, 184 ms |
-| mandelbrot | 140 KB, 258 ms | 2298 KB, 284 ms | 4435 KB, 177 ms |
-| matmul | 140 KB, 263 ms | 2298 KB, 295 ms | 4437 KB, 194 ms |
-| sort | 140 KB, 252 ms | 2299 KB, 259 ms | 4437 KB, 181 ms |
-| maps | 140 KB, 250 ms | 2299 KB, 257 ms | 4458 KB, 290 ms |
+| fib | 99 KB, 139 ms | 2298 KB, 186 ms | 4436 KB, 197 ms |
+| sieve | 99 KB, 134 ms | 2297 KB, 173 ms | 4435 KB, 193 ms |
+| nbody | 104 KB, 140 ms | 2303 KB, 176 ms | 4438 KB, 194 ms |
+| mandelbrot | 100 KB, 127 ms | 2298 KB, 177 ms | 4435 KB, 175 ms |
+| matmul | 99 KB, 148 ms | 2298 KB, 194 ms | 4437 KB, 203 ms |
+| sort | 99 KB, 140 ms | 2299 KB, 175 ms | 4437 KB, 196 ms |
+| maps | 99 KB, 123 ms | 2299 KB, 168 ms | 4458 KB, 303 ms |
 
 ## The challenges
 
