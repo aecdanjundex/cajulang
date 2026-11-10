@@ -1,0 +1,31 @@
+# Top-level variables that no function uses become locals of the top-level code (and may live in
+# registers, compiler/native.caju); the ones a function uses, or whose address is taken, stay
+# global. These programs check that every kind of use still sees the same variable.
+import { describe, it, expect, run_source } from "std/testing"
+
+describe("top-level variables", fn() {
+  it("are seen by a function that uses them only inside a struct literal", fn() {
+    r := run_source("const LIMIT = 7\nstruct S { n: int }\nfn build_s() -> *S { return &S{n: LIMIT} }\nprint(build_s().n)\n")
+    expect(r.output).to_equal("7")
+  })
+  it("keep their address when & is taken", fn() {
+    r := run_source("x := 1\np := &x\n*p = 5\nprint(x)\nx = 9\nprint(*p)\n")
+    expect(r.output).to_equal("5\n9")
+  })
+  it("are shared with function literals", fn() {
+    r := run_source("count := 0\ninc := fn() { count++ }\nfor i := 0; i < 3; i++ { inc() }\nprint(count)\n")
+    expect(r.output).to_equal("3")
+  })
+  it("are shared with named functions that change them", fn() {
+    r := run_source("total := 0\nfn add(n: int) { total += n }\nfor i := 1; i <= 4; i++ { add(i) }\nprint(total)\n")
+    expect(r.output).to_equal("10")
+  })
+  it("work as loop counters and accumulators of the top level", fn() {
+    r := run_source("sum := 0\nx := 0.5\nfor i := 0; i < 1000; i++ {\n  sum += i\n  x = x * 1.001\n}\nprint(sum, x > 1.0)\n")
+    expect(r.output).to_equal("499500 true")
+  })
+  it("survive the garbage collector when they hold lists", fn() {
+    r := run_source("keep := []int{1, 2, 3}\nfor i := 0; i < 200000; i++ { tmp := []int{i, i, i}\n  tmp[0] = 1\n}\nprint(keep)\n")
+    expect(r.output).to_equal("[1 2 3]")
+  })
+})
