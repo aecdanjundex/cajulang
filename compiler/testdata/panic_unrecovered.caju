@@ -1,0 +1,8 @@
+# a runtime error that nobody recovers: deferred calls still run, then the program stops
+struct Cnt { v: int }
+fn no_recover() -> int {
+  defer print("defer runs before the end")
+  let p: *Cnt = nil
+  return p.v
+}
+print(no_recover())

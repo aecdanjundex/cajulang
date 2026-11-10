@@ -12,21 +12,21 @@ mensagens da linguagem estão em inglês (decisão da reorganização); mantenha
 
 ```
 compiler/*.caju      o compilador, em Caju (ver docs/compiler-port.md, tabela de módulos)
-  main.caju            o comando `caju` (build, run, test, bench, version)
+  main.caju            o comando `caju` (build, run, test, bench, pkg, version)
+  pkg.caju             o gerenciador de pacotes (docs/packages.md)
   build_main.caju      só o `build` (driver pequeno)
   dump_main.caju       imprime a árvore de um estágio (parse, link, check) para comparar com o JS
+  *_test.caju          testes do compilador nativo, do runtime, do pkg e do alvo Windows
+  testdata/            programas auxiliares desses testes
 rt/*.caju            runtime dos programas: core, gc, values, dynamic, panic, linux, windows
-lib/*.caju           biblioteca padrão (import "std/strings"): strings, strconv, math, bytes, os, net, http
+lib/*.caju           biblioteca padrão (import "std/x"): strings, strconv, math, bytes, os, fs, path,
+                     net, http, toml, crypto, hash, hex, base64, testing; cada uma com seu _test.caju
 bootstrap/*.js       o compilador original em JavaScript (léxico, parser, tipos, ligador, VM, native.js)
-  caju.js              `node bootstrap/caju.js build|run ...`
-  dump.js              a árvore canônica do JS (referência do dump_main)
-tests/               programas com a saída esperada ao lado (foo.caju + foo.out, ou dir/main.caju + expected.out)
-  lang examples parity native std   compilados e executados no Linux
-  windows/             programas que só fazem sentido no Windows (FFI, DLL)
-  run.js               runner (Node); history.jsonl guarda os resultados gravados
+tests/lang/          testes da linguagem (*_test.caju + testdata/)
+examples/            exemplos da linguagem; examples_test.caju roda cada um e confere a saída
 bench/               programs/*.caju + run.js; history.jsonl guarda a evolução da velocidade
-examples/            exemplos avulsos
-docs/                compiler-port.md (regras do port), arquitetura-nativo.md, plano, histórico
+tools/compare-compilers.sh   JS × compilador em Caju: binários idênticos em todos os programas
+docs/                packages.md, testing.md, compiler-port.md, arquitetura-nativo.md, plano, histórico
 build/               gerado (não versionar)
 ```
 
@@ -37,22 +37,26 @@ node bootstrap/caju.js build -o build/caju compiler/main.caju   # estágio 1 (co
 build/caju build -o build/caju2 compiler/main.caju              # estágio 2 (compilado por ele mesmo)
 build/caju2 build -o build/caju3 compiler/main.caju && cmp build/caju2 build/caju3   # tem que ser igual
 
-build/caju test [filtro]          # suíte (o root é o diretório acima do binário, ou $CAJU_ROOT)
-node tests/run.js                 # a mesma suíte com o compilador em JS
-node tests/run.js --compiler=build/caju
+build/caju test                   # todos os *_test.caju (≈25 s); -v mostra cada teste
+build/caju test lib/fs_test.caju --run "mkdir_all"
+tools/compare-compilers.sh        # JS × Caju (≈1 min); tem que terminar com "different: 0"
 build/caju run programa.caju      # compila em memória e roda
-build/caju bench / node bench/run.js
 ```
 
-Resultado esperado hoje da suíte: **100 passam, 3 falham, 10 pulados** (igual nos dois
-compiladores). Falhas conhecidas: `parity/fn-local-before` (variável lida antes de ser atribuída
-não dá erro no nativo), `parity/st-any`, `parity/st-arity`. Pulados: goroutines, canais, select,
-alloc/peek/poke.
+**Testes** (docs/testing.md): estilo Go na organização (`x_test.caju` ao lado de `x.caju`,
+auxiliares em `testdata/`) e BDD na escrita: `describe("assunto", fn() { it("frase do
+comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out`. Erros de
+compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
+Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
+
+Resultado esperado hoje: **518 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
+receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
+confere a quantidade de argumentos).
 
 **Regra de ouro do port:** enquanto o JS existir, o compilador em Caju tem que gerar binários
-idênticos aos do `bootstrap/caju.js` para todos os programas de `tests/` (Linux e `--target
-windows`). Hoje: 97 binários idênticos + 16 com o mesmo erro de compilação; 59 idênticos no alvo
-Windows. Ao mudar o compilador, mude os dois lados ou aposente o JS de vez (decisão do dono).
+idênticos aos do `bootstrap/caju.js` (`tools/compare-compilers.sh`, também com `--target
+windows`). Ao mudar o compilador, mude os dois lados ou aposente o JS de vez (decisão do dono).
 
 Crash no código gerado: `gdb -batch -ex run -ex 'info registers rip' binário`; os rótulos
 (`u.f.nome`, `r.f.rt_x`, `u.top`, `u.l.N`) estão descritos em `docs/arquitetura-nativo.md`.
@@ -61,11 +65,17 @@ Crash no código gerado: `gdb -batch -ex run -ex 'info registers rip' binário`;
 
 - Goroutines, canais, `select`, sleep com escalonador, deadlock (fase 6).
 - Windows: `alloc`/`peek`/`poke`/`readstr`, `dllexport` e DLL nativa (fase 7).
-- As 3 falhas da suíte acima.
+- Os 3 bugs conhecidos acima.
+- `to_have_length`/`to_contain` do std/testing só conhecem listas e mapas de tipos básicos
+  (a linguagem não tem `len` sobre `any`); para outros, `expect(len(x)).to_equal(n)`.
 - Mapas com chave struct/array/any, chamar um `any` como função, operações de bits com `any`.
 
 ## Cuidados que já custaram tempo
 
+- `not` é palavra reservada (por isso `expect(x).not_()`); `s[i]` é `uint8` (use `int(s[i])`);
+  não há operador `~` (use `x ^ -1`); `"\xff"` é o caractere U+00FF em UTF-8, não o byte 0xFF.
+- Um nome de variável igual ao de um namespace importado é erro (`path` vs `import "std/path"`):
+  importe com outro nome (`import filepath "std/path"`).
 - Uma expressão não pode continuar na linha seguinte depois de um operador (`a +` no fim da
   linha é erro de sintaxe). Quebre em variáveis.
 - `let x = 0` sem tipo vira **num**; use `x := 0` ou `let x: int = 0`. Literais inteiros acima de

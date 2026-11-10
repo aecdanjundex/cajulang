@@ -1,0 +1,58 @@
+# std/hash: non-cryptographic checksums and hashes (fast, for tables and integrity checks
+# against accidents, not against attackers; for that use std/crypto).
+
+let CRC_TABLE = crc_table()
+
+fn crc_table() -> []int {
+  t := []int{}
+  for n := 0; n < 256; n++ {
+    c := n
+    for k := 0; k < 8; k++ {
+      if (c & 1) != 0 { c = 0xEDB88320 ^ (c >> 1) } else { c = c >> 1 }
+    }
+    t = append(t, c)
+  }
+  return t
+}
+
+# CRC-32 (IEEE 802.3, the one of zip, gzip and PNG), as a number from 0 to 2^32-1
+export fn crc32(s: str) -> int { return crc32_update(0, s) }
+
+# continues a CRC-32: crc32_update(crc32(a), b) == crc32(a + b)
+export fn crc32_update(crc: int, s: str) -> int {
+  c := crc ^ 0xFFFFFFFF
+  p := __strp(s) + 8
+  n := len(s)
+  i := 0
+  while i < n {
+    c = CRC_TABLE[(c ^ __load8(p + i)) & 255] ^ (c >> 8)
+    i++
+  }
+  return c ^ 0xFFFFFFFF
+}
+
+# FNV-1a, 32 bits, as a number from 0 to 2^32-1
+export fn fnv1a32(s: str) -> int {
+  h := 0x811C9DC5
+  p := __strp(s) + 8
+  n := len(s)
+  i := 0
+  while i < n {
+    h = ((h ^ __load8(p + i)) * 0x01000193) & 0xFFFFFFFF
+    i++
+  }
+  return h
+}
+
+# FNV-1a, 64 bits
+export fn fnv1a64(s: str) -> uint64 {
+  h := 0xCBF29CE484222325
+  p := __strp(s) + 8
+  n := len(s)
+  i := 0
+  while i < n {
+    h = (h ^ __load8(p + i)) * 0x100000001B3
+    i++
+  }
+  return uint64(h)
+}

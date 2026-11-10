@@ -1,6 +1,0 @@
-fn repeat(t, n) {
-  let r = ""
-  for i = 1 to n { r = r + t }
-  return r
-}
-print(repeat("ab", 5), repeat("é", 3))

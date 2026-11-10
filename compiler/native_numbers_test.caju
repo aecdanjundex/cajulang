@@ -1,0 +1,127 @@
+# Number arithmetic and printing, fixed-size integers, comparisons, logic and control flow in
+# the native compiler (migrated from tests/native/numbers.caju). Numbers print with up to 12
+# significant digits, like the reference VM.
+import { describe, it, expect } from "std/testing"
+
+fn fact(n: int) -> int {
+  if n <= 1 { return 1 }
+  return n * fact(n - 1)
+}
+fn average(a: num, b: num) -> num { return (a + b) / 2 }
+
+describe("printing floats", fn() {
+  it("uses up to 12 significant digits and switches to exponents at the extremes", fn() {
+    expect(str([]any{1.0 / 7, 0.1 + 0.2, 1e21, 1e20, 123456789012.5, 1e-7, 0.000001, 1.5e-10})).to_equal("[0.142857142857 0.3 1e+21 100000000000000000000 123456789013 1e-7 0.000001 1.5e-10]")
+    expect(str([]any{5e-324, 1.7976931348623157e308, -0.0, 2.0 ** 53 + 1, 9007199254740993.0})).to_equal("[4.94065645841e-324 1.79769313486e+308 0 9007199254740992 9007199254740992]")
+    expect(str([]any{1.0 / 3 * 3, 100.0 / 3, 2.0 ** 70, 2.0 ** -20, 12345678901234567890.0})).to_equal("[1 33.3333333333 1.18059162072e+21 9.53674316406e-7 12345678901234567168]")
+    expect(str([]any{0.5, 0.25, 999999999999.5, 9999999999995.0, 1.0e15 + 0.3})).to_equal("[0.5 0.25 1000000000000 9999999999995 1000000000000000]")
+  })
+  it("prints a growing series the same way as the reference", fn() {
+    want := []str{
+      "[1 1.37 0.729927007299 1370000]",
+      "[2 1.8769 0.532793435985 1876900]",
+      "[3 2.571353 0.388900318237 2571353]",
+      "[4 3.52275361 0.283868845429 3522753.61]",
+      "[5 4.8261724457 0.207203536809 4826172.4457]",
+      "[6 6.61185625061 0.151243457525 6611856.25061]",
+      "[7 9.05824306333 0.110396684325 9058243.06333]",
+      "[8 12.4097929968 0.0805815214049 12409792.9968]",
+      "[9 17.0014164056 0.0588186287627 17001416.4056]",
+      "[10 23.2919404756 0.0429333056662 23291940.4756]",
+      "[11 31.9099584516 0.0313381793184 31909958.4516]",
+      "[12 43.7166430787 0.0228745834441 43716643.0787]",
+      "[13 59.8918010178 0.0166967762366 59891801.0178]",
+      "[14 82.0517673944 0.0121874279099 82051767.3944]",
+      "[15 112.41092133 0.00889593278095 112410921.33]",
+      "[16 154.002962223 0.00649338159194 154002962.223]",
+      "[17 210.984058245 0.00473969459265 210984058.245]",
+      "[18 289.048159796 0.00345963108953 289048159.796]",
+      "[19 395.99597892 0.00252527816754 395995978.92]",
+      "[20 542.51449112 0.00184326873543 542514491.12]",
+      "[21 743.244852835 0.0013454516317 743244852.835]",
+      "[22 1018.24544838 0.000982081482993 1018245448.38]",
+      "[23 1394.99626429 0.000716847797805 1394996264.29]",
+      "[24 1911.14488207 0.000523246567741 1911144882.07]",
+      "[25 2618.26848844 0.000381931801271 2618268488.44]",
+      "[26 3587.02782916 0.000278782336694 3587027829.16]",
+      "[27 4914.22812595 0.000203490756711 4914228125.95]",
+      "[28 6732.49253255 0.000148533399059 6732492532.55]",
+      "[29 9223.5147696 0.000108418539459 9223514769.6]",
+      "[30 12636.2152343 0.0000791376200432 12636215234.3]"}
+    x := 1.0
+    got := []str{}
+    for i = 1 to 30 {
+      x = x * 1.37
+      got = append(got, str([]any{i, x, 1.0 / x, x * 1000000.0}))
+    }
+    expect(got).to_equal(want)
+  })
+  it("computes sums, powers and float remainders", fn() {
+    s := 0.0
+    for k = 1 to 200 { s = s + 1.0 / num(k * k) }
+    expect(str([]any{s, s * 6, 2.0 ** 0.5, 10.0 ** 0.3, 7.0 % 2.5, -7.0 % 2.5})).to_equal("[1.63994654601 9.83967927609 1.41421356237 1.99526231497 2 -2]")
+  })
+})
+
+describe("fixed-size integers", fn() {
+  it("wrap around on overflow", fn() {
+    let a: int8 = 100
+    a = a + 100
+    let b: uint8 = 200
+    b = b * 3
+    let c: int32 = 2147483647
+    c = c + 1
+    let d: uint16 = 1
+    d = d - 2
+    expect(str([]any{a, b, c, d, int8(300), uint32(-1)})).to_equal("[-56 88 -2147483648 65535 44 4294967295]")
+  })
+  it("divide toward zero and shift", fn() {
+    expect(str([]any{7 / 2, -7 / 2, -7 % 3, 1 << 62, -8 >> 1})).to_equal("[3 -3 -1 4611686018427387904 -4]")
+  })
+  it("use all 64 bits for uint64", fn() {
+    let u: uint64 = 0
+    u = u - 1
+    expect(str([]any{u, u / 10, u % 7, u >> 60})).to_equal("[18446744073709551615 1844674407370955161 1 15]")
+  })
+  it("convert from floats by truncating", fn() {
+    expect(str([]any{int(3.99), int(-3.99), int(1e30) == 0, num(7) / 2})).to_equal("[3 -3 false 3.5]")
+  })
+})
+
+describe("comparisons and logic", fn() {
+  it("compare texts by bytes and mix ints with floats", fn() {
+    expect([]bool{"a" < "b", "abc" == "abc", "x" != "y", "é" > "e", 1 < 2.5, 2.5 >= 2.5}).to_equal([]bool{true, true, true, true, true, true})
+  })
+  it("use not, and, or, and join anything to a text with +", fn() {
+    expect(str([]any{not true, not 0, true and false, false or true, "" + 1 + true + 2.5})).to_equal("[false true false true \"1true2.5\"]")
+  })
+})
+
+describe("control flow", fn() {
+  it("continues and breaks loops", fn() {
+    t := 0
+    for t2 := 0; t2 < 10; t2++ {
+      if t2 == 3 { continue }
+      if t2 == 8 { break }
+      t += t2
+    }
+    expect(t).to_equal(25)
+  })
+  it("falls through to the next case of a switch", fn() {
+    log := []str{}
+    t := 25
+    switch t {
+    case 1, 2: log = append(log, "one or two")
+    case 25: log = append(log, "twenty-five")
+      fallthrough
+    case 99: log = append(log, "fell through")
+    default: log = append(log, "other")
+    }
+    expect(log).to_equal([]str{"twenty-five", "fell through"})
+  })
+  it("recurses and mixes int and float results", fn() {
+    expect(fact(20)).to_equal(2432902008176640000)
+    expect(average(1, 2)).to_equal(1.5)
+    expect(fact(10) + 0.5).to_equal(3628800.5)
+  })
+})

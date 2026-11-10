@@ -1,0 +1,4 @@
+struct Point { x: int, y: int }
+let nilp: *Point = nil
+print(nilp == nil)
+print(nilp.x)

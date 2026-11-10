@@ -1,9 +1,0 @@
-struct P { x: num, y: num, name: str, ok: bool }
-fn (p: P) sum() -> num { return p.x + p.y }
-fn (p: *P) double() { p.x = p.x * 2
- p.y = p.y * 2 }
-let a = P{x: 1.5, y: 2, name: "one \"a\""}
-let b = a
-b.double()
-print(a, b, a.sum(), b.sum(), a == b, a == P{x: 1.5, y: 2, name: "one \"a\""})
-print("text: " + a)

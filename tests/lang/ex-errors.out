@@ -1,9 +1,0 @@
-10 / 3 = 3
-error: division by zero
-1. have dinner
-2. wash the dishes
-3. clear the table
-recovered: something went wrong
-recovered: Index 5 out of range (length 3)
-all good
-nil

@@ -1,0 +1,53 @@
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+describe("strings", fn() {
+  describe("searching", fn() {
+    it("checks prefixes and suffixes", fn() {
+      expect(strings.has_prefix("caju", "ca")).to_be_true()
+      expect(strings.has_suffix("caju", "ju")).to_be_true()
+    })
+    it("finds the first and the last occurrence", fn() {
+      expect(strings.index("banana", "na")).to_equal(2)
+      expect(strings.last_index("banana", "na")).to_equal(4)
+    })
+    it("counts occurrences and tells if a text contains another", fn() {
+      expect(strings.count("cheese", "e")).to_equal(3)
+      expect(strings.contains("seafood", "foo")).to_be_true()
+    })
+  })
+  describe("split and join", fn() {
+    it("cuts at every separator, keeping empty parts", fn() {
+      expect(strings.split("a,b,,c", ",")).to_equal([]str{"a", "b", "", "c"})
+    })
+    it("joins parts with a separator", fn() {
+      expect(strings.join([]str{"x", "y", "z"}, "-")).to_equal("x-y-z")
+    })
+    it("splits at runs of spaces with fields", fn() {
+      expect(strings.fields("  one two\tthree  ")).to_equal([]str{"one", "two", "three"})
+    })
+  })
+  describe("building texts", fn() {
+    it("repeats and replaces", fn() {
+      expect(strings.repeat("ab", 3)).to_equal("ababab")
+      expect(strings.replace_all("a.b.c", ".", "::")).to_equal("a::b::c")
+    })
+    it("trims spaces and changes case", fn() {
+      expect(strings.trim_space("  hi there \n")).to_equal("hi there")
+      expect(strings.to_upper("Caju!")).to_equal("CAJU!")
+      expect(strings.to_lower("CAJU")).to_equal("caju")
+    })
+  })
+  describe("Builder", fn() {
+    it("collects many pieces and writes runes as UTF-8", fn() {
+      b := strings.Builder{}
+      for i := 0; i < 1000; i++ { b.write(str(i % 10)) }
+      b.write_rune(0xE9)
+      b.write_rune(0x1F600)
+      s := b.string()
+      expect(s).to_have_length(1006)
+      expect(s[0:12]).to_equal("012345678901")
+      expect(s[1000:]).to_equal("é😀")
+    })
+  })
+})

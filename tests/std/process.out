@@ -1,5 +1,0 @@
-nil 0 hello from a child
-7 ["out" "err"]
-137 9
-run /no/such/program: program not found
-true

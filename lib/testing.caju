@@ -1,0 +1,373 @@
+# std/testing: tests in the BDD style, run by `caju test`.
+#
+# A test file ends in _test.caju and sits next to the code it tests. It describes behaviours
+# with titles written as sentences, and checks values with expect:
+#
+#   import "std/strings"
+#   import { describe, it, expect } from "std/testing"
+#
+#   describe("strings.split", fn() {
+#     it("cuts the text at every separator", fn() {
+#       expect(strings.split("a,b,c", ",")).to_equal([]str{"a", "b", "c"})
+#     })
+#     it("keeps empty parts", fn() {
+#       expect(strings.split("a,,b", ",")).to_have_length(3)
+#     })
+#   })
+#
+# `caju test` finds every *_test.caju under a directory, compiles each one as a program, runs it
+# in its own directory and reports the results. A test (an `it`) stops at the first expectation
+# that fails, or at a panic or runtime error; the other tests go on. describe blocks can be
+# nested; before_each / after_each run around every test of their block (and inner blocks).
+# CAJU_TEST_RUN=text runs only the tests whose full title contains text (caju test --run text).
+
+import "std/os"
+import "std/strings"
+
+struct Block {
+  title: str
+  before: []fn()
+  after: []fn()
+}
+
+struct Failure {
+  msg: str
+}
+
+let stack: []*Block = []*Block{}
+let passed: int = 0
+let failed: int = 0
+let skipped: int = 0
+let failures: []str = []str{}
+let printed_depth: int = 0      # how many titles of the stack are already printed
+let filter_text: str = os.getenv("CAJU_TEST_RUN")
+
+fn indent(n: int) -> str { return strings.repeat("  ", n) }
+
+fn full_title(title: str) -> str {
+  parts := []str{}
+  for _, b := range stack { parts = append(parts, b.title) }
+  parts = append(parts, title)
+  return strings.join(parts, " › ")
+}
+
+# prints the titles of the enclosing blocks that are not printed yet
+fn print_headers() {
+  while printed_depth < len(stack) {
+    print(indent(printed_depth) + stack[printed_depth].title)
+    printed_depth++
+  }
+}
+
+# a group of tests about one subject; body declares the tests (it) and inner groups
+export fn describe(title: str, body: fn()) {
+  stack = append(stack, &Block{title: title, before: []fn(){}, after: []fn(){}})
+  body()
+  stack = stack[0:len(stack) - 1]
+  if printed_depth > len(stack) { printed_depth = len(stack) }
+}
+
+# runs f before each test of the current block (and of the blocks inside it)
+export fn before_each(f: fn()) {
+  if len(stack) == 0 { panic("before_each must be inside describe") }
+  b := stack[len(stack) - 1]
+  b.before = append(b.before, f)
+}
+
+# runs f after each test of the current block, even when the test fails
+export fn after_each(f: fn()) {
+  if len(stack) == 0 { panic("after_each must be inside describe") }
+  b := stack[len(stack) - 1]
+  b.after = append(b.after, f)
+}
+
+# one test: title says what should happen ("returns nil for an empty list")
+export fn it(title: str, body: fn()) {
+  full := full_title(title)
+  if filter_text != "" && !strings.contains(full, filter_text) { return }
+  print_headers()
+  msg := run_test(body)
+  if msg == "" {
+    passed++
+    print(indent(len(stack)) + "✓ " + title)
+    return
+  }
+  failed++
+  failures = append(failures, full)
+  print(indent(len(stack)) + "✗ " + title)
+  for _, line := range strings.split(msg, "\n") { print(indent(len(stack) + 2) + line) }
+}
+
+# a test that is written but not run yet (reported as skipped)
+export fn skip(title: str, body: fn()) {
+  full := full_title(title)
+  if filter_text != "" && !strings.contains(full, filter_text) { return }
+  print_headers()
+  skipped++
+  print(indent(len(stack)) + "- " + title + " (skipped)")
+}
+
+# the hooks, the body and the after hooks; "" if all went well, else the message
+fn run_test(body: fn()) -> str {
+  msg := guard(fn() {
+    for _, b := range stack { for _, f := range b.before { f() } }
+    body()
+  })
+  # after hooks run from the innermost block out, even after a failure
+  for i := len(stack) - 1; i >= 0; i-- {
+    for _, f := range stack[i].after {
+      m := guard(f)
+      if msg == "" && m != "" { msg = "in after_each: " + m }
+    }
+  }
+  return msg
+}
+
+# runs f; the message of an expectation that failed, or of a panic, or ""
+fn guard(f: fn()) -> (msg: str) {
+  defer fn() {
+    r := recover()
+    if r == nil { return }
+    if fl, ok := r.(*Failure); ok { msg = fl.msg } else { msg = "panic: " + str(r) }
+  }()
+  f()
+  return ""
+}
+
+# stops the current test as failed
+export fn fail(msg: str) { panic(&Failure{msg: msg}) }
+
+# called by `caju test` after the file's top level: prints the summary and sets the exit code
+export fn finish() {
+  print("")
+  for _, f := range failures { print("FAIL: " + f) }
+  print("# " + str(passed) + " passed, " + str(failed) + " failed, " + str(skipped) + " skipped")
+  if failed > 0 { os.exit(1) }
+}
+
+# ---------------------------------------------------------------- expectations
+
+# how a value is shown in messages and compared by to_equal: like print, but texts are quoted
+# (so "1" and 1 differ) — ["a" 1 nil]
+export fn repr(v: any) -> str {
+  s := str([]any{v})
+  return s[1:len(s) - 1]
+}
+
+export struct Expect {
+  actual: any
+  negate: bool
+}
+
+# starts an expectation about a value: expect(x).to_equal(y)
+export fn expect(actual: any) -> *Expect { return &Expect{actual: actual} }
+
+# the same expectation, reversed: expect(x).not_().to_contain("a")
+export fn (e: *Expect) not_() -> *Expect { return &Expect{actual: e.actual, negate: !e.negate} }
+
+fn (e: *Expect) check(ok: bool, what: str, detail: str) {
+  if ok != e.negate { return }
+  head := "expected " + repr(e.actual)
+  if e.negate { head = head + " not" }
+  msg := head + " " + what
+  if detail != "" { msg = msg + "\n" + detail }
+  fail(msg)
+}
+
+# the same value: equal texts, numbers, booleans, nil, and lists / maps / structs whose
+# contents are equal (compared by their printed form, see repr)
+export fn (e: *Expect) to_equal(want: any) {
+  a := repr(e.actual)
+  b := repr(want)
+  if (a == b) != e.negate { return }
+  if e.negate { fail("expected a value different from " + b) }
+  fail("expected: " + b + "\n     got: " + a)
+}
+
+export fn (e: *Expect) to_be_true() { e.check(e.actual == true, "to be true", "") }
+export fn (e: *Expect) to_be_false() { e.check(e.actual == false, "to be false", "") }
+export fn (e: *Expect) to_be_nil() { e.check(is_nil(e.actual), "to be nil", "") }
+
+fn is_nil(v: any) -> bool {
+  if v == nil { return true }
+  r := repr(v)
+  return r == "nil" || r == "&nil"        # a nil pointer of some type shows as &nil
+}
+
+# a text contains a piece of text; a list contains an element (equal as in to_equal);
+# a map[str]... has the key
+export fn (e: *Expect) to_contain(x: any) {
+  e.check(contains(e.actual, x), "to contain " + repr(x), "")
+}
+
+fn contains(v: any, x: any) -> bool {
+  switch a := v.(type) {
+  case str:
+    if s, ok := x.(str); ok { return strings.contains(a, s) }
+    return false
+  case []str:
+    for _, y1 := range a { if repr(y1) == repr(x) { return true } }
+  case []int:
+    for _, y2 := range a { if repr(y2) == repr(x) { return true } }
+  case []num:
+    for _, y3 := range a { if repr(y3) == repr(x) { return true } }
+  case []bool:
+    for _, y4 := range a { if repr(y4) == repr(x) { return true } }
+  case []any:
+    for _, y5 := range a { if repr(y5) == repr(x) { return true } }
+  case map[str]int:
+    if k1, ok1 := x.(str); ok1 { _, has1 := a[k1]; return has1 }
+  case map[str]str:
+    if k2, ok2 := x.(str); ok2 { _, has2 := a[k2]; return has2 }
+  case map[str]bool:
+    if k3, ok3 := x.(str); ok3 { _, has3 := a[k3]; return has3 }
+  case map[str]any:
+    if k4, ok4 := x.(str); ok4 { _, has4 := a[k4]; return has4 }
+  default:
+    fail("to_contain does not know how to look inside " + repr(v) + " (use a text, a list or a map with text keys)")
+  }
+  return false
+}
+
+# the length of a text (in bytes), list or map
+export fn (e: *Expect) to_have_length(n: int) {
+  got := length(e.actual)
+  e.check(got == n, "to have length " + str(n), "length: " + str(got))
+}
+
+fn length(v: any) -> int {
+  switch a := v.(type) {
+  case str: return len(a)
+  case []str: return len(a)
+  case []int: return len(a)
+  case []num: return len(a)
+  case []bool: return len(a)
+  case []any: return len(a)
+  case map[str]int: return len(a)
+  case map[str]str: return len(a)
+  case map[str]bool: return len(a)
+  case map[str]any: return len(a)
+  }
+  fail("to_have_length does not know the length of " + repr(v))
+  return -1
+}
+
+export fn (e: *Expect) to_start_with(prefix: str) {
+  s, ok := e.actual.(str)
+  e.check(ok && strings.has_prefix(s, prefix), "to start with " + repr(prefix), "")
+}
+export fn (e: *Expect) to_end_with(suffix: str) {
+  s, ok := e.actual.(str)
+  e.check(ok && strings.has_suffix(s, suffix), "to end with " + repr(suffix), "")
+}
+
+fn number(v: any) -> num {
+  switch a := v.(type) {
+  case int: return num(a)
+  case num: return a
+  case uint8: return num(a)
+  case int8: return num(a)
+  case int16: return num(a)
+  case uint16: return num(a)
+  case int32: return num(a)
+  case uint32: return num(a)
+  case int64: return num(a)
+  case uint64: return num(a)
+  }
+  fail("expected a number, got " + repr(v))
+  return 0.0
+}
+
+export fn (e: *Expect) to_be_greater_than(n: any) { e.check(number(e.actual) > number(n), "to be greater than " + repr(n), "") }
+export fn (e: *Expect) to_be_less_than(n: any) { e.check(number(e.actual) < number(n), "to be less than " + repr(n), "") }
+export fn (e: *Expect) to_be_at_least(n: any) { e.check(number(e.actual) >= number(n), "to be at least " + repr(n), "") }
+export fn (e: *Expect) to_be_at_most(n: any) { e.check(number(e.actual) <= number(n), "to be at most " + repr(n), "") }
+
+# a number within eps of n
+export fn (e: *Expect) to_be_close_to(n: any, eps: num) {
+  d := number(e.actual) - number(n)
+  if d < 0.0 { d = -d }
+  e.check(d <= eps, "to be within " + str(eps) + " of " + repr(n), "")
+}
+
+# an error (not nil) whose message is msg
+export fn (e: *Expect) to_be_error(msg: str) {
+  err, ok := e.actual.(error)
+  if !ok || err == nil {
+    e.check(false, "to be the error " + repr(msg), "")
+    return
+  }
+  e.check(err.Error() == msg, "to be the error " + repr(msg), "message: " + repr(err.Error()))
+}
+
+# expect(fn() { ... }).to_panic(): calling the function panics (or stops with a runtime error)
+export fn (e: *Expect) to_panic() {
+  f, ok := e.actual.(fn())
+  if !ok { fail("to_panic needs a function with no parameters and no result: expect(fn() { ... })") }
+  msg, did := panic_of(f)
+  detail := ""
+  if did { detail = "it panicked with " + repr(msg) }
+  e.check(did, "to panic", detail)
+}
+
+# like to_panic, and the message (of the panic or of the runtime error) is msg
+export fn (e: *Expect) to_panic_with(msg: str) {
+  f, ok := e.actual.(fn())
+  if !ok { fail("to_panic_with needs a function with no parameters and no result: expect(fn() { ... })") }
+  got, did := panic_of(f)
+  detail := "it did not panic"
+  if did { detail = "it panicked with " + repr(got) }
+  e.check(did && got == msg, "to panic with " + repr(msg), detail)
+}
+
+fn panic_of(f: fn()) -> (msg: str, did: bool) {
+  defer fn() {
+    r := recover()
+    if r != nil {
+      did = true
+      if fl, ok := r.(*Failure); ok { msg = fl.msg } else if err, ok2 := r.(error); ok2 { msg = err.Error() } else { msg = str(r) }
+    }
+  }()
+  f()
+  return "", false
+}
+
+# ---------------------------------------------------------------- whole programs
+
+# what a program printed (standard output and error together) and its exit code
+export struct Run {
+  output: str
+  code: int
+}
+
+fn caju_bin() -> str {
+  b := os.getenv("CAJU_BIN")
+  if b == "" { b = "caju" }
+  return b
+}
+
+# compiles and runs a Caju program (a path relative to the test file's directory) with
+# `caju run`; compile errors and runtime errors show up in output, with a nonzero code.
+# The last newline of the output is removed.
+export fn run_file(file: str) -> *Run {
+  p, err := os.run([]str{caju_bin(), "run", file}, nil, true)
+  if err != nil { fail("cannot run " + file + ": " + err.Error()) }
+  return &Run{output: strings.trim_suffix(p.output, "\n"), code: p.code}
+}
+
+let source_count: int = 0
+
+# like run_file, for a program given as text (written to a temporary main.caju)
+export fn run_source(src: str) -> *Run {
+  source_count++
+  base := os.getenv("TMPDIR")
+  if base == "" { base = "/tmp" }
+  dir := base + "/caju-test-" + str(os.getpid()) + "-" + str(source_count)
+  os.mkdir(dir, 0o700)
+  file := dir + "/main.caju"
+  os.write_file(file, src, 0o644)
+  r := run_file(file)
+  os.remove(file)
+  os.run([]str{"rmdir", dir}, nil, true)
+  return r
+}

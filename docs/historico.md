@@ -65,3 +65,15 @@ Resumo das conversas que construíram a Caju, para dar contexto a quem continua.
   (`docs/compiler-port.md`). Resultado: para todos os programas de `tests/` ele gera binários
   idênticos byte a byte aos do bootstrap (Linux e Windows), e a autocompilação fecha: os
   estágios 1, 2 e 3 são iguais (cerca de 2 s por estágio, binário de 1,2 MB).
+
+## Gerenciador de pacotes, std ampliada e testes BDD
+
+- `caju pkg` (docs/packages.md): pacotes são repositórios do GitHub com `caju.toml` (TOML);
+  versões por tags `vX.Y.Z`; dependências recursivas com *minimal version selection*; `caju.lock`
+  fixa versão, commit e um hash SHA-256 dos arquivos de cada pacote, conferido ao baixar, ao
+  compilar e em `caju pkg verify`. Download pelo `git` (a linguagem não tem TLS).
+- std nova: `fs` e `path` (arquivos e diretórios), `toml`, `crypto` (SHA-256/512, SHA-1, MD5,
+  HMAC, PBKDF2, bytes aleatórios), `hash` (CRC-32, FNV), `hex`, `base64`, `testing`.
+- Testes: os ~140 programas com `.out` viraram arquivos `_test.caju` em estilo BDD
+  (`describe`/`it` com títulos em texto, `expect`), ao lado do código (docs/testing.md). O `caju
+  test` acha e roda os testes; o `tests/run.js` saiu.

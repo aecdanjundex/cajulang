@@ -1,0 +1,38 @@
+import "std/net"
+import "std/http"
+import { describe, it, expect } from "std/testing"
+
+describe("net", fn() {
+  it("listens on a free port when the port is 0", fn() {
+    _, err := net.listen("127.0.0.1", 0)
+    expect(err).to_be_nil()
+  })
+  it("returns an error when nobody listens on the port", fn() {
+    _, err := net.dial("127.0.0.1", 1)
+    expect(err).to_be_error("dial 127.0.0.1:1: connection refused")
+  })
+})
+
+describe("http.serve_conn", fn() {
+  it("answers a request with the handler of its path", fn() {
+    l, err := net.listen("127.0.0.1", 39123)
+    expect(err).to_be_nil()
+    c, err2 := net.dial("127.0.0.1", 39123)
+    expect(err2).to_be_nil()
+    s, _ := l.accept()
+    c.write("GET /hi?name=caju HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+    http.handle("/hi", fn(req: *http.Request, res: *http.Response) {
+      res.set_header("X-Caju", "yes")
+      res.write("hi " + req.query + " " + req.body + " " + req.header("HOST"))
+    })
+    http.serve_conn(s)
+    reply := ""
+    while true {
+      chunk, _ := c.read(4096)
+      if chunk == "" { break }
+      reply = reply + chunk
+    }
+    c.close()
+    expect(reply).to_equal("HTTP/1.1 200 OK\r\nX-Caju: yes\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 20\r\nConnection: close\r\n\r\nhi name=caju hello x")
+  })
+})

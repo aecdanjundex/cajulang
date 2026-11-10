@@ -1,0 +1,4 @@
+struct C { r: num }
+fn (c: C) area() -> num { return 3 * c.r * c.r }
+let n: any = 5
+print(n.area())

@@ -1,9 +1,0 @@
-true 1 true
-nil true
-nil 14 ["line 1" "line 2"]
-nil false
-open /no/such/file: no such file or directory
-true
-before
-raw stdout
-after

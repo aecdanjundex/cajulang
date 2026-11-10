@@ -1,0 +1,343 @@
+# The package manager (pkg.caju): versions, names, editing caju.toml, caju.lock, the hash of a
+# package, and the whole `caju pkg` workflow against local git repositories that stand in for
+# GitHub (CAJU_PKG_SOURCE points github.com/... at them). Migrated from tests/pkg/run.sh.
+import "std/os"
+import "std/fs"
+import "std/strings"
+import "pkg"
+import { describe, it, expect, before_each } from "std/testing"
+
+fn version(s: str) -> str {
+  v, err := pkg.parse_version(s)
+  if err != nil { return "error: " + err.Error() }
+  return v.string()
+}
+
+fn cmp(a: str, b: str) -> int {
+  va, _ := pkg.parse_version(a)
+  vb, _ := pkg.parse_version(b)
+  c := pkg.compare_versions(va, vb)
+  if c < 0 { return -1 }
+  if c > 0 { return 1 }
+  return 0
+}
+
+describe("versions", fn() {
+  it("read MAJOR.MINOR.PATCH, with or without a v, and a pre-release", fn() {
+    expect(version("1.2.3")).to_equal("1.2.3")
+    expect(version("v1.2.3")).to_equal("1.2.3")
+    expect(version("1.0.0-beta.1")).to_equal("1.0.0-beta.1")
+  })
+  it("refuse anything else", fn() {
+    expect(version("1.2")).to_equal("error: invalid version \"1.2\" (expected MAJOR.MINOR.PATCH, like 1.2.0)")
+    expect(version("01.2.3")).to_equal("error: invalid version \"01.2.3\"")
+    expect(version("1.x.3")).to_equal("error: invalid version \"1.x.3\"")
+    expect(version("1.2.3-")).to_equal("error: invalid version \"1.2.3-\"")
+  })
+  it("compare by number, not by text", fn() {
+    expect(cmp("1.10.0", "1.9.0")).to_equal(1)
+    expect(cmp("2.0.0", "10.0.0")).to_equal(-1)
+    expect(cmp("1.2.3", "v1.2.3")).to_equal(0)
+  })
+  it("put a pre-release before its release", fn() {
+    expect(cmp("1.0.0-beta", "1.0.0")).to_equal(-1)
+    expect(cmp("1.0.0-alpha", "1.0.0-beta")).to_equal(-1)
+  })
+})
+
+describe("package names", fn() {
+  it("are github.com/owner/repository", fn() {
+    expect(pkg.check_name("github.com/acme/json")).to_be_nil()
+    expect(pkg.check_name("github.com/a-b/c_d.e")).to_be_nil()
+  })
+  it("refuse other hosts, other shapes and odd characters", fn() {
+    expect(pkg.check_name("gitlab.com/a/b")).to_be_error("invalid package name \"gitlab.com/a/b\" (expected github.com/owner/repository)")
+    expect(pkg.check_name("github.com/a")).to_be_error("invalid package name \"github.com/a\" (expected github.com/owner/repository)")
+    expect(pkg.check_name("github.com/a/..")).to_be_error("invalid package name \"github.com/a/..\"")
+    expect(pkg.check_name("github.com/a/b c")).to_be_error("invalid package name \"github.com/a/b c\" (character \" \")")
+  })
+})
+
+describe("editing caju.toml", fn() {
+  src := "[package]\nname = \"github.com/me/app\"   # the name\n\n[dependencies]\n# json parser\n\"github.com/acme/json\" = \"1.0.0\"\n\n[other]\nx = 1\n"
+  it("changes the version of a dependency in place, keeping comments", fn() {
+    out := pkg.set_dependency(src, "github.com/acme/json", "1.2.0")
+    expect(out).to_equal(strings.replace_all(src, "\"1.0.0\"", "\"1.2.0\""))
+  })
+  it("adds a dependency at the end of [dependencies]", fn() {
+    out := pkg.set_dependency(src, "github.com/acme/strutil", "0.3.1")
+    expect(out).to_contain("\"github.com/acme/json\" = \"1.0.0\"\n\"github.com/acme/strutil\" = \"0.3.1\"\n\n[other]")
+  })
+  it("adds the [dependencies] section when there is none", fn() {
+    out := pkg.set_dependency("[package]\nname = \"github.com/me/app\"\n", "github.com/acme/json", "1.0.0")
+    expect(out).to_equal("[package]\nname = \"github.com/me/app\"\n\n[dependencies]\n\"github.com/acme/json\" = \"1.0.0\"\n")
+  })
+  it("removes a dependency and says whether it was there", fn() {
+    out, found := pkg.remove_dependency(src, "github.com/acme/json")
+    expect(found).to_be_true()
+    expect(out).not_().to_contain("acme/json")
+    expect(out).to_contain("# json parser\n\n[other]")
+    _, found2 := pkg.remove_dependency(src, "github.com/acme/nothing")
+    expect(found2).to_be_false()
+  })
+})
+
+describe("caju.lock", fn() {
+  it("is written as TOML and read back the same", fn() {
+    lk := &pkg.Lock{requires: []str{"github.com/acme/greet@0.2.0"}, pkgs: []*pkg.Locked{
+      &pkg.Locked{name: "github.com/acme/greet", version: "0.2.0", source: "https://github.com/acme/greet", commit: "95a2d4ac", hash: "sha256:bd77", deps: []str{"github.com/acme/strutil@1.0.0"}},
+      &pkg.Locked{name: "github.com/acme/strutil", version: "1.0.0", source: "https://github.com/acme/strutil", commit: "e02a4475", hash: "sha256:66f1", deps: []str{}}}}
+    text := pkg.encode_lock(lk)
+    expect(text).to_start_with("# Written by `caju pkg`; do not edit.")
+    expect(text).to_contain("version = 1\nrequires = [\"github.com/acme/greet@0.2.0\"]\n")
+    expect(text).to_contain("[[package]]\nname = \"github.com/acme/strutil\"\nversion = \"1.0.0\"\n")
+    dir, _ := fs.temp_dir("", "caju-lock-test-")
+    file := dir + "/caju.lock"
+    os.write_file(file, text, 0o644)
+    back, err := pkg.read_lock(file)
+    fs.remove_all(dir)
+    expect(err).to_be_nil()
+    expect(back.requires).to_equal(lk.requires)
+    expect(len(back.pkgs)).to_equal(2)
+    expect(back.pkgs[0]).to_equal(lk.pkgs[0])
+    expect(back.pkgs[1]).to_equal(lk.pkgs[1])
+  })
+})
+
+describe("the hash of a package", fn() {
+  it("depends only on the files' paths and contents, not on .git", fn() {
+    dir, _ := fs.temp_dir("", "caju-hash-test-")
+    fs.mkdir_all(dir + "/sub", 0o755)
+    os.write_file(dir + "/a.caju", "print(1)\n", 0o644)
+    os.write_file(dir + "/sub/b.caju", "print(2)\n", 0o644)
+    h1, err := pkg.hash_dir(dir)
+    expect(err).to_be_nil()
+    expect(h1).to_start_with("sha256:")
+    expect(h1).to_have_length(71)
+    fs.mkdir_all(dir + "/.git", 0o755)
+    os.write_file(dir + "/.git/HEAD", "ref: x\n", 0o644)
+    h2, _ := pkg.hash_dir(dir)
+    expect(h2).to_equal(h1)
+    os.write_file(dir + "/sub/b.caju", "print(3)\n", 0o644)
+    h3, _ := pkg.hash_dir(dir)
+    expect(h3).not_().to_equal(h1)
+    fs.remove_all(dir)
+  })
+})
+
+# ---------------------------------------------------------------- the whole workflow
+
+let W: str = ""                 # the work directory: remote/ (git repos), home/ (CAJU_HOME), app/
+let env: []str = nil
+
+fn env_with(vars: []str) -> []str {
+  out := []str{}
+  for _, kv := range os.environ() {
+    keep := true
+    for _, v := range vars { if strings.has_prefix(kv, v[0:strings.index(v, "=") + 1]) { keep = false } }
+    if keep { out = append(out, kv) }
+  }
+  for _, v := range vars { out = append(out, v) }
+  return out
+}
+
+fn setup() {
+  if W != "" { return }
+  d, err := fs.temp_dir("", "caju-pkg-test-")
+  expect(err).to_be_nil()
+  W = d
+  env = env_with([]str{"CAJU_HOME=" + W + "/home", "CAJU_PKG_SOURCE=" + W + "/remote",
+    "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+    "GIT_AUTHOR_DATE=2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2026-01-01T00:00:00Z"})
+  fs.mkdir_all(W + "/app", 0o755)
+  publish_all()
+}
+
+fn git(args: []str) -> str {
+  argv := []str{"git"}
+  for _, a := range args { argv = append(argv, a) }
+  p, err := os.run(argv, env, true)
+  expect(err).to_be_nil()
+  if p.code != 0 { expect(p.output).to_equal("(git succeeding)") }
+  return strings.trim_space(p.output)
+}
+
+# commits the files to the repository of name (replacing what it had) and tags v<version>
+fn publish(name: str, version: str, files: map[str]str) {
+  repo := W + "/remote/" + name
+  if !fs.is_dir(repo) {
+    fs.mkdir_all(repo, 0o755)
+    git([]str{"-C", repo, "init", "-q", "-b", "main"})
+  }
+  git([]str{"-C", repo, "rm", "-rq", "--ignore-unmatch", "."})
+  for f, data := range files { os.write_file(repo + "/" + f, data, 0o644) }
+  git([]str{"-C", repo, "add", "-A"})
+  git([]str{"-C", repo, "commit", "-qm", "v" + version, "--allow-empty"})
+  git([]str{"-C", repo, "tag", "v" + version})
+}
+
+# the files of a package: caju.toml (with the dependency lines deps) and <repo>.caju
+fn package(name: str, version: str, deps: str, code: str) -> map[str]str {
+  toml := "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\nlicense = \"MIT\"\n\n[dependencies]\n" + deps
+  return map[str]str{"caju.toml": toml, name[strings.last_index(name, "/") + 1:] + ".caju": code}
+}
+
+fn publish_all() {
+  publish("github.com/acme/strutil", "1.0.0", package("github.com/acme/strutil", "1.0.0", "", "export fn shout(s: str) -> str { return s + \"!\" }\n"))
+  v11 := package("github.com/acme/strutil", "1.1.0", "", "import \"github.com/acme/strutil/extra\"\nexport fn shout(s: str) -> str { return extra.twice(s) + \"!!\" }\n")
+  v11["extra.caju"] = "export fn twice(s: str) -> str { return s + s }\n"
+  publish("github.com/acme/strutil", "1.1.0", v11)
+  publish("github.com/acme/greet", "0.2.0", package("github.com/acme/greet", "0.2.0", "\"github.com/acme/strutil\" = \"1.0.0\"\n", "import \"github.com/acme/strutil\"\nexport fn hello(n: str) -> str { return strutil.shout(\"hello \" + n) }\n"))
+  publish("github.com/acme/greet", "0.3.0", package("github.com/acme/greet", "0.3.0", "\"github.com/acme/strutil\" = \"1.1.0\"\n", "import \"github.com/acme/strutil\"\nexport fn hello(n: str) -> str { return strutil.shout(\"hi \" + n) }\n"))
+  # a package whose caju.toml version does not match its tag
+  publish("github.com/acme/bad", "1.0.0", package("github.com/acme/bad", "0.9.0", "", "export const X = 1\n"))
+  publish("github.com/acme/strutil", "2.0.0", package("github.com/acme/strutil", "2.0.0", "", "export fn shout(s: str) -> str { return s + \"?\" }\n"))
+  os.write_file(W + "/app/main.caju", "import \"github.com/acme/greet\"\nprint(greet.hello(\"caju\"))\n", 0o644)
+}
+
+# runs caju (or another program) inside app/; the output with W written as $W, and the exit code
+fn in_app(argv: []str) -> (out: str, code: int) {
+  args := []str{"sh", "-c", "cd \"$1\" && shift && exec \"$@\"", "sh", W + "/app"}
+  for _, a := range argv { args = append(args, a) }
+  p, err := os.run(args, env, true)
+  expect(err).to_be_nil()
+  return strings.replace_all(strings.trim_suffix(p.output, "\n"), W, "$W"), p.code
+}
+
+fn caju(args: []str) -> (str, int) {
+  argv := []str{os.getenv("CAJU_BIN")}
+  for _, a := range args { argv = append(argv, a) }
+  return in_app(argv)
+}
+
+fn read_app(f: str) -> str {
+  s, _ := os.read_file(W + "/app/" + f)
+  return s
+}
+
+# the steps run in order: each one starts from what the previous ones left
+describe("caju pkg, step by step", fn() {
+  before_each(fn() { setup() })
+
+  it("without caju.toml, an import of a package is a missing file", fn() {
+    out, code := caju([]str{"run", "main.caju"})
+    expect(out).to_equal("Link error in main.caju, line 1: File \"github.com/acme/greet.caju\" does not exist in the project.")
+    expect(code).to_equal(1)
+  })
+  it("init creates caju.toml with the package name", fn() {
+    out, code := caju([]str{"pkg", "init", "github.com/me/app"})
+    expect(out).to_equal("created caju.toml for github.com/me/app")
+    expect(code).to_equal(0)
+    expect(read_app("caju.toml")).to_equal("[package]\nname = \"github.com/me/app\"\nversion = \"0.1.0\"\ndescription = \"\"\nlicense = \"\"\nauthors = []\n\n[dependencies]\n")
+  })
+  it("add downloads the package and, recursively, its dependencies", fn() {
+    out, code := caju([]str{"pkg", "add", "github.com/acme/greet@0.2.0"})
+    expect(out).to_equal("downloading github.com/acme/greet@0.2.0\ndownloading github.com/acme/strutil@1.0.0\nadded github.com/acme/greet@0.2.0; 2 packages ok")
+    expect(code).to_equal(0)
+  })
+  it("writes caju.lock with the version, commit and hash of every package", fn() {
+    lock := read_app("caju.lock")
+    expect(lock).to_contain("requires = [\"github.com/acme/greet@0.2.0\"]")
+    expect(lock).to_contain("[[package]]\nname = \"github.com/acme/greet\"\nversion = \"0.2.0\"\nsource = \"https://github.com/acme/greet\"\ncommit = \"")
+    expect(lock).to_contain("dependencies = [\"github.com/acme/strutil@1.0.0\"]")
+    expect(lock).to_contain("[[package]]\nname = \"github.com/acme/strutil\"\nversion = \"1.0.0\"\n")
+    expect(strings.count(lock, "hash = \"sha256:")).to_equal(2)
+  })
+  it("lets the program import the package", fn() {
+    out, code := caju([]str{"run", "main.caju"})
+    expect(out).to_equal("hello caju!")
+    expect(code).to_equal(0)
+  })
+  it("tree shows the dependencies of the dependencies", fn() {
+    out, _ := caju([]str{"pkg", "tree"})
+    expect(out).to_equal("github.com/me/app@0.1.0\n└── github.com/acme/greet@0.2.0\n    └── github.com/acme/strutil@1.0.0")
+  })
+  it("picks the highest of the minimum versions asked for", fn() {
+    out, _ := caju([]str{"pkg", "add", "github.com/acme/strutil@1.1.0"})
+    expect(out).to_equal("downloading github.com/acme/strutil@1.1.0\nadded github.com/acme/strutil@1.1.0; 2 packages ok")
+    out2, _ := caju([]str{"run", "main.caju"})
+    expect(out2).to_equal("hello cajuhello caju!!")
+  })
+  it("update moves a dependency to its latest release", fn() {
+    out, _ := caju([]str{"pkg", "update", "github.com/acme/greet"})
+    expect(out).to_equal("github.com/acme/greet 0.2.0 -> 0.3.0\ndownloading github.com/acme/greet@0.3.0\n2 packages ok")
+    expect(read_app("caju.toml")).to_contain("[dependencies]\n\"github.com/acme/greet\" = \"0.3.0\"\n\"github.com/acme/strutil\" = \"1.1.0\"\n")
+    out2, _ := caju([]str{"pkg", "tree"})
+    expect(out2).to_equal("github.com/me/app@0.1.0\n├── github.com/acme/greet@0.3.0\n│   └── github.com/acme/strutil@1.1.0\n└── github.com/acme/strutil@1.1.0")
+    out3, _ := caju([]str{"run", "main.caju"})
+    expect(out3).to_equal("hi cajuhi caju!!")
+  })
+  it("verify checks every cached package against caju.lock", fn() {
+    out, code := caju([]str{"pkg", "verify"})
+    expect(out).to_start_with("ok       github.com/acme/greet@0.3.0 sha256:")
+    expect(out).to_contain("\nok       github.com/acme/strutil@1.1.0 sha256:")
+    expect(code).to_equal(0)
+  })
+  it("refuses to build with a cached package whose files were changed", fn() {
+    os.write_file(W + "/home/pkg/github.com/acme/strutil@1.1.0/strutil.caju", "export fn shout(s: str) -> str { return \"pwned\" }\n", 0o644)
+    out, code := caju([]str{"run", "main.caju"})
+    expect(out).to_start_with("Package error: checksum mismatch for github.com/acme/strutil@1.1.0 in $W/home/pkg/github.com/acme/strutil@1.1.0\n  caju.lock: sha256:")
+    expect(out).to_end_with("The cached files were changed. Delete that directory and run caju pkg install.")
+    expect(code).to_equal(1)
+    out2, code2 := caju([]str{"pkg", "verify"})
+    expect(out2).to_contain("MISMATCH github.com/acme/strutil@1.1.0\n  caju.lock: sha256:")
+    expect(code2).to_equal(1)
+  })
+  it("install downloads a deleted package again and checks it against the lock", fn() {
+    fs.remove_all(W + "/home/pkg/github.com/acme/strutil@1.1.0")
+    out, code := caju([]str{"pkg", "install"})
+    expect(out).to_equal("downloading github.com/acme/strutil@1.1.0\n2 packages ok")
+    expect(code).to_equal(0)
+    out2, _ := caju([]str{"run", "main.caju"})
+    expect(out2).to_equal("hi cajuhi caju!!")
+  })
+  it("refuses a release whose caju.toml has another version", fn() {
+    out, code := caju([]str{"pkg", "add", "github.com/acme/bad@1.0.0"})
+    expect(out).to_equal("downloading github.com/acme/bad@1.0.0\ncaju pkg: github.com/acme/bad: the tag v1.0.0 has version = \"0.9.0\" in its caju.toml")
+    expect(code).to_equal(1)
+    expect(read_app("caju.toml")).not_().to_contain("acme/bad")
+  })
+  it("refuses two major versions of the same package", fn() {
+    out, code := caju([]str{"pkg", "add", "github.com/acme/strutil@2.0.0"})
+    expect(out).to_equal("downloading github.com/acme/strutil@2.0.0\ncaju pkg: github.com/acme/strutil is needed in different major versions: 2.0.0 (by github.com/me/app), 1.1.0 (by github.com/acme/greet@0.3.0); they are not compatible")
+    expect(code).to_equal(1)
+    expect(read_app("caju.toml")).to_contain("\"github.com/acme/strutil\" = \"1.1.0\"")
+  })
+  it("reports a repository that does not exist", fn() {
+    out, code := caju([]str{"pkg", "add", "github.com/acme/nothere@1.0.0"})
+    expect(out).to_equal("downloading github.com/acme/nothere@1.0.0\ncaju pkg: cannot download github.com/acme/nothere@1.0.0 (git tag v1.0.0 of $W/remote/github.com/acme/nothere): fatal: repository '$W/remote/github.com/acme/nothere' does not exist")
+    expect(code).to_equal(1)
+  })
+  it("remove keeps a package that another dependency still needs", fn() {
+    out, code := caju([]str{"pkg", "remove", "github.com/acme/strutil"})
+    expect(out).to_equal("removed github.com/acme/strutil; 2 packages ok")
+    expect(code).to_equal(0)
+    out2, _ := caju([]str{"pkg", "tree"})
+    expect(out2).to_equal("github.com/me/app@0.1.0\n└── github.com/acme/greet@0.3.0\n    └── github.com/acme/strutil@1.1.0")
+    out3, code3 := caju([]str{"pkg", "remove", "github.com/acme/strutil"})
+    expect(out3).to_equal("caju pkg: github.com/acme/strutil is not in [dependencies]")
+    expect(code3).to_equal(1)
+  })
+  it("detects a tag moved to different content", fn() {
+    r := W + "/remote/github.com/acme/strutil"
+    git([]str{"-C", r, "checkout", "-q", "v1.1.0"})
+    os.write_file(r + "/extra.caju", "export fn twice(s: str) -> str { return s + s }\n# changed\n", 0o644)
+    git([]str{"-C", r, "commit", "-qam", "moved"})
+    git([]str{"-C", r, "tag", "-f", "v1.1.0"})
+    git([]str{"-C", r, "checkout", "-q", "main"})
+    fs.remove_all(W + "/home/pkg")
+    out, code := caju([]str{"pkg", "install"})
+    expect(out).to_start_with("downloading github.com/acme/greet@0.3.0\ndownloading github.com/acme/strutil@1.1.0\ncaju pkg: the tag v1.1.0 of github.com/acme/strutil has moved\n  caju.lock: commit ")
+    expect(out).to_end_with("A published version must not change. If you trust the new content, remove the package from caju.lock and install again.")
+    expect(code).to_equal(1)
+  })
+  it("hash prints the hash of a directory", fn() {
+    out, code := caju([]str{"pkg", "hash", W + "/remote/github.com/acme/greet"})
+    expect(out).to_start_with("sha256:")
+    expect(out).to_have_length(71)
+    expect(code).to_equal(0)
+  })
+  it("cleans up its work directory", fn() {
+    expect(fs.remove_all(W)).to_be_nil()
+  })
+})

@@ -1,0 +1,831 @@
+# pkg: the package manager (`caju pkg ...`).
+#
+# A package is a GitHub repository with a caju.toml at its root; its name is the repository path
+# ("github.com/user/repo"), which is also what programs import. A release is a git tag "vX.Y.Z"
+# whose caju.toml says version = "X.Y.Z". A project lists the packages it needs in caju.toml
+# ([dependencies], each with the minimum version it needs); `caju pkg install` follows the
+# dependencies of the dependencies (recursively), picks one version of each package (minimal
+# version selection: the highest of the minimums asked for, within one major version), downloads
+# them with git into the cache ($CAJU_HOME/pkg, default ~/.caju/pkg) and writes caju.lock with the
+# exact version, the git commit and a SHA-256 hash of the files of every package. Builds and
+# `caju pkg verify` check the cached files against those hashes; a download whose commit or hash
+# differs from caju.lock is refused. See docs/packages.md.
+
+import "std/os"
+import "std/fs"
+import "std/path"
+import "std/strings"
+import "std/toml"
+import "std/crypto"
+import "project"
+
+export const VERSION = "0.1.0"     # the version of the compiler (caju version)
+const LOCK_VERSION = 1
+
+# ---------------------------------------------------------------- versions (semver)
+
+export struct Version {
+  major: int
+  minor: int
+  patch: int
+  pre: str       # "beta.1" in 1.0.0-beta.1, or ""
+}
+
+# parses "1.2.3", "v1.2.3" or "1.2.3-beta.1"
+export fn parse_version(s: str) -> (*Version, error) {
+  t := strings.trim_prefix(s, "v")
+  v := &Version{}
+  dash := strings.index(t, "-")
+  if dash >= 0 {
+    v.pre = t[dash + 1:]
+    t = t[0:dash]
+    if v.pre == "" { return nil, errors.New("invalid version \"" + s + "\"") }
+  }
+  parts := strings.split(t, ".")
+  if len(parts) != 3 { return nil, errors.New("invalid version \"" + s + "\" (expected MAJOR.MINOR.PATCH, like 1.2.0)") }
+  nums := []int{}
+  for _, p := range parts {
+    if p == "" || (len(p) > 1 && p[0] == 48) { return nil, errors.New("invalid version \"" + s + "\"") }
+    n := 0
+    for i := 0; i < len(p); i++ {
+      c := int(p[i])
+      if c < 48 || c > 57 { return nil, errors.New("invalid version \"" + s + "\"") }
+      n = n * 10 + c - 48
+    }
+    nums = append(nums, n)
+  }
+  v.major = nums[0]
+  v.minor = nums[1]
+  v.patch = nums[2]
+  return v, nil
+}
+
+export fn (v: *Version) string() -> str {
+  s := str(v.major) + "." + str(v.minor) + "." + str(v.patch)
+  if v.pre != "" { s = s + "-" + v.pre }
+  return s
+}
+
+# <0, 0, >0 like a - b; a pre-release comes before its release (1.0.0-beta < 1.0.0)
+export fn compare_versions(a: *Version, b: *Version) -> int {
+  if a.major != b.major { return a.major - b.major }
+  if a.minor != b.minor { return a.minor - b.minor }
+  if a.patch != b.patch { return a.patch - b.patch }
+  if a.pre == b.pre { return 0 }
+  if a.pre == "" { return 1 }
+  if b.pre == "" { return -1 }
+  if a.pre < b.pre { return -1 }
+  return 1
+}
+
+fn cmp_text(a: str, b: str) -> int {
+  va, _ := parse_version(a)
+  vb, _ := parse_version(b)
+  return compare_versions(va, vb)
+}
+
+# ---------------------------------------------------------------- names
+
+# a package name is "github.com/<owner>/<repo>" with letters, digits, ".", "-", "_"
+export fn check_name(name: str) -> error {
+  parts := strings.split(name, "/")
+  if len(parts) != 3 || parts[0] != "github.com" {
+    return errors.New("invalid package name \"" + name + "\" (expected github.com/owner/repository)")
+  }
+  for _, p := range parts[1:] {
+    if p == "" || p == "." || p == ".." { return errors.New("invalid package name \"" + name + "\"") }
+    for i := 0; i < len(p); i++ {
+      c := int(p[i])
+      ok := (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 46 || c == 45 || c == 95
+      if !ok { return errors.New("invalid package name \"" + name + "\" (character \"" + p[i:i + 1] + "\")") }
+    }
+  }
+  return nil
+}
+
+# ---------------------------------------------------------------- caju.toml
+
+export struct Dep {
+  name: str
+  version: str     # the minimum version
+}
+
+export struct Manifest {
+  dir: str
+  name: str
+  version: str
+  description: str
+  license: str
+  authors: []str
+  entry: str       # the file imported by `import "<name>"` (default: <repo>.caju)
+  caju: str        # the minimum version of the compiler, or ""
+  deps: []*Dep     # in the order of caju.toml
+}
+
+fn toml_str(t: *toml.Value, key: str, file: str) -> (str, error) {
+  v := t.get(key)
+  if v == nil { return "", nil }
+  if v.kind != "string" { return "", errors.New(file + ": " + key + " must be a string") }
+  return v.s, nil
+}
+
+# reads <dir>/caju.toml
+export fn read_manifest(dir: str) -> (*Manifest, error) {
+  file := path.join(dir, "caju.toml")
+  src, err := os.read_file(file)
+  if err != nil { return nil, errors.New("cannot read " + file + ": " + err.Error()) }
+  doc, err2 := toml.parse(src)
+  if err2 != nil { return nil, errors.New(file + ": " + err2.Error()) }
+  m := &Manifest{dir: dir, authors: []str{}, deps: []*Dep{}}
+  pkg := doc.get("package")
+  if pkg == nil || pkg.kind != "table" { return nil, errors.New(file + ": missing [package] table") }
+  err = nil
+  m.name, err = toml_str(pkg, "name", file)
+  if err != nil { return nil, err }
+  m.version, err = toml_str(pkg, "version", file)
+  if err != nil { return nil, err }
+  m.description, err = toml_str(pkg, "description", file)
+  if err != nil { return nil, err }
+  m.license, err = toml_str(pkg, "license", file)
+  if err != nil { return nil, err }
+  m.entry, err = toml_str(pkg, "entry", file)
+  if err != nil { return nil, err }
+  m.caju, err = toml_str(pkg, "caju", file)
+  if err != nil { return nil, err }
+  if m.name == "" { return nil, errors.New(file + ": [package] needs a name") }
+  err = check_name(m.name)
+  if err != nil { return nil, errors.New(file + ": " + err.Error()) }
+  if m.version == "" { m.version = "0.0.0" }
+  _, err = parse_version(m.version)
+  if err != nil { return nil, errors.New(file + ": " + err.Error()) }
+  if m.entry == "" { m.entry = path.base(m.name) + ".caju" }
+  if m.caju != "" {
+    _, err = parse_version(m.caju)
+    if err != nil { return nil, errors.New(file + ": caju: " + err.Error()) }
+  }
+  au := pkg.get("authors")
+  if au != nil {
+    if au.kind != "array" { return nil, errors.New(file + ": authors must be a list of strings") }
+    for _, a := range au.items {
+      if a.kind != "string" { return nil, errors.New(file + ": authors must be a list of strings") }
+      m.authors = append(m.authors, a.s)
+    }
+  }
+  deps := doc.get("dependencies")
+  if deps != nil {
+    if deps.kind != "table" { return nil, errors.New(file + ": [dependencies] must be a table") }
+    for _, k := range deps.keys {
+      v := deps.fields[k]
+      if v.kind != "string" { return nil, errors.New(file + ": the version of " + k + " must be a string, like \"1.2.0\"") }
+      err = check_name(k)
+      if err != nil { return nil, errors.New(file + ": " + err.Error()) }
+      _, err = parse_version(v.s)
+      if err != nil { return nil, errors.New(file + ": " + k + ": " + err.Error()) }
+      if k == m.name { return nil, errors.New(file + ": a package cannot depend on itself") }
+      m.deps = append(m.deps, &Dep{name: k, version: strings.trim_prefix(v.s, "v")})
+    }
+  }
+  return m, nil
+}
+
+# caju.toml with [dependencies] "name" set to version (added, or changed in place); the rest of
+# the file (comments, order) is kept
+export fn set_dependency(src: str, name: str, version: str) -> str {
+  line := toml.key_text(name) + " = \"" + version + "\""
+  lines := strings.split(src, "\n")
+  start, end := dep_section(lines)
+  if start < 0 {
+    s := strings.trim_suffix(src, "\n")
+    return s + "\n\n[dependencies]\n" + line + "\n"
+  }
+  for i := start + 1; i < end; i++ {
+    if dep_key(lines[i]) == name {
+      lines[i] = line
+      return strings.join(lines, "\n")
+    }
+  }
+  # after the last non-empty line of the section
+  at := end
+  while at > start + 1 && strings.trim_space(lines[at - 1]) == "" { at-- }
+  out := []str{}
+  for i := 0; i < at; i++ { out = append(out, lines[i]) }
+  out = append(out, line)
+  for i := at; i < len(lines); i++ { out = append(out, lines[i]) }
+  return strings.join(out, "\n")
+}
+
+# caju.toml without the dependency name; "" in found if it was not there
+export fn remove_dependency(src: str, name: str) -> (out: str, found: bool) {
+  lines := strings.split(src, "\n")
+  start, end := dep_section(lines)
+  if start < 0 { return src, false }
+  kept := []str{}
+  for i, l := range lines {
+    if i > start && i < end && dep_key(l) == name {
+      found = true
+      continue
+    }
+    kept = append(kept, l)
+  }
+  return strings.join(kept, "\n"), found
+}
+
+# the line of the [dependencies] header and the line where the section ends
+fn dep_section(lines: []str) -> (int, int) {
+  start := -1
+  for i, l := range lines {
+    t := strings.trim_space(l)
+    if start < 0 {
+      if t == "[dependencies]" { start = i }
+      continue
+    }
+    if strings.has_prefix(t, "[") { return start, i }
+  }
+  return start, len(lines)
+}
+
+# the key of a `key = value` line ("" if the line is not one)
+fn dep_key(l: str) -> str {
+  t := strings.trim_space(l)
+  eq := strings.index(t, "=")
+  if eq <= 0 { return "" }
+  k := strings.trim_space(t[0:eq])
+  if len(k) >= 2 && (k[0] == 34 || k[0] == 39) { k = k[1:len(k) - 1] }
+  return k
+}
+
+# ---------------------------------------------------------------- caju.lock
+
+export struct Locked {
+  name: str
+  version: str
+  source: str
+  commit: str
+  hash: str
+  deps: []str      # "name@minimum" as its caju.toml says
+}
+
+export struct Lock {
+  requires: []str  # the project's dependencies ("name@version") when the lock was written
+  pkgs: []*Locked  # sorted by name
+}
+
+export fn read_lock(file: str) -> (*Lock, error) {
+  src, err := os.read_file(file)
+  if err != nil { return nil, err }
+  doc, err2 := toml.parse(src)
+  if err2 != nil { return nil, errors.New(file + ": " + err2.Error()) }
+  lk := &Lock{requires: []str{}, pkgs: []*Locked{}}
+  v := doc.get("version")
+  if v == nil || v.kind != "int" || v.i != LOCK_VERSION { return nil, errors.New(file + ": unknown lock version (expected version = 1)") }
+  req := doc.get("requires")
+  if req != nil { for _, r := range req.items { lk.requires = append(lk.requires, r.s) } }
+  ps := doc.get("package")
+  if ps != nil {
+    for _, p := range ps.items {
+      l := &Locked{deps: []str{}}
+      l.name, _ = toml_str(p, "name", file)
+      l.version, _ = toml_str(p, "version", file)
+      l.source, _ = toml_str(p, "source", file)
+      l.commit, _ = toml_str(p, "commit", file)
+      l.hash, _ = toml_str(p, "hash", file)
+      ds := p.get("dependencies")
+      if ds != nil { for _, d := range ds.items { l.deps = append(l.deps, d.s) } }
+      if l.name == "" || l.version == "" || l.hash == "" { return nil, errors.New(file + ": a [[package]] needs name, version and hash") }
+      lk.pkgs = append(lk.pkgs, l)
+    }
+  }
+  return lk, nil
+}
+
+fn str_array(xs: []str) -> *toml.Value {
+  a := toml.new_array()
+  for _, x := range xs { a.items = append(a.items, toml.new_string(x)) }
+  return a
+}
+
+export fn encode_lock(lk: *Lock) -> str {
+  doc := toml.new_table()
+  doc.set("version", toml.new_int(LOCK_VERSION))
+  doc.set("requires", str_array(lk.requires))
+  arr := toml.new_array()
+  for _, l := range lk.pkgs {
+    t := toml.new_table()
+    t.set("name", toml.new_string(l.name))
+    t.set("version", toml.new_string(l.version))
+    t.set("source", toml.new_string(l.source))
+    t.set("commit", toml.new_string(l.commit))
+    t.set("hash", toml.new_string(l.hash))
+    t.set("dependencies", str_array(l.deps))
+    arr.items = append(arr.items, t)
+  }
+  if len(lk.pkgs) > 0 { doc.set("package", arr) }
+  return "# Written by `caju pkg`; do not edit. It pins the exact version, commit and hash of every\n# package the project uses, directly or not.\n" + toml.encode(doc)
+}
+
+fn requires_of(m: *Manifest) -> []str {
+  out := []str{}
+  for _, d := range m.deps { out = append(out, d.name + "@" + d.version) }
+  return out
+}
+
+fn same_list(a: []str, b: []str) -> bool {
+  if len(a) != len(b) { return false }
+  for i := range a { if a[i] != b[i] { return false } }
+  return true
+}
+
+# ---------------------------------------------------------------- the cache and downloads
+
+# $CAJU_HOME, or ~/.caju
+export fn home() -> str {
+  h := os.getenv("CAJU_HOME")
+  if h != "" { return h }
+  return path.join(os.getenv("HOME"), ".caju")
+}
+
+export fn cache_dir(name: str, version: str) -> str { return path.join_all([]str{home(), "pkg", name + "@" + version}) }
+
+# where git downloads a package from: https://github.com/owner/repo, or $CAJU_PKG_SOURCE/<name>
+# (a mirror or local copies, used by the tests)
+export fn source_url(name: str) -> str {
+  s := os.getenv("CAJU_PKG_SOURCE")
+  if s != "" { return path.join(s, name) }
+  return "https://" + name
+}
+
+# the hash of a package directory: SHA-256 of the list "<sha256 of file>  <path>\n" of every file
+# (sorted by path, .git left out; a symbolic link counts as the text "symlink <target>").
+# Written as "sha256:<hex>". It depends only on the files, not on git.
+export fn hash_dir(dir: str) -> (str, error) {
+  files, err := fs.walk_files(dir)
+  if err != nil { return "", err }
+  list := strings.Builder{}
+  for _, f := range files {
+    if f == ".git" || strings.has_prefix(f, ".git/") { continue }
+    p := path.join(dir, f)
+    fi, err2 := fs.lstat(p)
+    if err2 != nil { return "", err2 }
+    data := ""
+    if fi.is_symlink {
+      t, err3 := fs.readlink(p)
+      if err3 != nil { return "", err3 }
+      data = "symlink " + t
+    } else {
+      d, err3 := os.read_file(p)
+      if err3 != nil { return "", err3 }
+      data = d
+    }
+    list.write(crypto.sha256_hex(data))
+    list.write("  ")
+    list.write(f)
+    list.write("\n")
+  }
+  return "sha256:" + crypto.sha256_hex(list.string()), nil
+}
+
+fn git(args: []str) -> (str, error) {
+  argv := []str{"git"}
+  for _, a := range args { argv = append(argv, a) }
+  p, err := os.run(argv, nil, true)
+  if err != nil { return "", errors.New("git is needed to download packages: " + err.Error()) }
+  if p.code != 0 { return "", errors.New(strings.trim_space(p.output)) }
+  return strings.trim_space(p.output), nil
+}
+
+# the release versions (tags vX.Y.Z) of a package, from the newest
+export fn remote_versions(name: str) -> ([]str, error) {
+  out, err := git([]str{"ls-remote", "--tags", "--refs", source_url(name)})
+  if err != nil { return nil, errors.New("cannot list the versions of " + name + ": " + err.Error()) }
+  vs := []str{}
+  for _, line := range strings.split(out, "\n") {
+    i := strings.index(line, "refs/tags/v")
+    if i < 0 { continue }
+    t := line[i + 10:]
+    v, err2 := parse_version(t)
+    if err2 == nil && v.string() == t[1:] { vs = append(vs, v.string()) }
+  }
+  # sort, newest first (insertion sort: tag lists are short)
+  for i := 1; i < len(vs); i++ {
+    j := i
+    while j > 0 && cmp_text(vs[j - 1], vs[j]) < 0 {
+      t := vs[j]
+      vs[j] = vs[j - 1]
+      vs[j - 1] = t
+      j--
+    }
+  }
+  return vs, nil
+}
+
+# the newest release that is not a pre-release (or the newest of all if there is none)
+export fn latest_version(name: str) -> (str, error) {
+  vs, err := remote_versions(name)
+  if err != nil { return "", err }
+  if len(vs) == 0 { return "", errors.New(name + " has no releases (git tags like v1.0.0)") }
+  for _, v := range vs { if strings.index(v, "-") < 0 { return v, nil } }
+  return vs[0], nil
+}
+
+export struct Fetched {
+  dir: str
+  commit: str
+  hash: str
+}
+
+# the cached copy of name@version, downloading it if needed. want_commit / want_hash ("" = not
+# known yet) come from caju.lock: a copy that does not match them is an error.
+export fn fetch(name: str, version: str, want_commit: str, want_hash: str) -> (*Fetched, error) {
+  dst := cache_dir(name, version)
+  info := dst + ".info"
+  if fs.is_dir(dst) && os.exists(info) {
+    h, err := hash_dir(dst)
+    if err != nil { return nil, err }
+    src, _ := os.read_file(info)
+    commit := strings.trim_space(src)
+    if want_hash != "" && h != want_hash {
+      return nil, errors.New("checksum mismatch for " + name + "@" + version + " in the cache " + dst + "\n  caju.lock: " + want_hash + "\n  files:     " + h + "\nThe cached files were changed. Delete that directory and run caju pkg install to download it again.")
+    }
+    return &Fetched{dir: dst, commit: commit, hash: h}, nil
+  }
+  os.stderr("downloading " + name + "@" + version + "\n")
+  err := fs.mkdir_all(path.join(home(), "tmp"), 0o755)
+  if err != nil { return nil, err }
+  tmp, err2 := fs.temp_dir(path.join(home(), "tmp"), "dl-")
+  if err2 != nil { return nil, err2 }
+  defer fs.remove_all(tmp)
+  src := path.join(tmp, "src")
+  _, err = git([]str{"-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1", "--branch", "v" + version, source_url(name), src})
+  if err != nil { return nil, errors.New("cannot download " + name + "@" + version + " (git tag v" + version + " of " + source_url(name) + "): " + err.Error()) }
+  commit, err3 := git([]str{"-C", src, "rev-parse", "HEAD"})
+  if err3 != nil { return nil, err3 }
+  err = fs.remove_all(path.join(src, ".git"))
+  if err != nil { return nil, err }
+  h, err4 := hash_dir(src)
+  if err4 != nil { return nil, err4 }
+  if want_commit != "" && commit != want_commit {
+    return nil, errors.New("the tag v" + version + " of " + name + " has moved\n  caju.lock: commit " + want_commit + "\n  now:       commit " + commit + "\nA published version must not change. If you trust the new content, remove the package from caju.lock and install again.")
+  }
+  if want_hash != "" && h != want_hash {
+    return nil, errors.New("checksum mismatch for " + name + "@" + version + "\n  caju.lock:  " + want_hash + "\n  downloaded: " + h + "\nThe downloaded files are not the ones the lock was made with.")
+  }
+  err = fs.mkdir_all(path.dir(dst), 0o755)
+  if err != nil { return nil, err }
+  err = fs.rename(src, dst)
+  if err != nil { return nil, err }
+  err = os.write_file(info, commit + "\n", 0o644)
+  if err != nil { return nil, err }
+  return &Fetched{dir: dst, commit: commit, hash: h}, nil
+}
+
+# ---------------------------------------------------------------- resolving
+
+struct Want {
+  name: str
+  version: str
+  by: str          # who asks for it ("name@version" or the project's name)
+}
+
+struct Resolver {
+  pins: map[str]*Locked         # name@version -> entry of the old caju.lock
+  seen: map[str]*Locked         # name@version -> what we found
+  selected: map[str]str         # name -> chosen version
+  asked: map[str][]str          # name -> "version (by)" for error messages
+}
+
+# minimal version selection over the whole graph: every version asked for anywhere is visited
+# (its dependencies count too), and each package ends at the highest version asked for
+fn resolve(m: *Manifest, old: *Lock) -> (*Lock, error) {
+  r := &Resolver{pins: map[str]*Locked{}, seen: map[str]*Locked{}, selected: map[str]str{}, asked: map[str][]str{}}
+  if old != nil { for _, l := range old.pkgs { r.pins[l.name + "@" + l.version] = l } }
+  queue := []*Want{}
+  for _, d := range m.deps { queue = append(queue, &Want{name: d.name, version: d.version, by: m.name}) }
+  i := 0
+  while i < len(queue) {
+    w := queue[i]
+    i++
+    if w.name == m.name { return nil, errors.New(w.by + " depends on " + m.name + ", the project itself") }
+    r.asked[w.name] = append(r.asked[w.name], w.version + " (by " + w.by + ")")
+    cur, has := r.selected[w.name]
+    if !has || cmp_text(w.version, cur) > 0 {
+      if has {
+        a, _ := parse_version(cur)
+        b, _ := parse_version(w.version)
+        if a.major != b.major { return nil, errors.New(w.name + " is needed in different major versions: " + strings.join(r.asked[w.name], ", ") + "; they are not compatible") }
+      }
+      r.selected[w.name] = w.version
+    } else {
+      a, _ := parse_version(cur)
+      b, _ := parse_version(w.version)
+      if a.major != b.major { return nil, errors.New(w.name + " is needed in different major versions: " + strings.join(r.asked[w.name], ", ") + "; they are not compatible") }
+    }
+    key := w.name + "@" + w.version
+    if _, ok := r.seen[key]; ok { continue }
+    pin := r.pins[key]
+    want_commit := ""
+    want_hash := ""
+    if pin != nil {
+      want_commit = pin.commit
+      want_hash = pin.hash
+    }
+    f, err := fetch(w.name, w.version, want_commit, want_hash)
+    if err != nil { return nil, err }
+    dm, err2 := read_manifest(f.dir)
+    if err2 != nil { return nil, errors.New(w.name + "@" + w.version + ": " + err2.Error()) }
+    if dm.name != w.name { return nil, errors.New(w.name + "@" + w.version + ": its caju.toml says the name is " + dm.name) }
+    if dm.caju != "" && cmp_text(dm.caju, VERSION) > 0 { return nil, errors.New(w.name + "@" + w.version + " needs caju " + dm.caju + " or newer (this is " + VERSION + ")") }
+    if dm.version != w.version { return nil, errors.New(w.name + ": the tag v" + w.version + " has version = \"" + dm.version + "\" in its caju.toml") }
+    l := &Locked{name: w.name, version: w.version, source: source_url(w.name), commit: f.commit, hash: f.hash, deps: requires_of(dm)}
+    if os.getenv("CAJU_PKG_SOURCE") != "" { l.source = "https://" + w.name }
+    r.seen[key] = l
+    for _, d := range dm.deps { queue = append(queue, &Want{name: d.name, version: d.version, by: key}) }
+  }
+  names := []str{}
+  for n, _ := range r.selected { names = append(names, n) }
+  sort_strs(names)
+  lk := &Lock{requires: requires_of(m), pkgs: []*Locked{}}
+  for _, n := range names { lk.pkgs = append(lk.pkgs, r.seen[n + "@" + r.selected[n]]) }
+  return lk, nil
+}
+
+fn sort_strs(xs: []str) {
+  for i := 1; i < len(xs); i++ {
+    j := i
+    while j > 0 && xs[j] < xs[j - 1] {
+      t := xs[j]
+      xs[j] = xs[j - 1]
+      xs[j - 1] = t
+      j--
+    }
+  }
+}
+
+# ---------------------------------------------------------------- the project
+
+# the directory with caju.toml that holds dir (dir itself or a parent), or ""
+export fn find_root(dir: str) -> str {
+  d := path.abs(dir)
+  while true {
+    if os.exists(path.join(d, "caju.toml")) { return d }
+    if d == "/" { return "" }
+    d = path.dir(d)
+  }
+  return ""
+}
+
+# makes sure every package in caju.lock is in the cache with the right hash, resolving again if
+# caju.toml changed since the lock was written; writes caju.lock when it changes
+export fn install(root: str) -> (*Lock, error) {
+  m, err := read_manifest(root)
+  if err != nil { return nil, err }
+  lock_file := path.join(root, "caju.lock")
+  let old: *Lock = nil
+  if os.exists(lock_file) {
+    lk, err2 := read_lock(lock_file)
+    if err2 != nil { return nil, err2 }
+    old = lk
+  }
+  if old != nil && same_list(old.requires, requires_of(m)) {
+    for _, l := range old.pkgs {
+      _, err3 := fetch(l.name, l.version, l.commit, l.hash)
+      if err3 != nil { return nil, err3 }
+    }
+    return old, nil
+  }
+  lk, err4 := resolve(m, old)
+  if err4 != nil { return nil, err4 }
+  err = os.write_file(lock_file, encode_lock(lk), 0o644)
+  if err != nil { return nil, err }
+  return lk, nil
+}
+
+# the packages a program can import, for the compiler: nil if the program is not in a project
+# with dependencies. Checks that caju.lock is up to date and that the cached files match it.
+export fn packages_for(entry: str) -> (map[str]*project.Package, error) {
+  root := find_root(path.dir(path.abs(entry)))
+  if root == "" { return nil, nil }
+  m, err := read_manifest(root)
+  if err != nil { return nil, err }
+  pkgs := map[str]*project.Package{}
+  if len(m.deps) == 0 { return pkgs, nil }
+  lock_file := path.join(root, "caju.lock")
+  if !os.exists(lock_file) { return nil, errors.New("caju.toml has dependencies but there is no caju.lock; run caju pkg install") }
+  lk, err2 := read_lock(lock_file)
+  if err2 != nil { return nil, err2 }
+  if !same_list(lk.requires, requires_of(m)) { return nil, errors.New("caju.lock is out of date with caju.toml; run caju pkg install") }
+  for _, l := range lk.pkgs {
+    dir := cache_dir(l.name, l.version)
+    if !fs.is_dir(dir) { return nil, errors.New(l.name + "@" + l.version + " is not installed; run caju pkg install") }
+    h, err3 := hash_dir(dir)
+    if err3 != nil { return nil, err3 }
+    if h != l.hash {
+      return nil, errors.New("checksum mismatch for " + l.name + "@" + l.version + " in " + dir + "\n  caju.lock: " + l.hash + "\n  files:     " + h + "\nThe cached files were changed. Delete that directory and run caju pkg install.")
+    }
+    pm, err4 := read_manifest(dir)
+    if err4 != nil { return nil, err4 }
+    pkgs[l.name] = &project.Package{name: l.name, dir: dir, entry: pm.entry}
+  }
+  return pkgs, nil
+}
+
+# ---------------------------------------------------------------- the command
+
+fn die(msg: str) {
+  os.eprintln("caju pkg: " + msg)
+  os.exit(1)
+}
+
+fn pkg_usage() {
+  os.stderr("usage:\n  caju pkg init [name]               create caju.toml (name: github.com/owner/repo)\n  caju pkg add name[@version]         add a dependency (default: the latest release)\n  caju pkg remove name                remove a dependency\n  caju pkg update [name]              move dependencies to their latest release\n  caju pkg install                    download what caju.lock lists (resolving again if caju.toml changed)\n  caju pkg verify                     check the cached packages against the hashes in caju.lock\n  caju pkg tree                       show the dependency tree\n  caju pkg hash [dir]                 the hash of a package directory\n")
+  os.exit(2)
+}
+
+fn project_root() -> str {
+  r := find_root(".")
+  if r == "" { die("no caju.toml here or in a parent directory (create one with caju pkg init)") }
+  return r
+}
+
+fn do_install(root: str) {
+  lk, err := install(root)
+  if err != nil { die(err.Error()) }
+  print(str(len(lk.pkgs)) + " packages ok")
+}
+
+fn edit_manifest(root: str, f: fn(str) -> str) {
+  file := path.join(root, "caju.toml")
+  src, err := os.read_file(file)
+  if err != nil { die(err.Error()) }
+  err = os.write_file(file, f(src), 0o644)
+  if err != nil { die(err.Error()) }
+}
+
+fn cmd_init(args: []str) {
+  if os.exists("caju.toml") { die("caju.toml already exists") }
+  name := ""
+  if len(args) > 0 { name = args[0] } else {
+    out, err := git([]str{"remote", "get-url", "origin"})
+    if err == nil {
+      u := strings.trim_suffix(out, ".git")
+      u = strings.replace_all(u, "git@github.com:", "github.com/")
+      u = strings.trim_prefix(u, "https://")
+      name = u
+    }
+  }
+  if name == "" { die("give the package name: caju pkg init github.com/owner/repo") }
+  err := check_name(name)
+  if err != nil { die(err.Error()) }
+  src := "[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\ndescription = \"\"\nlicense = \"\"\nauthors = []\n\n[dependencies]\n"
+  err = os.write_file("caju.toml", src, 0o644)
+  if err != nil { die(err.Error()) }
+  print("created caju.toml for " + name)
+}
+
+fn split_at(spec: str) -> (str, str) {
+  i := strings.index(spec, "@")
+  if i < 0 { return spec, "" }
+  return spec[0:i], strings.trim_prefix(spec[i + 1:], "v")
+}
+
+fn cmd_add(args: []str) {
+  if len(args) != 1 { pkg_usage() }
+  root := project_root()
+  name, version := split_at(args[0])
+  err := check_name(name)
+  if err != nil { die(err.Error()) }
+  if version == "" {
+    v, err2 := latest_version(name)
+    if err2 != nil { die(err2.Error()) }
+    version = v
+  }
+  _, err = parse_version(version)
+  if err != nil { die(err.Error()) }
+  m, err3 := read_manifest(root)
+  if err3 != nil { die(err3.Error()) }
+  if name == m.name { die("a package cannot depend on itself") }
+  file := path.join(root, "caju.toml")
+  before, _ := os.read_file(file)
+  edit_manifest(root, fn(src: str) -> str { return set_dependency(src, name, version) })
+  lk, err4 := install(root)
+  if err4 != nil {
+    os.write_file(file, before, 0o644)          # leave caju.toml as it was
+    die(err4.Error())
+  }
+  print("added " + name + "@" + version + "; " + str(len(lk.pkgs)) + " packages ok")
+}
+
+fn cmd_remove(args: []str) {
+  if len(args) != 1 { pkg_usage() }
+  root := project_root()
+  name := args[0]
+  file := path.join(root, "caju.toml")
+  src, err := os.read_file(file)
+  if err != nil { die(err.Error()) }
+  out, found := remove_dependency(src, name)
+  if !found { die(name + " is not in [dependencies]") }
+  err = os.write_file(file, out, 0o644)
+  if err != nil { die(err.Error()) }
+  lk, err2 := install(root)
+  if err2 != nil {
+    os.write_file(file, src, 0o644)              # leave caju.toml as it was
+    die(err2.Error())
+  }
+  print("removed " + name + "; " + str(len(lk.pkgs)) + " packages ok")
+}
+
+fn cmd_update(args: []str) {
+  root := project_root()
+  m, err := read_manifest(root)
+  if err != nil { die(err.Error()) }
+  changed := 0
+  for _, d := range m.deps {
+    if len(args) > 0 && args[0] != d.name { continue }
+    v, err2 := latest_version(d.name)
+    if err2 != nil { die(err2.Error()) }
+    if v != d.version {
+      print(d.name + " " + d.version + " -> " + v)
+      edit_manifest(root, fn(src: str) -> str { return set_dependency(src, d.name, v) })
+      changed++
+    }
+  }
+  if len(args) > 0 && changed == 0 {
+    found := false
+    for _, d := range m.deps { if d.name == args[0] { found = true } }
+    if !found { die(args[0] + " is not in [dependencies]") }
+  }
+  do_install(root)
+}
+
+fn cmd_verify() {
+  root := project_root()
+  lk, err := read_lock(path.join(root, "caju.lock"))
+  if err != nil { die(err.Error()) }
+  bad := 0
+  for _, l := range lk.pkgs {
+    dir := cache_dir(l.name, l.version)
+    if !fs.is_dir(dir) {
+      print("missing  " + l.name + "@" + l.version + " (run caju pkg install)")
+      bad++
+      continue
+    }
+    h, err2 := hash_dir(dir)
+    if err2 != nil { die(err2.Error()) }
+    if h == l.hash { print("ok       " + l.name + "@" + l.version + " " + h) } else {
+      print("MISMATCH " + l.name + "@" + l.version + "\n  caju.lock: " + l.hash + "\n  files:     " + h)
+      bad++
+    }
+  }
+  if bad > 0 { os.exit(1) }
+}
+
+fn cmd_tree() {
+  root := project_root()
+  m, err := read_manifest(root)
+  if err != nil { die(err.Error()) }
+  lk, err2 := read_lock(path.join(root, "caju.lock"))
+  if err2 != nil { die("no caju.lock (run caju pkg install)") }
+  chosen := map[str]*Locked{}
+  for _, l := range lk.pkgs { chosen[l.name] = l }
+  print(m.name + "@" + m.version)
+  tree_level(requires_of(m), chosen, "", map[str]bool{})
+}
+
+fn tree_level(reqs: []str, chosen: map[str]*Locked, indent: str, path_: map[str]bool) {
+  for i, r := range reqs {
+    name, min := split_at(r)
+    last := i == len(reqs) - 1
+    branch := "├── "
+    next := "│   "
+    if last {
+      branch = "└── "
+      next = "    "
+    }
+    l := chosen[name]
+    if l == nil {
+      print(indent + branch + r + " (not in caju.lock)")
+      continue
+    }
+    note := ""
+    if l.version != min { note = " (needs " + min + ")" }
+    print(indent + branch + name + "@" + l.version + note)
+    if path_[name] { continue }
+    path_[name] = true
+    tree_level(l.deps, chosen, indent + next, path_)
+    delete(path_, name)
+  }
+}
+
+export fn command(args: []str) {
+  if len(args) == 0 { pkg_usage() }
+  sub := args[0]
+  rest := args[1:]
+  if sub == "init" { cmd_init(rest) } else if sub == "add" { cmd_add(rest) } else if sub == "remove" { cmd_remove(rest) } else if sub == "update" { cmd_update(rest) } else if sub == "install" {
+    do_install(project_root())
+  } else if sub == "verify" { cmd_verify() } else if sub == "tree" { cmd_tree() } else if sub == "hash" {
+    dir := "."
+    if len(rest) > 0 { dir = rest[0] }
+    h, err := hash_dir(dir)
+    if err != nil { die(err.Error()) }
+    print(h)
+  } else { pkg_usage() }
+}

@@ -1,0 +1,123 @@
+# Closures, function values, bound methods and multiple results in the native compiler
+# (migrated from tests/native/closures.caju).
+import { describe, it, expect } from "std/testing"
+
+fn generator() -> fn() -> fn() -> int {
+  base := 100
+  return fn() -> fn() -> int {
+    k := 0
+    return fn() -> int {
+      k++
+      base++
+      return base * 10 + k
+    }
+  }
+}
+
+fn adjust(n: int) -> fn() -> int {
+  return fn() -> int { n *= 2; return n }
+}
+
+struct Stack { items: []int }
+fn (p: *Stack) push(x: int) { p.items = append(p.items, x) }
+fn (p: Stack) top() -> int { return p.items[len(p.items) - 1] }
+
+struct Pair { a: int, b: str }
+fn two() -> (int, str) { return 7, "seven" }
+
+fn apply(f: fn(any) -> any, x: any) -> any { return f(x) }
+
+fn sum(ns: []int) -> (total: int, n: int) {
+  for _, x := range ns { total += x }
+  n = len(ns)
+  return total, n
+}
+fn average(ns: []int) -> num {
+  t, n := sum(ns)
+  return num(t) / num(n)
+}
+
+describe("closures", fn() {
+  it("share captured variables between the closures made by the same call", fn() {
+    g := generator()
+    a := g()
+    b := g()
+    expect([]int{a(), a(), b(), a()}).to_equal([]int{1011, 1022, 1031, 1043})
+  })
+  it("can call themselves through a variable declared before", fn() {
+    let fact: fn(int) -> int = nil
+    fact = fn(n: int) -> int {
+      if n <= 1 { return 1 }
+      return n * fact(n - 1)
+    }
+    expect(fact(10)).to_equal(3628800)
+  })
+  it("keep changing a captured parameter", fn() {
+    d := adjust(3)
+    expect([]int{d(), d(), d()}).to_equal([]int{6, 12, 24})
+  })
+  it("update a variable of the enclosing function", fn() {
+    count := 0
+    incr := fn() { count++ }
+    for i := 0; i < 5; i++ { incr() }
+    expect(count).to_equal(5)
+  })
+  it("capture a fresh loop variable on each iteration", fn() {
+    let fs: []fn() -> int = nil
+    for i := 0; i < 3; i++ {
+      j := i * i
+      fs = append(fs, fn() -> int { return i + j })
+    }
+    got := []int{}
+    for _, f := range fs { got = append(got, f()) }
+    expect(got).to_equal([]int{0, 2, 6})
+    fs2 := []fn() -> int{}
+    for i := range 3 { fs2 = append(fs2, fn() -> int { return i }) }
+    got2 := []int{}
+    for _, f2 := range fs2 { got2 = append(got2, f2()) }
+    expect(got2).to_equal([]int{0, 1, 2})
+  })
+  it("take untyped values through any", fn() {
+    expect(apply(fn(v: any) -> any { return v + v }, 21)).to_equal(42)
+    expect(apply(fn(v: any) -> any { return v + "!" }, "hi")).to_equal("hi!")
+  })
+})
+
+describe("bound methods", fn() {
+  it("keep the pointer receiver, and copy a value receiver when bound", fn() {
+    pl := &Stack{}
+    push := pl.push
+    push(1)
+    push(2)
+    tp := pl.top
+    push(3)
+    expect(pl.items).to_equal([]int{1, 2, 3})
+    expect(tp()).to_equal(2)
+    expect(pl.top()).to_equal(3)
+  })
+})
+
+describe("multiple results", fn() {
+  it("can be assigned to struct fields and map entries", fn() {
+    let pr: Pair = Pair{}
+    let mp: map[str]int = map[str]int{}
+    pr.a, pr.b = two()
+    mp["x"], pr.b = two()
+    expect(pr).to_equal(Pair{7, "seven"})
+    expect(mp).to_equal(map[str]int{"x": 7})
+  })
+  it("work with named results", fn() {
+    t, n := sum([]int{1, 2, 3, 4})
+    expect([]int{t, n}).to_equal([]int{10, 4})
+    expect(average([]int{1, 2, 3, 4})).to_equal(2.5)
+  })
+})
+
+describe("struct values in any", fn() {
+  it("compare by contents, and a pointer differs from a value", fn() {
+    let xs: []any = []any{Pair{1, "a"}, Pair{1, "a"}, &Pair{2, "b"}}
+    expect(xs[0] == xs[1]).to_be_true()
+    expect(xs[1] == xs[2]).to_be_false()
+    expect(str(xs)).to_equal("[Pair{a: 1, b: \"a\"} Pair{a: 1, b: \"a\"} &Pair{a: 2, b: \"b\"}]")
+  })
+})

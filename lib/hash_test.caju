@@ -1,0 +1,36 @@
+import "std/hash"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+let inputs = []str{"", "a", "abc", "123456789", "The quick brown fox jumps over the lazy dog", strings.repeat("caju", 10000)}
+
+describe("hash.crc32", fn() {
+  it("matches the IEEE checksums of known texts", fn() {
+    got := []int{}
+    for _, s := range inputs { got = append(got, hash.crc32(s)) }
+    expect(got).to_equal([]int{0, 3904355907, 891568578, 3421780262, 1095738169, 3949439318})
+  })
+  it("can be computed in pieces with crc32_update", fn() {
+    s := "The quick brown fox jumps over the lazy dog"
+    expect(hash.crc32_update(hash.crc32(s[0:10]), s[10:])).to_equal(hash.crc32(s))
+  })
+  it("does not change when updated with an empty text", fn() {
+    expect(hash.crc32_update(0, "")).to_equal(0)
+  })
+})
+
+describe("hash.fnv1a32", fn() {
+  it("matches the known values", fn() {
+    got := []int{}
+    for _, s := range inputs { got = append(got, hash.fnv1a32(s)) }
+    expect(got).to_equal([]int{2166136261, 3826002220, 440920331, 3146166556, 76545936, 2677868229})
+  })
+})
+
+describe("hash.fnv1a64", fn() {
+  it("matches the known values (unsigned 64 bits)", fn() {
+    got := []str{}
+    for _, s := range inputs { got = append(got, str(hash.fnv1a64(s))) }
+    expect(got).to_equal([]str{"14695981039346656037", "12638187200555641996", "16654208175385433931", "492395637191921148", "17580284887202820368", "17385840502251825189"})
+  })
+})

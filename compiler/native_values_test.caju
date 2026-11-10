@@ -1,0 +1,227 @@
+# Structs, arrays, slices, maps, pointers and texts in the native compiler
+# (migrated from tests/native/values.caju).
+import { describe, it, expect } from "std/testing"
+
+struct Point { x: int, y: int }
+struct Line { a: Point, b: Point, name: str }
+struct Base { id: int }
+struct Child { Base, tag: str }
+fn (p: Point) sum() -> int { return p.x + p.y }
+fn (p: *Point) move(dx: int) { p.x += dx }
+fn (b: *Base) mark(n: int) { b.id = n }
+fn (b: Base) show() -> str { return "base " + str(b.id) }
+
+fn swap(p: *int, q: *int) { t := *p; *p = *q; *q = t }
+fn zero(xs: []int) { for i := range xs { xs[i] = 0 } }
+fn double(n: int) -> *int { r := n * 2; return &r }
+
+describe("structs", fn() {
+  it("are copied on assignment and compared by contents", fn() {
+    p := Point{x: 1, y: 2}
+    q := p
+    q.x = 10
+    expect(p).to_equal(Point{1, 2})
+    expect(q).to_equal(Point{10, 2})
+    expect(p == q).to_be_false()
+    expect(p != q).to_be_true()
+    expect(p.sum()).to_equal(3)
+  })
+  it("change through pointer methods and pointers", fn() {
+    p := Point{x: 1, y: 2}
+    p.move(5)
+    expect(p).to_equal(Point{6, 2})
+    pp := &p
+    pp.move(1)
+    (*pp).y = 7
+    expect(p).to_equal(Point{7, 7})
+    expect(*pp).to_equal(Point{7, 7})
+    expect(pp.sum()).to_equal(14)
+  })
+  it("nest by value", fn() {
+    p := Point{7, 7}
+    l := Line{a: p, name: "l1"}
+    l.a.x = 99
+    l.b = l.a
+    l.b.y = -1
+    expect(str(l)).to_equal("Line{a: Point{x: 99, y: 7}, b: Point{x: 99, y: -1}, name: \"l1\"}")
+    expect(p).to_equal(Point{7, 7})
+  })
+  it("embed another struct with its fields and methods", fn() {
+    f := Child{Base: Base{id: 3}, tag: "x"}
+    f.mark(8)
+    expect(f.id).to_equal(8)
+    expect(f.show()).to_equal("base 8")
+    expect(str(f)).to_equal("Child{Base: Base{id: 8}, tag: \"x\"}")
+  })
+})
+
+describe("arrays", fn() {
+  it("are values: copies are independent", fn() {
+    let arr: [4]int = [4]int{1, 2}
+    b2 := arr
+    b2[0] = 50
+    expect(str(arr)).to_equal("[1 2 0 0]")
+    expect(str(b2)).to_equal("[50 2 0 0]")
+    expect(len(arr)).to_equal(4)
+    expect(arr == b2).to_be_false()
+    arr[3] += 4
+    arr[1] *= 3
+    expect(str(arr)).to_equal("[1 6 0 4]")
+  })
+  it("share memory with a slice of them", fn() {
+    a3 := [3]int{1, 2, 3}
+    sl := a3[:]
+    sl[0] = 42
+    expect(str(a3)).to_equal("[42 2 3]")
+    expect(sl).to_equal([]int{42, 2, 3})
+  })
+})
+
+describe("slices", fn() {
+  it("hold struct values that change in place but copy when read", fn() {
+    let pts: []Point = []Point{}
+    for i := 0; i < 3; i++ { pts = append(pts, Point{x: i, y: i * i}) }
+    pts[1].x = 100
+    c := pts[2]
+    c.y = 1000
+    expect(str(pts)).to_equal("[Point{x: 0, y: 0} Point{x: 100, y: 1} Point{x: 2, y: 4}]")
+    expect(c).to_equal(Point{2, 1000})
+    for _, v := range pts { v.x = -1 }
+    expect(pts[0].x).to_equal(0)
+  })
+  it("share the array when sliced and appended within capacity", fn() {
+    s := []int{1, 2, 3, 4, 5}
+    t := s[1:3]
+    t = append(t, 40)
+    expect(s).to_equal([]int{1, 2, 3, 40, 5})
+    expect(t).to_equal([]int{2, 3, 40})
+    expect([]int{len(t), cap(t)}).to_equal([]int{3, 4})
+  })
+  it("copy with append(..., s...) and copy()", fn() {
+    s := []int{1, 2, 3, 40, 5}
+    u := append([]int{}, s...)
+    u[0] = 77
+    expect(s[0]).to_equal(1)
+    expect(u[0]).to_equal(77)
+    n := copy(u, []int{9, 9})
+    expect(n).to_equal(2)
+    expect(u).to_equal([]int{9, 9, 3, 40, 5})
+    expect(s[:2]).to_equal([]int{1, 2})
+    expect(s[3:]).to_equal([]int{40, 5})
+    expect(s[:]).to_equal(s)
+  })
+  it("start nil and grow with append", fn() {
+    let ns: []int
+    expect(ns == nil).to_be_true()
+    expect(ns).to_have_length(0)
+    ns = append(ns, 1)
+    expect(ns).to_equal([]int{1})
+    expect(ns == nil).to_be_false()
+  })
+  it("nest", fn() {
+    grid := [][]int{}
+    for i := 0; i < 3; i++ {
+      row := make([]int, 3)
+      for j := 0; j < 3; j++ { row[j] = i * j }
+      grid = append(grid, row)
+    }
+    expect(str(grid)).to_equal("[[0 0 0] [0 1 2] [0 2 4]]")
+  })
+  it("are passed by reference to their elements", fn() {
+    s := []int{1, 2, 3, 40, 5}
+    zero(s)
+    expect(s).to_equal([]int{0, 0, 0, 0, 0})
+  })
+  it("range over an int", fn() {
+    got := []int{}
+    for k := range 3 { got = append(got, k) }
+    expect(got).to_equal([]int{0, 1, 2})
+  })
+})
+
+describe("maps", fn() {
+  it("add, update, look up and delete", fn() {
+    let m: map[str]int = make(map[str]int)
+    m["a"] = 1
+    m["b"] += 5
+    m["a"]++
+    vz, ok := m["z"]
+    w, ok2 := m["b"]
+    expect(m).to_equal(map[str]int{"a": 2, "b": 5})
+    expect(vz).to_equal(0)
+    expect(ok).to_be_false()
+    expect(w).to_equal(5)
+    expect(ok2).to_be_true()
+    expect(len(m)).to_equal(2)
+    delete(m, "a")
+    expect(m).to_equal(map[str]int{"b": 5})
+  })
+  it("have int keys and struct values, with the zero value for a missing key", fn() {
+    mp := map[int]Point{1: Point{x: 1}, 2: Point{y: 2}}
+    expect(str(mp)).to_equal("map[1:Point{x: 1, y: 0} 2:Point{x: 0, y: 2}]")
+    expect(mp[3]).to_equal(Point{0, 0})
+  })
+  it("grow slices stored in them", fn() {
+    idx := map[str][]int{}
+    idx["a"] = append(idx["a"], 1)
+    idx["a"] = append(idx["a"], 2)
+    expect(str(idx)).to_equal("map[\"a\":[1 2]]")
+  })
+})
+
+describe("texts", fn() {
+  it("range over the code points with their byte positions", fn() {
+    txt := "naïve, world"
+    pos := []int{}
+    runes := []int{}
+    for i, r := range txt {
+      pos = append(pos, i)
+      runes = append(runes, int(r))
+    }
+    expect(pos).to_equal([]int{0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12})
+    expect(runes).to_equal([]int{110, 97, 239, 118, 101, 44, 32, 119, 111, 114, 108, 100})
+  })
+  it("convert to bytes and runes", fn() {
+    txt := "naïve, world"
+    bs := []byte(txt)
+    rs := []rune(txt)
+    expect([]int{len(bs), len(rs), int(txt[1])}).to_equal([]int{13, 12, 97})
+    expect(txt[0:2]).to_equal("na")
+    expect(str(bs[0:3])).to_equal("[110 97 195]")
+    expect(str(rs[1:3])).to_equal("[97 239]")
+    expect(str([]byte{0xff, 65, 0xc3})).to_equal("[255 65 195]")
+  })
+})
+
+describe("pointers", fn() {
+  it("can be nil", fn() {
+    let np: *Point = nil
+    expect(np == nil).to_be_true()
+    expect(str(np)).to_equal("nil")
+  })
+  it("come from new and from &", fn() {
+    nn := new(int)
+    *nn = 5
+    *nn += 2
+    expect(*nn).to_equal(7)
+    cnt := 0
+    inc := &cnt
+    *inc = *inc + 3
+    expect(cnt).to_equal(3)
+  })
+  it("let a function change the caller's variables", fn() {
+    aa, bb := 1, 2
+    swap(&aa, &bb)
+    expect([]int{aa, bb}).to_equal([]int{2, 1})
+  })
+  it("to a local variable keep it alive after the function returns", fn() {
+    r1 := double(4)
+    r2 := double(5)
+    expect([]int{*r1, *r2}).to_equal([]int{8, 10})
+  })
+  it("swap with a parallel assignment", fn() {
+    x, y := 1, 2
+    x, y = y, x
+    expect([]int{x, y}).to_equal([]int{2, 1})
+  })
+})

@@ -1,0 +1,572 @@
+# std/crypto: cryptographic hashes (SHA-256, SHA-512, SHA-1, MD5), HMAC, PBKDF2, constant-time
+# comparison and secure random bytes.
+#
+# The digests are binary strings (32 bytes for SHA-256); the *_hex functions give the usual
+# lowercase hexadecimal form. SHA-1 and MD5 are broken for security: use them only to talk to
+# formats and programs that require them (git object names, old checksums), never for new
+# signatures, passwords or integrity against attackers.
+
+import "std/hex"
+
+const M32 = 0xFFFFFFFF
+const SYS_GETRANDOM = 318
+
+# ---------------------------------------------------------------- helpers
+
+fn load_be32(p: int) -> int {
+  return (__load8(p) << 24) | (__load8(p + 1) << 16) | (__load8(p + 2) << 8) | __load8(p + 3)
+}
+fn load_le32(p: int) -> int {
+  return __load8(p) | (__load8(p + 1) << 8) | (__load8(p + 2) << 16) | (__load8(p + 3) << 24)
+}
+fn store_be32(p: int, x: int) {
+  __store8(p, (x >> 24) & 255)
+  __store8(p + 1, (x >> 16) & 255)
+  __store8(p + 2, (x >> 8) & 255)
+  __store8(p + 3, x & 255)
+}
+fn store_le32(p: int, x: int) {
+  __store8(p, x & 255)
+  __store8(p + 1, (x >> 8) & 255)
+  __store8(p + 2, (x >> 16) & 255)
+  __store8(p + 3, (x >> 24) & 255)
+}
+fn store_be64(p: int, x: int) {
+  store_be32(p, (x >> 32) & M32)
+  store_be32(p + 4, x & M32)
+}
+
+# ---------------------------------------------------------------- the block hashers
+#
+# All four hashes share the same Merkle-Damgård frame: a 64- or 128-byte block buffer, a byte
+# count, and a compression function. Hasher keeps that frame; algo picks the compression.
+
+const ALG_SHA256 = 1
+const ALG_SHA512 = 2
+const ALG_SHA1 = 3
+const ALG_MD5 = 4
+
+# Hasher: an incremental hash. Feed it with write() as many times as needed; sum() gives the
+# digest of everything written so far (the hasher can keep receiving data after it).
+export struct Hasher {
+  algo: int
+  block: int        # block size: 64 or 128
+  dsize: int        # digest size in bytes
+  h: []int          # the state (32-bit words in an int, or 64-bit words for SHA-512)
+  buf: int          # raw memory for a partial block (a __newstr block)
+  nbuf: int
+  total: int        # bytes written
+  w: int            # raw memory for the message schedule
+}
+
+fn new_hasher(algo: int) -> *Hasher {
+  x := &Hasher{algo: algo, block: 64, nbuf: 0, total: 0}
+  if algo == ALG_SHA256 {
+    x.dsize = 32
+    x.h = []int{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
+  } else if algo == ALG_SHA512 {
+    x.block = 128
+    x.dsize = 64
+    x.h = []int{0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+      0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179}
+  } else if algo == ALG_SHA1 {
+    x.dsize = 20
+    x.h = []int{0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0}
+  } else {
+    x.dsize = 16
+    x.h = []int{0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476}
+  }
+  x.buf = __newstr(x.block) + 8
+  x.w = __newstr(80 * 8) + 8
+  return x
+}
+
+export fn new_sha256() -> *Hasher { return new_hasher(ALG_SHA256) }
+export fn new_sha512() -> *Hasher { return new_hasher(ALG_SHA512) }
+export fn new_sha1() -> *Hasher { return new_hasher(ALG_SHA1) }
+export fn new_md5() -> *Hasher { return new_hasher(ALG_MD5) }
+
+# the digest size in bytes
+export fn (x: *Hasher) size() -> int { return x.dsize }
+# the block size in bytes (64, or 128 for SHA-512)
+export fn (x: *Hasher) block_size() -> int { return x.block }
+
+fn (x: *Hasher) compress(p: int) {
+  if x.algo == ALG_SHA256 { sha256_block(x.h, x.w, p) } else if x.algo == ALG_SHA512 { sha512_block(x.h, x.w, p) } else if x.algo == ALG_SHA1 { sha1_block(x.h, x.w, p) } else { md5_block(x.h, p) }
+}
+
+fn (x: *Hasher) write_raw(p: int, n: int) {
+  x.total += n
+  bs := x.block
+  i := 0
+  if x.nbuf > 0 {
+    while i < n && x.nbuf < bs {
+      __store8(x.buf + x.nbuf, __load8(p + i))
+      x.nbuf++
+      i++
+    }
+    if x.nbuf < bs { return }
+    x.compress(x.buf)
+    x.nbuf = 0
+  }
+  while i + bs <= n {
+    x.compress(p + i)
+    i += bs
+  }
+  while i < n {
+    __store8(x.buf + x.nbuf, __load8(p + i))
+    x.nbuf++
+    i++
+  }
+}
+
+# adds s to the data being hashed
+export fn (x: *Hasher) write(s: str) { x.write_raw(__strp(s) + 8, len(s)) }
+
+# an independent copy, in the same state
+export fn (x: *Hasher) clone() -> *Hasher {
+  y := &Hasher{algo: x.algo, block: x.block, dsize: x.dsize, nbuf: x.nbuf, total: x.total}
+  y.h = []int{}
+  for _, v := range x.h { y.h = append(y.h, v) }
+  y.buf = __newstr(x.block) + 8
+  i := 0
+  while i < x.nbuf {
+    __store8(y.buf + i, __load8(x.buf + i))
+    i++
+  }
+  y.w = __newstr(80 * 8) + 8
+  return y
+}
+
+# the digest of the data written so far (binary, size() bytes); does not change the hasher
+export fn (x: *Hasher) sum() -> str {
+  y := x.clone()
+  bits := y.total * 8
+  # 0x80, zeros up to the length field (8 bytes; 16 for SHA-512, high half zero), the length
+  lenfield := 8
+  if y.block == 128 { lenfield = 16 }
+  pad := y.block - ((y.total + 1 + lenfield) % y.block)
+  if pad == y.block { pad = 0 }
+  tail := __newstr(1 + pad + lenfield) + 8
+  __store8(tail, 0x80)
+  i := 1
+  while i < 1 + pad + lenfield {
+    __store8(tail + i, 0)
+    i++
+  }
+  e := tail + 1 + pad + lenfield - 8
+  if y.algo == ALG_MD5 {
+    store_le32(e, bits & M32)
+    store_le32(e + 4, (bits >> 32) & M32)
+  } else {
+    store_be64(e, bits)
+  }
+  y.write_raw(tail, 1 + pad + lenfield)
+  out := __newstr(y.dsize)
+  o := out + 8
+  for k, v := range y.h {
+    if y.algo == ALG_SHA512 { store_be64(o + 8 * k, v) } else if y.algo == ALG_MD5 { store_le32(o + 4 * k, v) } else { store_be32(o + 4 * k, v) }
+  }
+  return __pstr(out)
+}
+
+# the digest in lowercase hexadecimal
+export fn (x: *Hasher) sum_hex() -> str { return hex.encode(x.sum()) }
+
+fn digest(algo: int, s: str) -> str {
+  x := new_hasher(algo)
+  x.write(s)
+  return x.sum()
+}
+
+# ---------------------------------------------------------------- SHA-256
+
+let K256 = []int{
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2}
+
+fn sha256_block(hs: []int, w: int, p: int) {
+  t := 0
+  while t < 16 {
+    __store64(w + 8 * t, load_be32(p + 4 * t))
+    t++
+  }
+  while t < 64 {
+    x := __load64(w + 8 * (t - 15))
+    y := __load64(w + 8 * (t - 2))
+    s0 := (((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3)) & M32
+    s1 := (((y >> 17) | (y << 15)) ^ ((y >> 19) | (y << 13)) ^ (y >> 10)) & M32
+    __store64(w + 8 * t, (__load64(w + 8 * (t - 16)) + s0 + __load64(w + 8 * (t - 7)) + s1) & M32)
+    t++
+  }
+  a := hs[0]
+  b := hs[1]
+  c := hs[2]
+  d := hs[3]
+  e := hs[4]
+  f := hs[5]
+  g := hs[6]
+  h := hs[7]
+  t = 0
+  while t < 64 {
+    S1 := (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7))) & M32
+    ch := (e & f) ^ ((e ^ M32) & g)
+    t1 := h + S1 + ch + K256[t] + __load64(w + 8 * t)
+    S0 := (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10))) & M32
+    maj := (a & b) ^ (a & c) ^ (b & c)
+    h = g
+    g = f
+    f = e
+    e = (d + t1) & M32
+    d = c
+    c = b
+    b = a
+    a = (t1 + S0 + maj) & M32
+    t++
+  }
+  hs[0] = (hs[0] + a) & M32
+  hs[1] = (hs[1] + b) & M32
+  hs[2] = (hs[2] + c) & M32
+  hs[3] = (hs[3] + d) & M32
+  hs[4] = (hs[4] + e) & M32
+  hs[5] = (hs[5] + f) & M32
+  hs[6] = (hs[6] + g) & M32
+  hs[7] = (hs[7] + h) & M32
+}
+
+export fn sha256(s: str) -> str { return digest(ALG_SHA256, s) }
+export fn sha256_hex(s: str) -> str { return hex.encode(sha256(s)) }
+
+# ---------------------------------------------------------------- SHA-512
+#
+# The words are 64-bit; they live in int (wrapping arithmetic). Right shifts must be logical,
+# so the rotations go through uint64.
+
+let K512 = []int{
+  0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc, 0x3956c25bf348b538,
+  0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118, 0xd807aa98a3030242, 0x12835b0145706fbe,
+  0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2, 0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235,
+  0xc19bf174cf692694, 0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+  0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5, 0x983e5152ee66dfab,
+  0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4, 0xc6e00bf33da88fc2, 0xd5a79147930aa725,
+  0x06ca6351e003826f, 0x142929670a0e6e70, 0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed,
+  0x53380d139d95b3df, 0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+  0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30, 0xd192e819d6ef5218,
+  0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8, 0x19a4c116b8d2d0c8, 0x1e376c085141ab53,
+  0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8, 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373,
+  0x682e6ff3d6b2b8a3, 0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+  0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b, 0xca273eceea26619c,
+  0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178, 0x06f067aa72176fba, 0x0a637dc5a2c898a6,
+  0x113f9804bef90dae, 0x1b710b35131c471b, 0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc,
+  0x431d67c49c100d4c, 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817}
+
+# rotation right of a 64-bit word
+fn rotr64(x: int, n: int) -> int {
+  u := uint64(x)
+  return int((u >> n) | (u << (64 - n)))
+}
+# logical shift right of a 64-bit word
+fn shr64(x: int, n: int) -> int { return int(uint64(x) >> n) }
+
+fn sha512_block(hs: []int, w: int, p: int) {
+  t := 0
+  while t < 16 {
+    __store64(w + 8 * t, (load_be32(p + 8 * t) << 32) | load_be32(p + 8 * t + 4))
+    t++
+  }
+  while t < 80 {
+    x := __load64(w + 8 * (t - 15))
+    y := __load64(w + 8 * (t - 2))
+    s0 := rotr64(x, 1) ^ rotr64(x, 8) ^ shr64(x, 7)
+    s1 := rotr64(y, 19) ^ rotr64(y, 61) ^ shr64(y, 6)
+    __store64(w + 8 * t, __load64(w + 8 * (t - 16)) + s0 + __load64(w + 8 * (t - 7)) + s1)
+    t++
+  }
+  a := hs[0]
+  b := hs[1]
+  c := hs[2]
+  d := hs[3]
+  e := hs[4]
+  f := hs[5]
+  g := hs[6]
+  h := hs[7]
+  t = 0
+  while t < 80 {
+    S1 := rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+    ch := (e & f) ^ ((e ^ -1) & g)
+    t1 := h + S1 + ch + K512[t] + __load64(w + 8 * t)
+    S0 := rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+    maj := (a & b) ^ (a & c) ^ (b & c)
+    h = g
+    g = f
+    f = e
+    e = d + t1
+    d = c
+    c = b
+    b = a
+    a = t1 + S0 + maj
+    t++
+  }
+  hs[0] = hs[0] + a
+  hs[1] = hs[1] + b
+  hs[2] = hs[2] + c
+  hs[3] = hs[3] + d
+  hs[4] = hs[4] + e
+  hs[5] = hs[5] + f
+  hs[6] = hs[6] + g
+  hs[7] = hs[7] + h
+}
+
+export fn sha512(s: str) -> str { return digest(ALG_SHA512, s) }
+export fn sha512_hex(s: str) -> str { return hex.encode(sha512(s)) }
+
+# ---------------------------------------------------------------- SHA-1 (legacy)
+
+fn sha1_block(hs: []int, w: int, p: int) {
+  t := 0
+  while t < 16 {
+    __store64(w + 8 * t, load_be32(p + 4 * t))
+    t++
+  }
+  while t < 80 {
+    x := __load64(w + 8 * (t - 3)) ^ __load64(w + 8 * (t - 8)) ^ __load64(w + 8 * (t - 14)) ^ __load64(w + 8 * (t - 16))
+    __store64(w + 8 * t, ((x << 1) | (x >> 31)) & M32)
+    t++
+  }
+  a := hs[0]
+  b := hs[1]
+  c := hs[2]
+  d := hs[3]
+  e := hs[4]
+  t = 0
+  while t < 80 {
+    f := 0
+    k := 0
+    if t < 20 {
+      f = (b & c) | ((b ^ M32) & d)
+      k = 0x5A827999
+    } else if t < 40 {
+      f = b ^ c ^ d
+      k = 0x6ED9EBA1
+    } else if t < 60 {
+      f = (b & c) | (b & d) | (c & d)
+      k = 0x8F1BBCDC
+    } else {
+      f = b ^ c ^ d
+      k = 0xCA62C1D6
+    }
+    tmp := ((((a << 5) | (a >> 27)) & M32) + f + e + k + __load64(w + 8 * t)) & M32
+    e = d
+    d = c
+    c = ((b << 30) | (b >> 2)) & M32
+    b = a
+    a = tmp
+    t++
+  }
+  hs[0] = (hs[0] + a) & M32
+  hs[1] = (hs[1] + b) & M32
+  hs[2] = (hs[2] + c) & M32
+  hs[3] = (hs[3] + d) & M32
+  hs[4] = (hs[4] + e) & M32
+}
+
+# SHA-1: only for compatibility (git object names, old formats); not secure
+export fn sha1(s: str) -> str { return digest(ALG_SHA1, s) }
+export fn sha1_hex(s: str) -> str { return hex.encode(sha1(s)) }
+
+# ---------------------------------------------------------------- MD5 (legacy)
+
+let MD5_S = []int{7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21}
+
+let MD5_K = []int{
+  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391}
+
+fn md5_block(hs: []int, p: int) {
+  a := hs[0]
+  b := hs[1]
+  c := hs[2]
+  d := hs[3]
+  i := 0
+  while i < 64 {
+    f := 0
+    g := 0
+    if i < 16 {
+      f = (b & c) | ((b ^ M32) & d)
+      g = i
+    } else if i < 32 {
+      f = (d & b) | ((d ^ M32) & c)
+      g = (5 * i + 1) & 15
+    } else if i < 48 {
+      f = b ^ c ^ d
+      g = (3 * i + 5) & 15
+    } else {
+      f = c ^ (b | (d ^ M32))
+      g = (7 * i) & 15
+    }
+    x := (a + f + MD5_K[i] + load_le32(p + 4 * g)) & M32
+    s := MD5_S[i]
+    a = d
+    d = c
+    c = b
+    b = (b + (((x << s) | (x >> (32 - s))) & M32)) & M32
+    i++
+  }
+  hs[0] = (hs[0] + a) & M32
+  hs[1] = (hs[1] + b) & M32
+  hs[2] = (hs[2] + c) & M32
+  hs[3] = (hs[3] + d) & M32
+}
+
+# MD5: only for compatibility (old checksums); broken, not secure
+export fn md5(s: str) -> str { return digest(ALG_MD5, s) }
+export fn md5_hex(s: str) -> str { return hex.encode(md5(s)) }
+
+# ---------------------------------------------------------------- HMAC (RFC 2104)
+
+# HMAC: a keyed hash. new_hmac_sha256(key) then write() and sum(), like a Hasher.
+export struct Hmac {
+  inner: *Hasher
+  outer: *Hasher
+}
+
+fn xor_pad(key: str, size: int, pad: int) -> str {
+  m := __newstr(size)
+  i := 0
+  while i < size {
+    k := 0
+    if i < len(key) { k = int(key[i]) }
+    __store8(m + 8 + i, k ^ pad)
+    i++
+  }
+  return __pstr(m)
+}
+
+fn new_hmac(algo: int, key: str) -> *Hmac {
+  inner := new_hasher(algo)
+  outer := new_hasher(algo)
+  if len(key) > inner.block { key = digest(algo, key) }
+  inner.write(xor_pad(key, inner.block, 0x36))
+  outer.write(xor_pad(key, outer.block, 0x5c))
+  return &Hmac{inner: inner, outer: outer}
+}
+
+export fn new_hmac_sha256(key: str) -> *Hmac { return new_hmac(ALG_SHA256, key) }
+export fn new_hmac_sha512(key: str) -> *Hmac { return new_hmac(ALG_SHA512, key) }
+
+export fn (m: *Hmac) write(s: str) { m.inner.write(s) }
+# an independent copy, in the same state
+export fn (m: *Hmac) clone() -> *Hmac { return &Hmac{inner: m.inner.clone(), outer: m.outer.clone()} }
+# the MAC of the data written so far (binary); does not change the Hmac
+export fn (m: *Hmac) sum() -> str {
+  o := m.outer.clone()
+  o.write(m.inner.sum())
+  return o.sum()
+}
+export fn (m: *Hmac) sum_hex() -> str { return hex.encode(m.sum()) }
+
+export fn hmac_sha256(key: str, msg: str) -> str {
+  m := new_hmac(ALG_SHA256, key)
+  m.write(msg)
+  return m.sum()
+}
+export fn hmac_sha256_hex(key: str, msg: str) -> str { return hex.encode(hmac_sha256(key, msg)) }
+export fn hmac_sha512(key: str, msg: str) -> str {
+  m := new_hmac(ALG_SHA512, key)
+  m.write(msg)
+  return m.sum()
+}
+export fn hmac_sha512_hex(key: str, msg: str) -> str { return hex.encode(hmac_sha512(key, msg)) }
+
+# ---------------------------------------------------------------- PBKDF2 (RFC 8018)
+
+# derives key_len bytes from a password with PBKDF2-HMAC-SHA256
+export fn pbkdf2_sha256(password: str, salt: str, iterations: int, key_len: int) -> str {
+  base := new_hmac(ALG_SHA256, password)
+  out := __newstr(key_len)
+  o := out + 8
+  done := 0
+  block := 1
+  acc := __newstr(32) + 8
+  while done < key_len {
+    m := base.clone()
+    ib := __newstr(4)
+    store_be32(ib + 8, block)
+    m.write(salt)
+    m.write(__pstr(ib))
+    u := m.sum()
+    up := __strp(u) + 8
+    j := 0
+    while j < 32 {
+      __store8(acc + j, __load8(up + j))
+      j++
+    }
+    it := 1
+    while it < iterations {
+      m = base.clone()
+      m.write(u)
+      u = m.sum()
+      up = __strp(u) + 8
+      j = 0
+      while j < 32 {
+        __store8(acc + j, __load8(acc + j) ^ __load8(up + j))
+        j++
+      }
+      it++
+    }
+    j = 0
+    while j < 32 && done < key_len {
+      __store8(o + done, __load8(acc + j))
+      done++
+      j++
+    }
+    block++
+  }
+  return __pstr(out)
+}
+
+# ---------------------------------------------------------------- comparison and randomness
+
+# are a and b equal? The time depends only on the lengths, not on where they differ (use it to
+# compare MACs and tokens)
+export fn constant_time_eq(a: str, b: str) -> bool {
+  if len(a) != len(b) { return false }
+  pa := __strp(a) + 8
+  pb := __strp(b) + 8
+  d := 0
+  i := 0
+  while i < len(a) {
+    d = d | (__load8(pa + i) ^ __load8(pb + i))
+    i++
+  }
+  return d == 0
+}
+
+# n bytes from the kernel's secure random generator (getrandom)
+export fn random_bytes(n: int) -> (str, error) {
+  if n < 0 { return "", errors.New("crypto: negative length") }
+  m := __newstr(n)
+  got := 0
+  while got < n {
+    r := __syscall(SYS_GETRANDOM, m + 8 + got, n - got, 0, 0, 0, 0)
+    if r == -4 { continue }      # interrupted
+    if r < 0 { return "", errors.New("crypto: getrandom failed: error " + str(-r)) }
+    got += r
+  }
+  return __pstr(m), nil
+}

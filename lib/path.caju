@@ -1,0 +1,170 @@
+# std/path: Unix-style paths ("/" separates the parts). Only text: nothing here touches the disk,
+# except abs(), which asks for the current directory.
+
+import "std/strings"
+import "std/os"
+
+# the shortest path equal to p: removes repeated "/", "." parts and "x/.." pairs.
+# "" becomes "."; a trailing "/" is removed (except for the root).
+export fn clean(p: str) -> str {
+  if p == "" { return "." }
+  rooted := p[0] == 47
+  parts := []str{}
+  for _, part := range strings.split(p, "/") {
+    if part == "" || part == "." { continue }
+    if part == ".." {
+      if len(parts) > 0 && parts[len(parts) - 1] != ".." {
+        parts = parts[0:len(parts) - 1]
+        continue
+      }
+      if rooted { continue }       # "/.." is "/"
+    }
+    parts = append(parts, part)
+  }
+  out := strings.join(parts, "/")
+  if rooted { return "/" + out }
+  if out == "" { return "." }
+  return out
+}
+
+# joins two paths and cleans the result; an empty part is ignored
+export fn join(a: str, b: str) -> str {
+  if a == "" { return clean(b) }
+  if b == "" { return clean(a) }
+  return clean(a + "/" + b)
+}
+
+# joins any number of parts
+export fn join_all(parts: []str) -> str {
+  nonempty := []str{}
+  for _, p := range parts { if p != "" { nonempty = append(nonempty, p) } }
+  if len(nonempty) == 0 { return "" }
+  return clean(strings.join(nonempty, "/"))
+}
+
+# the last part of the path ("/a/b.caju" -> "b.caju"; "/" -> "/"; "" -> ".")
+export fn base(p: str) -> str {
+  if p == "" { return "." }
+  while len(p) > 1 && p[len(p) - 1] == 47 { p = p[0:len(p) - 1] }
+  if p == "/" { return "/" }
+  return p[strings.last_index(p, "/") + 1:]
+}
+
+# everything but the last part, cleaned ("/a/b.caju" -> "/a"; "b.caju" -> ".")
+export fn dir(p: str) -> str {
+  i := strings.last_index(p, "/")
+  if i < 0 { return "." }
+  if i == 0 { return "/" }
+  return clean(p[0:i])
+}
+
+# the extension of the last part, with the dot ("a/b.tar.gz" -> ".gz"; "a/b" -> "")
+export fn ext(p: str) -> str {
+  b := base(p)
+  i := strings.last_index(b, ".")
+  if i <= 0 { return "" }
+  return b[i:]
+}
+
+# the last part without its extension ("a/b.caju" -> "b")
+export fn stem(p: str) -> str {
+  b := base(p)
+  return b[0:len(b) - len(ext(b))]
+}
+
+export fn is_abs(p: str) -> bool { return len(p) > 0 && p[0] == 47 }
+
+# the absolute, cleaned path (relative paths start at the current directory)
+export fn abs(p: str) -> str {
+  if is_abs(p) { return clean(p) }
+  return join(os.getwd(), p)
+}
+
+# the path of target relative to the directory from_ (both cleaned; both absolute or both
+# relative). Example: rel("/a/b", "/a/c/d") == "../c/d". Errors if one is absolute and the other not.
+export fn rel(from_: str, target: str) -> (str, error) {
+  f := clean(from_)
+  t := clean(target)
+  if is_abs(f) != is_abs(t) { return "", errors.New("rel: " + target + " and " + from_ + " must both be absolute or both relative") }
+  if f == t { return ".", nil }
+  fp := parts_of(f)
+  tp := parts_of(t)
+  i := 0
+  while i < len(fp) && i < len(tp) && fp[i] == tp[i] { i++ }
+  out := []str{}
+  for k := i; k < len(fp); k++ {
+    if fp[k] == ".." { return "", errors.New("rel: cannot make " + target + " relative to " + from_) }
+    out = append(out, "..")
+  }
+  for k := i; k < len(tp); k++ { out = append(out, tp[k]) }
+  return strings.join(out, "/"), nil
+}
+
+fn parts_of(p: str) -> []str {
+  out := []str{}
+  for _, s := range strings.split(p, "/") { if s != "" && s != "." { out = append(out, s) } }
+  return out
+}
+
+# the parts of a cleaned path, without empty parts ("/a/b/" -> ["a", "b"])
+export fn split_all(p: str) -> []str { return parts_of(clean(p)) }
+
+# true if name matches the shell pattern: "*" (any run of characters except "/"), "?" (one
+# character except "/"), "[abc]" / "[a-z]" / "[!abc]" (one character from a set)
+export fn match(pattern: str, name: str) -> bool { return match_at(pattern, 0, name, 0) }
+
+fn match_at(pat: str, i: int, s: str, j: int) -> bool {
+  while i < len(pat) {
+    c := pat[i]
+    if c == 42 {                                   # *
+      while i < len(pat) && pat[i] == 42 { i++ }
+      if i == len(pat) { return strings.index_byte(s[j:], 47) < 0 }
+      for k := j; k <= len(s); k++ {
+        if match_at(pat, i, s, k) { return true }
+        if k < len(s) && s[k] == 47 { return false }
+      }
+      return false
+    }
+    if j >= len(s) { return false }
+    if c == 63 {                                   # ?
+      if s[j] == 47 { return false }
+      i++
+      j++
+      continue
+    }
+    if c == 91 {                                   # [
+      end := i + 1
+      if end < len(pat) && pat[end] == 33 { end++ }
+      if end < len(pat) && pat[end] == 93 { end++ }
+      while end < len(pat) && pat[end] != 93 { end++ }
+      if end >= len(pat) { return false }          # no closing "]": no match
+      if !class_has(pat[i + 1:end], int(s[j])) { return false }
+      i = end + 1
+      j++
+      continue
+    }
+    if c != s[j] { return false }
+    i++
+    j++
+  }
+  return j == len(s)
+}
+
+fn class_has(cls: str, ch: int) -> bool {
+  neg := len(cls) > 0 && cls[0] == 33
+  k := 0
+  if neg { k = 1 }
+  found := false
+  while k < len(cls) {
+    lo := int(cls[k])
+    hi := lo
+    if k + 2 < len(cls) && cls[k + 1] == 45 {
+      hi = int(cls[k + 2])
+      k += 3
+    } else {
+      k++
+    }
+    if ch >= lo && ch <= hi { found = true }
+  }
+  return found != neg
+}

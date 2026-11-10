@@ -1,0 +1,114 @@
+import { describe, it, expect } from "std/testing"
+
+describe("fixed-size integers", fn() {
+  it("uint8 wraps around past 255", fn() {
+    let b: uint8 = 250
+    for i := 0; i < 8; i++ { b++ }
+    expect(b).to_equal(2)
+    let c: uint8 = 250
+    c += 10
+    expect(c).to_equal(4)
+  })
+  it("int8 wraps from 127 to -128", fn() {
+    let c: int8 = 127
+    c++
+    expect(c).to_equal(-128)
+  })
+  it("conversions keep the low bits", fn() {
+    expect(int8(200)).to_equal(-56)
+    expect(uint16(70000)).to_equal(4464)
+    expect(int16(70000)).to_equal(4464)
+    expect(uint32(-1)).to_equal(4294967295)
+    expect(uint8(-1)).to_equal(255)
+  })
+  it("uint32 wraps below zero and on overflow", fn() {
+    let u: uint32 = 0
+    u--
+    expect(u).to_equal(4294967295)
+    let v: uint32 = 4000000000
+    expect(v * 2).to_equal(3705032704)
+    expect(v + v).to_equal(3705032704)
+    expect(v >> 1).to_equal(2000000000)
+    expect(v ^ 0xFFFFFFFF).to_equal(294967295)
+  })
+  it("int64 wraps at the 64-bit limits", fn() {
+    let a: int64 = int64(9223372036854775807)
+    expect(str(a + 1)).to_equal("-9223372036854775808")
+    expect(str(a * 3)).to_equal("9223372036854775805")
+    expect(str(int64(1e18) * 10)).to_equal("-8446744073709551616")
+  })
+  it("uint64 goes up to 18446744073709551615", fn() {
+    let b: uint64 = 0
+    expect(str(b - 1)).to_equal("18446744073709551615")
+    let big: uint64 = uint64(18446744073709551615)
+    expect(str(big / 3)).to_equal("6148914691236517205")
+    expect(big % 10).to_equal(5)
+    expect(big >> 60).to_equal(15)
+  })
+  it("FNV-1a over uint32 gives the known hash of \"caju\"", fn() {
+    let h: uint32 = 2166136261
+    for _, c := range []byte("caju") {
+      h ^= uint32(c)
+      h *= 16777619
+    }
+    expect(h).to_equal(2800546564)
+  })
+})
+
+describe("integer arithmetic", fn() {
+  it("division truncates toward zero and % keeps the sign of the dividend", fn() {
+    expect(7 / 2).to_equal(3)
+    expect(-7 / 2).to_equal(-3)
+    expect(7 % 3).to_equal(1)
+    expect(-7 % 3).to_equal(-1)
+    expect(7 % -3).to_equal(1)
+  })
+  it("a float operand makes a float division; ** is power", fn() {
+    expect(7.0 / 2).to_equal(3.5)
+    expect(10.0 / 4).to_equal(2.5)
+    expect(2 ** 10).to_equal(1024)
+    expect(str(2 ** 0.5)).to_equal("1.41421356237")
+  })
+  it("int() truncates floats toward zero", fn() {
+    expect(int(3.9)).to_equal(3)
+    expect(int(-3.9)).to_equal(-3)
+    expect(int(3.99)).to_equal(3)
+    expect(int(-3.99)).to_equal(-3)
+  })
+  it("float32 keeps single precision", fn() {
+    let f32: float32 = 0.1
+    expect(str(f32 * 3)).to_equal("0.300000011921")
+    expect(str(float32(0.1))).to_equal("0.10000000149")
+  })
+})
+
+describe("bit operations", fn() {
+  it("&, |, ^, &^ and shifts on a uint8", fn() {
+    let flags: uint8 = 0b0000_0101
+    expect(flags & 0b100).to_equal(4)
+    expect(flags | 0b10).to_equal(7)
+    expect(flags ^ 0xFF).to_equal(250)
+    expect(flags &^ 1).to_equal(4)
+    expect(1 << 7).to_equal(128)
+    expect(200 >> 3).to_equal(25)
+  })
+  it("^x is the complement", fn() {
+    expect(^0).to_equal(-1)
+  })
+  it("works on big ints", fn() {
+    x := 1 << 40
+    expect(x).to_equal(1099511627776)
+    expect(x >> 38).to_equal(4)
+    expect(x & 0xFF).to_equal(0)
+    expect(7 &^ 5).to_equal(2)
+    expect(6 ^ 3).to_equal(5)
+    expect(6 &^ 3).to_equal(4)
+    expect(0xFF & 0x0F).to_equal(15)
+    expect(0xF0 | 0x0F).to_equal(255)
+  })
+  it("<< reaches the sign bit and >> on negatives is arithmetic", fn() {
+    expect(str(1 << 62)).to_equal("4611686018427387904")
+    expect(str(1 << 63)).to_equal("-9223372036854775808")
+    expect(-1 >> 3).to_equal(-1)
+  })
+})

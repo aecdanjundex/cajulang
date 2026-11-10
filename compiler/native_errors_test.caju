@@ -1,0 +1,77 @@
+# Runtime errors of native programs: the message, the file and the line must be the same as in
+# the reference VM, after whatever the program printed before (migrated from
+# tests/native/errorN.caju; the programs are in testdata/runtime_errors/).
+import { describe, it, expect, run_file } from "std/testing"
+
+describe("runtime errors", fn() {
+  it("reports an integer division by zero", fn() {
+    r := run_file("testdata/runtime_errors/division_by_zero.caju")
+    expect(r.output).to_equal("before\nRuntime error in division_by_zero.caju, line 4: Integer division by zero.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports too much recursion", fn() {
+    r := run_file("testdata/runtime_errors/deep_recursion.caju")
+    expect(r.output).to_equal("Runtime error in deep_recursion.caju, line 1: Too much recursion: more than 10,000 nested function calls.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a float remainder by zero", fn() {
+    r := run_file("testdata/runtime_errors/float_remainder_by_zero.caju")
+    expect(r.output).to_equal("Runtime error in float_remainder_by_zero.caju, line 1: Remainder of division by zero.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a negative shift", fn() {
+    r := run_file("testdata/runtime_errors/negative_shift.caju")
+    expect(r.output).to_equal("Runtime error in negative_shift.caju, line 2: Negative shift.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports an index out of range with the length", fn() {
+    r := run_file("testdata/runtime_errors/index_out_of_range.caju")
+    expect(r.output).to_equal("Runtime error in index_out_of_range.caju, line 3: Index 3 out of range (length 3).")
+    expect(r.code).to_equal(1)
+  })
+  it("reads a nil map as empty but reports an assignment to it", fn() {
+    r := run_file("testdata/runtime_errors/nil_map_assignment.caju")
+    expect(r.output).to_equal("0\nRuntime error in nil_map_assignment.caju, line 3: Assignment to a nil map or slice.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a field access through a nil pointer", fn() {
+    r := run_file("testdata/runtime_errors/nil_pointer_field.caju")
+    expect(r.output).to_equal("Runtime error in nil_pointer_field.caju, line 3: Access to field \"x\" through a nil pointer.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a slice out of bounds with length and capacity", fn() {
+    r := run_file("testdata/runtime_errors/slice_out_of_bounds.caju")
+    expect(r.output).to_equal("Runtime error in slice_out_of_bounds.caju, line 2: Slice [1:5] out of bounds (length 3, capacity 3).")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a make with capacity smaller than the length", fn() {
+    r := run_file("testdata/runtime_errors/make_capacity.caju")
+    expect(r.output).to_equal("Runtime error in make_capacity.caju, line 2: make: capacity (1) is less than length (2).")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a failed type assertion with the stored type", fn() {
+    r := run_file("testdata/runtime_errors/type_assertion.caju")
+    expect(r.output).to_equal("Runtime error in type_assertion.caju, line 2: x.(int): the stored value is str, not int.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports an operator used with the wrong types in an untyped function", fn() {
+    r := run_file("testdata/runtime_errors/untyped_minus.caju")
+    expect(r.output).to_equal("2\nRuntime error in untyped_minus.caju, line 1: The \"-\" operator only works with numbers.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a method call on a nil interface", fn() {
+    r := run_file("testdata/runtime_errors/nil_interface_call.caju")
+    expect(r.output).to_equal("true\nRuntime error in nil_interface_call.caju, line 4: Call of method \"m\" on a nil value.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a call of a nil function", fn() {
+    r := run_file("testdata/runtime_errors/nil_function_call.caju")
+    expect(r.output).to_equal("true\nRuntime error in nil_function_call.caju, line 3: Call of a nil function.")
+    expect(r.code).to_equal(1)
+  })
+  it("reports a comparison between a number and a text", fn() {
+    r := run_file("testdata/runtime_errors/mixed_comparison.caju")
+    expect(r.output).to_equal("true true\nRuntime error in mixed_comparison.caju, line 1: Cannot compare number with string using \"<\".")
+    expect(r.code).to_equal(1)
+  })
+})

@@ -1,0 +1,44 @@
+# std/hex: hexadecimal encoding of binary strings.
+
+let DIGITS = "0123456789abcdef"
+
+# the lowercase hexadecimal form of the bytes of s (two digits per byte)
+export fn encode(s: str) -> str {
+  n := len(s)
+  m := __newstr(2 * n)
+  p := __strp(s) + 8
+  d := __strp(DIGITS) + 8
+  i := 0
+  while i < n {
+    c := __load8(p + i)
+    __store8(m + 8 + 2 * i, __load8(d + (c >> 4)))
+    __store8(m + 9 + 2 * i, __load8(d + (c & 15)))
+    i++
+  }
+  return __pstr(m)
+}
+
+# the value of a hexadecimal digit, or -1
+fn digit(c: int) -> int {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return -1
+}
+
+# the bytes written in hexadecimal in s (upper or lower case)
+export fn decode(s: str) -> (str, error) {
+  n := len(s)
+  if n % 2 != 0 { return "", errors.New("hex: odd length") }
+  m := __newstr(n / 2)
+  p := __strp(s) + 8
+  i := 0
+  while i < n {
+    hi := digit(__load8(p + i))
+    lo := digit(__load8(p + i + 1))
+    if hi < 0 || lo < 0 { return "", errors.New("hex: invalid byte at position " + str(i)) }
+    __store8(m + 8 + i / 2, hi * 16 + lo)
+    i += 2
+  }
+  return __pstr(m), nil
+}

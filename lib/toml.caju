@@ -1,0 +1,955 @@
+# std/toml: reads and writes TOML 1.0 documents (https://toml.io), used by caju.toml and caju.lock.
+#
+#   doc, err := toml.parse(src)          # a table, or an error "toml: line N: ..."
+#   name := doc.get_str("package.name", "")
+#   out := toml.encode(doc)              # canonical TOML; parse(encode(v)) gives the same data
+#
+# Values keep the order of their keys. Dates and times are kept as text (kind "datetime").
+
+import "std/strings"
+import "std/strconv"
+import "std/math"
+
+# a TOML value; kind is "string", "int", "float", "bool", "datetime", "array" or "table"
+export struct Value {
+  kind: str
+  s: str                       # string and datetime
+  i: int
+  f: num
+  b: bool
+  items: []*Value              # array
+  keys: []str                  # table: the keys in insertion order
+  fields: map[str]*Value       # table
+  # how the value was written (the parser needs it to reject redefinitions)
+  defined: bool                # table created by a [header]
+  dotted: bool                 # table created by a dotted key (a.b = 1)
+  inline: bool                 # inline table {...} or array [...]: closed for later additions
+  aot: bool                    # array created by [[header]]
+}
+
+struct ParseError {
+  msg: str
+}
+
+# ---------------------------------------------------------------- constructors and access
+
+export fn new_table() -> *Value { return &Value{kind: "table", keys: []str{}, fields: map[str]*Value{}} }
+export fn new_array() -> *Value { return &Value{kind: "array", items: []*Value{}} }
+export fn new_string(s: str) -> *Value { return &Value{kind: "string", s: s} }
+export fn new_int(i: int) -> *Value { return &Value{kind: "int", i: i} }
+export fn new_float(f: num) -> *Value { return &Value{kind: "float", f: f} }
+export fn new_bool(b: bool) -> *Value { return &Value{kind: "bool", b: b} }
+export fn new_datetime(s: str) -> *Value { return &Value{kind: "datetime", s: s} }
+
+# sets a key of a table (a new key goes to the end; an existing one keeps its place)
+export fn (t: *Value) set(key: str, v: *Value) {
+  if _, ok := t.fields[key]; !ok { t.keys = append(t.keys, key) }
+  t.fields[key] = v
+}
+
+# removes a key of a table
+export fn (t: *Value) remove(key: str) {
+  if _, ok := t.fields[key]; !ok { return }
+  delete(t.fields, key)
+  keys := []str{}
+  for _, k := range t.keys { if k != key { keys = append(keys, k) } }
+  t.keys = keys
+}
+
+# appends an item to an array
+export fn (a: *Value) push(v: *Value) { a.items = append(a.items, v) }
+
+# the value of one key of a table, or nil
+export fn (t: *Value) field(key: str) -> *Value {
+  if t == nil || t.kind != "table" { return nil }
+  return t.fields[key]
+}
+
+# the value at a dotted path ("package.name"; "" is the value itself), or nil.
+# Keys that contain a dot can only be reached with field.
+export fn (v: *Value) get(path: str) -> *Value {
+  if path == "" { return v }
+  cur := v
+  for _, part := range strings.split(path, ".") {
+    if cur == nil || cur.kind != "table" { return nil }
+    cur = cur.fields[part]
+  }
+  return cur
+}
+
+export fn (v: *Value) get_str(path: str, def: str) -> str {
+  x := v.get(path)
+  if x == nil || (x.kind != "string" && x.kind != "datetime") { return def }
+  return x.s
+}
+export fn (v: *Value) get_int(path: str, def: int) -> int {
+  x := v.get(path)
+  if x == nil || x.kind != "int" { return def }
+  return x.i
+}
+# a float; an integer is converted
+export fn (v: *Value) get_float(path: str, def: num) -> num {
+  x := v.get(path)
+  if x == nil { return def }
+  if x.kind == "float" { return x.f }
+  if x.kind == "int" { return num(x.i) }
+  return def
+}
+export fn (v: *Value) get_bool(path: str, def: bool) -> bool {
+  x := v.get(path)
+  if x == nil || x.kind != "bool" { return def }
+  return x.b
+}
+# the items of an array (nil if the path is not an array)
+export fn (v: *Value) get_array(path: str) -> []*Value {
+  x := v.get(path)
+  if x == nil || x.kind != "array" { return nil }
+  return x.items
+}
+# the strings of an array of strings (other items are skipped)
+export fn (v: *Value) get_strs(path: str) -> []str {
+  out := []str{}
+  for _, x := range v.get_array(path) { if x.kind == "string" { out = append(out, x.s) } }
+  return out
+}
+# the keys of a table, in order (empty if the path is not a table)
+export fn (v: *Value) table_keys(path: str) -> []str {
+  x := v.get(path)
+  if x == nil || x.kind != "table" { return []str{} }
+  return x.keys
+}
+
+# ---------------------------------------------------------------- parser
+
+const NL = 10
+const CR = 13
+const TAB = 9
+const SP = 32
+const QUOTE = 34
+const HASH = 35
+const APOS = 39
+const COMMA = 44
+const DOT = 46
+const EQ = 61
+const LBRACKET = 91
+const BACKSLASH = 92
+const RBRACKET = 93
+const LBRACE = 123
+const RBRACE = 125
+
+struct Parser {
+  src: str
+  i: int
+  n: int
+  line: int
+}
+
+# parses a TOML document into a table
+export fn parse(src: str) -> (root: *Value, err: error) {
+  defer fn() {
+    r := recover()
+    if r != nil {
+      if pe, ok := r.(*ParseError); ok {
+        root = nil
+        err = errors.New(pe.msg)
+      } else { panic(r) }
+    }
+  }()
+  p := &Parser{src: src, i: 0, n: len(src), line: 1}
+  root = p.document()
+  err = nil
+  return
+}
+
+fn (p: *Parser) fail(msg: str) { panic(&ParseError{msg: "toml: line " + str(p.line) + ": " + msg}) }
+
+fn (p: *Parser) peek() -> int {
+  if p.i < p.n { return int(p.src[p.i]) }
+  return -1
+}
+fn (p: *Parser) peek_at(k: int) -> int {
+  if p.i + k < p.n { return int(p.src[p.i + k]) }
+  return -1
+}
+fn (p: *Parser) advance() {
+  if p.i < p.n && p.src[p.i] == NL { p.line++ }
+  p.i++
+}
+
+# a description of the next character, for messages
+fn (p: *Parser) describe() -> str {
+  c := p.peek()
+  if c < 0 { return "the end of the file" }
+  if c == NL || (c == CR && p.peek_at(1) == NL) { return "the end of the line" }
+  if c < 32 || c == 127 { return "a control character" }
+  if c >= 128 { return "a non-ASCII character" }
+  return "\"" + strings.from_byte(c) + "\""
+}
+
+fn (p: *Parser) skip_ws() {
+  for p.peek() == SP || p.peek() == TAB { p.i++ }
+}
+
+fn (p: *Parser) skip_comment() {
+  if p.peek() != HASH { return }
+  for p.i < p.n {
+    c := p.peek()
+    if c == NL || (c == CR && p.peek_at(1) == NL) { return }
+    if (c < 32 && c != TAB) || c == 127 { p.fail("control characters are not allowed in comments") }
+    p.i++
+  }
+}
+
+# true (and consumed) at a newline
+fn (p: *Parser) newline() -> bool {
+  if p.peek() == NL {
+    p.advance()
+    return true
+  }
+  if p.peek() == CR && p.peek_at(1) == NL {
+    p.i++
+    p.advance()
+    return true
+  }
+  return false
+}
+
+# whitespace, newlines and comments (between statements and inside arrays)
+fn (p: *Parser) skip_blank() {
+  while true {
+    p.skip_ws()
+    p.skip_comment()
+    if !p.newline() { return }
+  }
+}
+
+fn (p: *Parser) expect_eol() {
+  p.skip_ws()
+  p.skip_comment()
+  if p.i >= p.n { return }
+  if !p.newline() { p.fail("expected the end of the line, found " + p.describe()) }
+}
+
+fn (p: *Parser) expect(c: int, what: str) {
+  if p.peek() != c { p.fail("expected " + what + ", found " + p.describe()) }
+  p.advance()
+}
+
+fn (p: *Parser) document() -> *Value {
+  root := new_table()
+  cur := root
+  while true {
+    p.skip_blank()
+    if p.i >= p.n { break }
+    if p.peek() == LBRACKET {
+      if p.peek_at(1) == LBRACKET {
+        p.i += 2
+        keys := p.key()
+        p.expect(RBRACKET, "\"]]\"")
+        p.expect(RBRACKET, "\"]]\"")
+        cur = p.array_table(root, keys)
+      } else {
+        p.i++
+        hkeys := p.key()
+        p.expect(RBRACKET, "\"]\"")
+        cur = p.std_table(root, hkeys)
+      }
+    } else {
+      p.keyval(cur)
+    }
+    p.expect_eol()
+  }
+  return root
+}
+
+fn is_bare(c: int) -> bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 45
+}
+
+# a key: one or more simple keys joined by dots
+fn (p: *Parser) key() -> []str {
+  parts := []str{}
+  while true {
+    p.skip_ws()
+    parts = append(parts, p.simple_key())
+    p.skip_ws()
+    if p.peek() != DOT { break }
+    p.i++
+  }
+  return parts
+}
+
+fn (p: *Parser) simple_key() -> str {
+  c := p.peek()
+  if c == QUOTE {
+    if p.peek_at(1) == QUOTE && p.peek_at(2) == QUOTE { p.fail("a multi-line string cannot be a key") }
+    return p.basic_string()
+  }
+  if c == APOS {
+    if p.peek_at(1) == APOS && p.peek_at(2) == APOS { p.fail("a multi-line string cannot be a key") }
+    return p.literal_string()
+  }
+  if !is_bare(c) { p.fail("expected a key, found " + p.describe()) }
+  start := p.i
+  for is_bare(p.peek()) { p.i++ }
+  return p.src[start:p.i]
+}
+
+fn key_path(keys: []str, upto: int) -> str {
+  parts := []str{}
+  for j := 0; j <= upto; j++ { parts = append(parts, key_text(keys[j])) }
+  return strings.join(parts, ".")
+}
+
+# key = value, into table t
+fn (p: *Parser) keyval(t: *Value) {
+  keys := p.key()
+  p.skip_ws()
+  p.expect(EQ, "\"=\" after the key")
+  p.skip_ws()
+  v := p.value()
+  container := t
+  last := len(keys) - 1
+  for j := 0; j < last; j++ {
+    ex := container.fields[keys[j]]
+    if ex == nil {
+      nt := new_table()
+      nt.dotted = true
+      container.set(keys[j], nt)
+      container = nt
+      continue
+    }
+    if ex.kind != "table" || ex.inline || !ex.dotted { p.fail("\"" + key_path(keys, j) + "\" is already defined and cannot be extended with a dotted key") }
+    container = ex
+  }
+  if _, ok := container.fields[keys[last]]; ok { p.fail("duplicate key \"" + key_path(keys, last) + "\"") }
+  container.set(keys[last], v)
+}
+
+# walks the tables of a header up to (not including) the last key
+fn (p: *Parser) header_parent(root: *Value, keys: []str) -> *Value {
+  t := root
+  for j := 0; j < len(keys) - 1; j++ {
+    ex := t.fields[keys[j]]
+    if ex == nil {
+      nt := new_table()
+      t.set(keys[j], nt)
+      t = nt
+      continue
+    }
+    if ex.kind == "array" && ex.aot {
+      t = ex.items[len(ex.items) - 1]
+      continue
+    }
+    if ex.kind != "table" || ex.inline { p.fail("\"" + key_path(keys, j) + "\" is already defined as a value and cannot be used as a table") }
+    t = ex
+  }
+  return t
+}
+
+# [a.b.c]
+fn (p: *Parser) std_table(root: *Value, keys: []str) -> *Value {
+  parent := p.header_parent(root, keys)
+  k := keys[len(keys) - 1]
+  ex := parent.fields[k]
+  if ex == nil {
+    nt := new_table()
+    nt.defined = true
+    parent.set(k, nt)
+    return nt
+  }
+  if ex.kind != "table" || ex.inline || ex.defined || ex.dotted { p.fail("table \"" + key_path(keys, len(keys) - 1) + "\" is defined more than once") }
+  ex.defined = true
+  return ex
+}
+
+# [[a.b.c]]
+fn (p: *Parser) array_table(root: *Value, keys: []str) -> *Value {
+  parent := p.header_parent(root, keys)
+  k := keys[len(keys) - 1]
+  ex := parent.fields[k]
+  if ex == nil {
+    ex = new_array()
+    ex.aot = true
+    parent.set(k, ex)
+  } else if ex.kind != "array" || !ex.aot {
+    p.fail("\"" + key_path(keys, len(keys) - 1) + "\" is already defined and is not an array of tables")
+  }
+  nt := new_table()
+  nt.defined = true
+  ex.push(nt)
+  return nt
+}
+
+# ---------------------------------------------------------------- values
+
+fn (p: *Parser) value() -> *Value {
+  c := p.peek()
+  if c == QUOTE {
+    if p.peek_at(1) == QUOTE && p.peek_at(2) == QUOTE { return new_string(p.ml_basic_string()) }
+    return new_string(p.basic_string())
+  }
+  if c == APOS {
+    if p.peek_at(1) == APOS && p.peek_at(2) == APOS { return new_string(p.ml_literal_string()) }
+    return new_string(p.literal_string())
+  }
+  if c == LBRACKET { return p.array() }
+  if c == LBRACE { return p.inline_table() }
+  if c == 116 || c == 102 {          # t f
+    word := p.token()
+    if word == "true" { return new_bool(true) }
+    if word == "false" { return new_bool(false) }
+    p.fail("invalid value \"" + word + "\"")
+    return nil
+  }
+  if c == 43 || c == 45 || (c >= 48 && c <= 57) || c == 105 || c == 110 { return p.number_or_date() }   # + - digit i n
+  p.fail("expected a value, found " + p.describe())
+  return nil
+}
+
+fn is_delim(c: int) -> bool {
+  return c < 0 || c == SP || c == TAB || c == NL || c == CR || c == COMMA || c == RBRACKET || c == RBRACE || c == HASH
+}
+
+# the characters up to the next delimiter
+fn (p: *Parser) token() -> str {
+  start := p.i
+  for !is_delim(p.peek()) { p.i++ }
+  return p.src[start:p.i]
+}
+
+fn is_digit(c: int) -> bool { return c >= 48 && c <= 57 }
+fn is_hex(c: int) -> bool { return is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) }
+
+fn (p: *Parser) number_or_date() -> *Value {
+  tok := p.token()
+  # a date followed by a space and a time: 1979-05-27 07:32:00
+  is_date := len(tok) >= 10 && is_digit(int(tok[0])) && tok[4] == 45 && tok[7] == 45
+  if is_date && len(tok) == 10 && p.peek() == SP && is_digit(p.peek_at(1)) && is_digit(p.peek_at(2)) && p.peek_at(3) == 58 {
+    p.i++
+    tok = tok + " " + p.token()
+  }
+  if is_date || (len(tok) >= 5 && is_digit(int(tok[0])) && tok[2] == 58) {
+    for j := 0; j < len(tok); j++ {
+      c := int(tok[j])
+      if !(is_digit(c) || c == 45 || c == 58 || c == 46 || c == 43 || c == 84 || c == 116 || c == 90 || c == 122 || c == SP) { p.fail("invalid date or time \"" + tok + "\"") }
+    }
+    return new_datetime(tok)
+  }
+  body := tok
+  sign := ""
+  if len(tok) > 0 && (tok[0] == 43 || tok[0] == 45) {
+    sign = tok[0:1]
+    body = tok[1:]
+  }
+  if body == "inf" {
+    if sign == "-" { return new_float(-math.inf()) }
+    return new_float(math.inf())
+  }
+  if body == "nan" { return new_float(math.nan()) }
+  if len(body) > 2 && body[0] == 48 && (body[1] == 120 || body[1] == 111 || body[1] == 98) {   # 0x 0o 0b
+    if sign != "" { p.fail("a sign is not allowed in \"" + tok + "\"") }
+    base := 16
+    if body[1] == 111 { base = 8 } else if body[1] == 98 { base = 2 }
+    p.check_underscores(tok, body[2:], base)
+    v, err := strconv.parse_int(tok, 0)
+    if err != nil { p.fail("invalid integer \"" + tok + "\"") }
+    return new_int(v)
+  }
+  is_float := false
+  for j := 0; j < len(body); j++ {
+    if body[j] == DOT || body[j] == 101 || body[j] == 69 { is_float = true }
+  }
+  if !is_float {
+    p.check_underscores(tok, body, 10)
+    if len(body) > 1 && body[0] == 48 { p.fail("leading zeros are not allowed in \"" + tok + "\"") }
+    iv, ierr := strconv.parse_int(tok, 10)
+    if ierr != nil {
+      if strings.contains(ierr.Error(), "range") { p.fail("integer out of range \"" + tok + "\"") }
+      p.fail("invalid value \"" + tok + "\"")
+    }
+    return new_int(iv)
+  }
+  p.check_float(tok, body)
+  f, ferr := strconv.parse_float(tok)
+  if ferr != nil { p.fail("invalid float \"" + tok + "\"") }
+  return new_float(f)
+}
+
+# every _ must be between two digits of the base
+fn (p: *Parser) check_underscores(tok: str, digits: str, base: int) {
+  if len(digits) == 0 { p.fail("invalid value \"" + tok + "\"") }
+  for j := 0; j < len(digits); j++ {
+    c := int(digits[j])
+    ok := false
+    if c == 95 {
+      ok = j > 0 && j + 1 < len(digits) && digits[j - 1] != 95 && digits[j + 1] != 95
+    } else if base == 16 {
+      ok = is_hex(c)
+    } else {
+      ok = is_digit(c) && c - 48 < base
+    }
+    if !ok { p.fail("invalid value \"" + tok + "\"") }
+  }
+}
+
+# float grammar: integer part (no leading zeros), optional .digits, optional exponent
+fn (p: *Parser) check_float(tok: str, body: str) {
+  j := 0
+  n := len(body)
+  start := j
+  for j < n && (is_digit(int(body[j])) || body[j] == 95) { j++ }
+  intpart := body[start:j]
+  p.check_underscores(tok, intpart, 10)
+  if len(intpart) > 1 && intpart[0] == 48 { p.fail("leading zeros are not allowed in \"" + tok + "\"") }
+  if j < n && body[j] == DOT {
+    j++
+    fs := j
+    for j < n && (is_digit(int(body[j])) || body[j] == 95) { j++ }
+    p.check_underscores(tok, body[fs:j], 10)
+  }
+  if j < n && (body[j] == 101 || body[j] == 69) {
+    j++
+    if j < n && (body[j] == 43 || body[j] == 45) { j++ }
+    es := j
+    for j < n && (is_digit(int(body[j])) || body[j] == 95) { j++ }
+    p.check_underscores(tok, body[es:j], 10)
+  }
+  if j != n { p.fail("invalid float \"" + tok + "\"") }
+}
+
+fn (p: *Parser) check_char(c: int, multiline: bool) {
+  if c == TAB { return }
+  if multiline && (c == NL || c == CR) { return }
+  if c < 32 || c == 127 { p.fail("control characters must be escaped in strings") }
+}
+
+fn hex_value(c: int) -> int {
+  if is_digit(c) { return c - 48 }
+  return (c | 32) - 97 + 10
+}
+
+# a backslash escape, written to b
+fn (p: *Parser) escape(b: *strings.Builder) {
+  p.i++
+  c := p.peek()
+  if c == 98 { b.write_byte(8) } else if c == 116 { b.write_byte(9) } else if c == 110 { b.write_byte(10) } else if c == 102 { b.write_byte(12) } else if c == 114 { b.write_byte(13) } else if c == QUOTE { b.write_byte(QUOTE) } else if c == BACKSLASH { b.write_byte(BACKSLASH) } else if c == 117 || c == 85 {
+    count := 4
+    if c == 85 { count = 8 }
+    cp := 0
+    for k := 1; k <= count; k++ {
+      h := p.peek_at(k)
+      if !is_hex(h) { p.fail("invalid unicode escape: expected " + str(count) + " hexadecimal digits") }
+      cp = cp * 16 + hex_value(h)
+    }
+    if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) { p.fail("invalid unicode escape: not a unicode scalar value") }
+    b.write_rune(cp)
+    p.i += count
+  } else {
+    if c < 0 || c == NL || c == CR { p.fail("invalid escape at the end of the line") }
+    p.fail("invalid escape \"\\" + strings.from_byte(c) + "\"")
+  }
+  p.i++
+}
+
+fn (p: *Parser) basic_string() -> str {
+  p.i++
+  b := &strings.Builder{}
+  while true {
+    c := p.peek()
+    if c < 0 || c == NL || (c == CR && p.peek_at(1) == NL) { p.fail("unterminated string") }
+    if c == QUOTE {
+      p.i++
+      break
+    }
+    if c == BACKSLASH {
+      p.escape(b)
+      continue
+    }
+    p.check_char(c, false)
+    b.write_byte(c)
+    p.i++
+  }
+  return b.string()
+}
+
+fn (p: *Parser) literal_string() -> str {
+  p.i++
+  start := p.i
+  while true {
+    c := p.peek()
+    if c < 0 || c == NL || (c == CR && p.peek_at(1) == NL) { p.fail("unterminated string") }
+    if c == APOS { break }
+    p.check_char(c, false)
+    p.i++
+  }
+  s := p.src[start:p.i]
+  p.i++
+  return s
+}
+
+# the closing quotes of a multi-line string: up to two extra quotes belong to the content.
+# Returns true at the end of the string.
+fn (p: *Parser) ml_close(q: int, b: *strings.Builder) -> bool {
+  count := 0
+  while p.peek() == q {
+    count++
+    p.i++
+  }
+  if count >= 3 {
+    if count > 5 { p.fail("too many quotes at the end of a multi-line string") }
+    for k := 0; k < count - 3; k++ { b.write_byte(q) }
+    return true
+  }
+  for k := 0; k < count; k++ { b.write_byte(q) }
+  return false
+}
+
+fn (p: *Parser) ml_basic_string() -> str {
+  p.i += 3
+  p.newline()
+  b := &strings.Builder{}
+  while true {
+    c := p.peek()
+    if c < 0 { p.fail("unterminated multi-line string") }
+    if c == QUOTE {
+      if p.ml_close(QUOTE, b) { break }
+      continue
+    }
+    if c == BACKSLASH {
+      # a backslash at the end of a line removes the newline and the whitespace that follows
+      j := p.i + 1
+      while j < p.n && (p.src[j] == SP || p.src[j] == TAB) { j++ }
+      if j < p.n && (p.src[j] == NL || (p.src[j] == CR && j + 1 < p.n && p.src[j + 1] == NL)) {
+        p.i = j
+        while p.peek() == SP || p.peek() == TAB || p.peek() == NL || p.peek() == CR {
+          if p.peek() == CR && p.peek_at(1) != NL { p.fail("control characters must be escaped in strings") }
+          p.advance()
+        }
+        continue
+      }
+      p.escape(b)
+      continue
+    }
+    if c == CR && p.peek_at(1) != NL { p.fail("control characters must be escaped in strings") }
+    p.check_char(c, true)
+    b.write_byte(c)
+    p.advance()
+  }
+  return b.string()
+}
+
+fn (p: *Parser) ml_literal_string() -> str {
+  p.i += 3
+  p.newline()
+  b := &strings.Builder{}
+  while true {
+    c := p.peek()
+    if c < 0 { p.fail("unterminated multi-line string") }
+    if c == APOS {
+      if p.ml_close(APOS, b) { break }
+      continue
+    }
+    if c == CR && p.peek_at(1) != NL { p.fail("control characters must be escaped in strings") }
+    p.check_char(c, true)
+    b.write_byte(c)
+    p.advance()
+  }
+  return b.string()
+}
+
+fn (p: *Parser) array() -> *Value {
+  p.i++
+  arr := new_array()
+  arr.inline = true
+  while true {
+    p.skip_blank()
+    if p.peek() == RBRACKET {
+      p.i++
+      break
+    }
+    arr.push(p.value())
+    p.skip_blank()
+    if p.peek() == COMMA {
+      p.i++
+      continue
+    }
+    if p.peek() == RBRACKET {
+      p.i++
+      break
+    }
+    p.fail("expected \",\" or \"]\" in the array, found " + p.describe())
+  }
+  return arr
+}
+
+fn (p: *Parser) inline_table() -> *Value {
+  p.i++
+  t := new_table()
+  p.skip_ws()
+  if p.peek() == RBRACE {
+    p.i++
+    t.inline = true
+    return t
+  }
+  while true {
+    p.keyval(t)
+    p.skip_ws()
+    if p.peek() == COMMA {
+      p.i++
+      p.skip_ws()
+      if p.peek() == RBRACE { p.fail("a trailing comma is not allowed in an inline table") }
+      continue
+    }
+    if p.peek() == RBRACE {
+      p.i++
+      break
+    }
+    p.fail("expected \",\" or \"}\" in the inline table, found " + p.describe())
+  }
+  t.inline = true
+  return t
+}
+
+# ---------------------------------------------------------------- encoder
+
+# canonical TOML text of a table: first its plain keys, then its tables ([a.b]) and arrays of
+# tables ([[a.b]]), each in insertion order
+export fn encode(root: *Value) -> str {
+  b := &strings.Builder{}
+  emit_table(b, root, "")
+  return b.string()
+}
+
+# an array whose items are all tables is written as [[x]] sections
+fn is_aot(v: *Value) -> bool {
+  if v.kind != "array" || len(v.items) == 0 { return false }
+  for _, it := range v.items { if it.kind != "table" { return false } }
+  return true
+}
+fn is_section(v: *Value) -> bool { return v.kind == "table" || is_aot(v) }
+
+fn has_plain(t: *Value) -> bool {
+  for _, k := range t.keys { if !is_section(t.fields[k]) { return true } }
+  return false
+}
+
+fn emit_table(b: *strings.Builder, t: *Value, prefix: str) {
+  for _, k := range t.keys {
+    v := t.fields[k]
+    if !is_section(v) {
+      b.write(key_text(k))
+      b.write(" = ")
+      b.write(value_text(v))
+      b.write("\n")
+    }
+  }
+  for _, k := range t.keys {
+    v := t.fields[k]
+    path := key_text(k)
+    if prefix != "" { path = prefix + "." + path }
+    if v.kind == "table" {
+      if has_plain(v) || len(v.keys) == 0 {
+        if b.len() > 0 { b.write("\n") }
+        b.write("[" + path + "]\n")
+      }
+      emit_table(b, v, path)
+    } else if is_aot(v) {
+      for _, it := range v.items {
+        if b.len() > 0 { b.write("\n") }
+        b.write("[[" + path + "]]\n")
+        emit_table(b, it, path)
+      }
+    }
+  }
+}
+
+# a key, bare when possible, quoted otherwise
+export fn key_text(k: str) -> str {
+  if len(k) == 0 { return "\"\"" }
+  for j := 0; j < len(k); j++ { if !is_bare(int(k[j])) { return quote(k) } }
+  return k
+}
+
+# a basic string with quotes and escapes
+export fn quote(s: str) -> str {
+  b := &strings.Builder{}
+  b.write_byte(QUOTE)
+  hexd := "0123456789abcdef"
+  for j := 0; j < len(s); j++ {
+    c := int(s[j])
+    if c == QUOTE { b.write("\\\"") } else if c == BACKSLASH { b.write("\\\\") } else if c == NL { b.write("\\n") } else if c == TAB { b.write("\\t") } else if c == CR { b.write("\\r") } else if c == 8 { b.write("\\b") } else if c == 12 { b.write("\\f") } else if c < 32 || c == 127 {
+      b.write("\\u00")
+      b.write_byte(int(hexd[c >> 4]))
+      b.write_byte(int(hexd[c & 15]))
+    } else { b.write_byte(c) }
+  }
+  b.write_byte(QUOTE)
+  return b.string()
+}
+
+# the TOML text of a value as it appears after "key = "
+export fn value_text(v: *Value) -> str {
+  if v.kind == "string" { return quote(v.s) }
+  if v.kind == "int" { return str(v.i) }
+  if v.kind == "float" { return format_float(v.f) }
+  if v.kind == "bool" {
+    if v.b { return "true" }
+    return "false"
+  }
+  if v.kind == "datetime" { return v.s }
+  if v.kind == "array" {
+    parts := []str{}
+    for _, it := range v.items { parts = append(parts, value_text(it)) }
+    return "[" + strings.join(parts, ", ") + "]"
+  }
+  if len(v.keys) == 0 { return "{}" }
+  kv := []str{}
+  for _, k := range v.keys { kv = append(kv, key_text(k) + " = " + value_text(v.fields[k])) }
+  return "{ " + strings.join(kv, ", ") + " }"
+}
+
+# ---------------------------------------------------------------- floats as text
+# The shortest decimal that reads back as the same double, in the same notation as Python's repr
+# (1.5, 0.0001, 1e-05, 1e+16, inf, nan), always with a "." or an exponent so it reads as a float.
+
+const LIMB = 1000000000
+
+fn big_mul_small(x: []int, k: int) -> []int {
+  carry := 0
+  for j := 0; j < len(x); j++ {
+    t := x[j] * k + carry
+    x[j] = t % LIMB
+    carry = t / LIMB
+  }
+  while carry > 0 {
+    x = append(x, carry % LIMB)
+    carry = carry / LIMB
+  }
+  return x
+}
+
+fn big_text(x: []int) -> str {
+  b := &strings.Builder{}
+  top := len(x) - 1
+  while top > 0 && x[top] == 0 { top-- }
+  b.write(str(x[top]))
+  for j := top - 1; j >= 0; j-- {
+    s := str(x[j])
+    for k := len(s); k < 9; k++ { b.write_byte(48) }
+    b.write(s)
+  }
+  return b.string()
+}
+
+fn zeros(n: int) -> str {
+  b := &strings.Builder{}
+  for k := 0; k < n; k++ { b.write_byte(48) }
+  return b.string()
+}
+
+# digits ds (no leading or trailing zeros) with the decimal point after p digits
+fn float_notation(neg: bool, ds: str, p: int) -> str {
+  out := ""
+  e := p - 1
+  if e >= -4 && e < 16 {
+    if p <= 0 {
+      out = "0." + zeros(-p) + ds
+    } else if p >= len(ds) {
+      out = ds + zeros(p - len(ds)) + ".0"
+    } else {
+      out = ds[0:p] + "." + ds[p:]
+    }
+  } else {
+    out = ds[0:1]
+    if len(ds) > 1 { out = out + "." + ds[1:] }
+    ae := e
+    es := "+"
+    if e < 0 {
+      ae = -e
+      es = "-"
+    }
+    et := str(ae)
+    if len(et) < 2 { et = "0" + et }
+    out = out + "e" + es + et
+  }
+  if neg { return "-" + out }
+  return out
+}
+
+export fn format_float(f: num) -> str {
+  if math.is_nan(f) { return "nan" }
+  if math.is_inf(f) {
+    if f > 0.0 { return "inf" }
+    return "-inf"
+  }
+  bits := math.bits(f)
+  neg := bits < 0
+  if f == 0.0 {
+    if neg { return "-0.0" }
+    return "0.0"
+  }
+  ex := (bits >> 52) & 0x7FF
+  m := bits & ((1 << 52) - 1)
+  e := -1074
+  if ex > 0 {
+    m = m | (1 << 52)
+    e = ex - 1075
+  }
+  # the exact value is digits * 10^-frac
+  x := []int{m % LIMB, (m / LIMB) % LIMB, m / LIMB / LIMB}
+  frac := 0
+  if e >= 0 {
+    rest := e
+    while rest > 0 {
+      k := rest
+      if k > 30 { k = 30 }
+      x = big_mul_small(x, 1 << k)
+      rest -= k
+    }
+  } else {
+    frac = -e
+    rest := frac
+    while rest > 0 {
+      k := rest
+      if k > 13 { k = 13 }
+      pw := 1
+      for q := 0; q < k; q++ { pw = pw * 5 }
+      x = big_mul_small(x, pw)
+      rest -= k
+    }
+  }
+  digits := big_text(x)
+  point := len(digits) - frac
+  for nd := 1; nd <= 17; nd++ {
+    ds := digits
+    p := point
+    if nd < len(digits) {
+      d := []int{}
+      for j := 0; j < nd; j++ { d = append(d, int(digits[j]) - 48) }
+      if int(digits[nd]) >= 53 {
+        j := nd - 1
+        while j >= 0 {
+          d[j]++
+          if d[j] < 10 { break }
+          d[j] = 0
+          j--
+        }
+        if j < 0 {
+          nd2 := []int{1}
+          for _, dv0 := range d { nd2 = append(nd2, dv0) }
+          d = nd2
+          p++
+        }
+      }
+      b := &strings.Builder{}
+      for _, dv := range d { b.write_byte(48 + dv) }
+      ds = b.string()
+    }
+    while len(ds) > 1 && ds[len(ds) - 1] == 48 { ds = ds[0:len(ds) - 1] }
+    text := float_notation(neg, ds, p)
+    back, err := strconv.parse_float(text)
+    if err == nil && math.bits(back) == bits { return text }
+  }
+  return str(f)
+}

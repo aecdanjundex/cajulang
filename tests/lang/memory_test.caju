@@ -1,0 +1,34 @@
+# Raw memory: alloc, peek, poke, readstr. The native compiler does not support them yet
+# (phase 7), so `caju test` skips this whole file until it does.
+import { describe, it, expect, run_file } from "std/testing"
+
+describe("raw memory", fn() {
+  it("poke writes and peek reads integers of each size, little endian", fn() {
+    let p = alloc(16)
+    poke32(p, 123456)
+    poke16(p + 4, 65535)
+    poke8(p + 6, 300)
+    expect([]any{peek32(p), peek16(p + 4), peek8(p + 6), peek64(p)}).to_equal([]any{123456, 65535, 44, 12666369657135680})
+    free(p)
+  })
+  it("readwstr reads UTF-16 and readstr stops at the first zero byte", fn() {
+    let p = alloc(16)
+    poke16(p, 72)
+    poke16(p + 2, 105)
+    poke16(p + 4, 225)
+    expect(readwstr(p)).to_equal("Hiá")
+    expect(readstr(p)).to_equal("H")
+    free(p)
+    free(0)
+  })
+  it("peek at address 0 is a runtime error", fn() {
+    r := run_file("testdata/null_peek.caju")
+    expect(r.output).to_equal("Runtime error in null_peek.caju, line 1: Null pointer in peek32.")
+    expect(r.code).to_equal(1)
+  })
+  it("poke checks the type of the value when compiling", fn() {
+    r := run_file("testdata/poke_type.caju")
+    expect(r.output).to_equal("Type error in poke_type.caju, line 4: poke32 expects int as argument 2, but got str.")
+    expect(r.code).to_equal(1)
+  })
+})

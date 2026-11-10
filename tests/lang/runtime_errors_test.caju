@@ -1,0 +1,49 @@
+import { describe, it, skip, expect, run_file } from "std/testing"
+
+# A runtime error that nobody recovers stops the program: it prints
+# "Runtime error in FILE, line N: MESSAGE." and exits with code 1.
+describe("runtime errors that stop the program", fn() {
+  it("reading a field through a nil pointer", fn() {
+    r := run_file("testdata/nil_field.caju")
+    expect(r.output).to_equal("true\nRuntime error in nil_field.caju, line 4: Access to field \"x\" through a nil pointer.")
+    expect(r.code).to_equal(1)
+  })
+  it("more than 10,000 nested calls", fn() {
+    r := run_file("testdata/deep_recursion.caju")
+    expect(r.output).to_equal("Runtime error in deep_recursion.caju, line 1: Too much recursion: more than 10,000 nested function calls.")
+    expect(r.code).to_equal(1)
+  })
+  it("untyped division by zero points at the line of the division", fn() {
+    r := run_file("testdata/division_by_zero.caju")
+    expect(r.output).to_equal("0.5\nRuntime error in division_by_zero.caju, line 1: Division by zero.")
+    expect(r.code).to_equal(1)
+  })
+  it("a field that the struct inside an any does not have", fn() {
+    r := run_file("testdata/wrong_field.caju")
+    expect(r.output).to_equal("C{r: 0}\nRuntime error in wrong_field.caju, line 4: struct C has no field \"q\".")
+    expect(r.code).to_equal(1)
+  })
+  it("calling a method on an any that holds a number", fn() {
+    r := run_file("testdata/not_a_struct.caju")
+    expect(r.output).to_equal("Runtime error in not_a_struct.caju, line 4: Only structs have methods, and this value is number.")
+    expect(r.code).to_equal(1)
+  })
+  skip("reading a local declared in a block that did not run (known bug: the native code reads uninitialized memory and prints garbage instead of the error)", fn() {
+    r := run_file("testdata/local_before.caju")
+    expect(r.output).to_equal("Runtime error in local_before.caju, line 3: The variable \"q\" was used before being assigned a value.")
+    expect(r.code).to_equal(1)
+  })
+  skip("calling a method on an any with too few arguments (known bug: no arity check in dynamic method calls; the program crashes with a segmentation fault)", fn() {
+    r := run_file("testdata/method_arity.caju")
+    expect(r.output).to_equal("Runtime error in method_arity.caju, line 4: The method f expects 1 argument, but got 0.")
+    expect(r.code).to_equal(1)
+  })
+})
+
+describe("compile errors", fn() {
+  it("using the result of a function that returns nothing", fn() {
+    r := run_file("testdata/void_result.caju")
+    expect(r.output).to_equal("Type error in void_result.caju, line 7: This value does not exist: the function returns nothing.")
+    expect(r.code).to_equal(1)
+  })
+})

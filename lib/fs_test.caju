@@ -1,0 +1,159 @@
+import "std/fs"
+import "std/os"
+import "std/path"
+import "std/strings"
+import { describe, it, expect, before_each, after_each } from "std/testing"
+
+describe("fs", fn() {
+  root := ""
+  # a/b/c/x.caju, a/b/y.txt (empty), a/z.txt ("zz", mode 0o600)
+  before_each(fn() {
+    r, err := fs.temp_dir("", "caju-fs-test-")
+    expect(err).to_be_nil()
+    root = r
+    expect(fs.mkdir_all(path.join(root, "a/b/c"), 0o755)).to_be_nil()
+    expect(fs.write_file(path.join(root, "a/b/c/x.caju"), "print(1)\n", 0o644)).to_be_nil()
+    expect(fs.write_file(path.join(root, "a/z.txt"), "zz", 0o600)).to_be_nil()
+    expect(fs.write_file(path.join(root, "a/b/y.txt"), "", 0o644)).to_be_nil()
+  })
+  after_each(fn() { fs.remove_all(root) })
+
+  describe("temp_dir", fn() {
+    it("creates a new empty directory", fn() {
+      t, err := fs.temp_dir("", "caju-fs-test-")
+      expect(err).to_be_nil()
+      expect(fs.is_dir(t)).to_be_true()
+      names, _ := fs.list_dir(t)
+      expect(names).to_have_length(0)
+      fs.remove(t)
+    })
+    it("creates it inside the directory given", fn() {
+      t, err := fs.temp_dir(root, "tmp-")
+      expect(err).to_be_nil()
+      expect(path.dir(t)).to_equal(root)
+      expect(path.base(t)).to_start_with("tmp-")
+    })
+  })
+
+  describe("mkdir_all", fn() {
+    it("creates every missing parent", fn() {
+      expect(fs.is_dir(path.join(root, "a/b/c"))).to_be_true()
+    })
+    it("does nothing for a directory that exists", fn() {
+      expect(fs.mkdir_all(path.join(root, "a/b/c"), 0o755)).to_be_nil()
+    })
+  })
+
+  describe("stat", fn() {
+    it("describes a regular file", fn() {
+      fi, err := fs.stat(path.join(root, "a/b/c/x.caju"))
+      expect(err).to_be_nil()
+      expect(fi.name).to_equal("x.caju")
+      expect(fi.size).to_equal(9)
+      expect(fi.is_file).to_be_true()
+      expect(fi.is_dir).to_be_false()
+      expect(fi.mode).to_equal(0o644)
+      expect(fi.mtime).to_be_greater_than(0)
+    })
+    it("describes a directory", fn() {
+      fi, _ := fs.stat(path.join(root, "a"))
+      expect(fi.is_dir).to_be_true()
+      expect(fi.is_file).to_be_false()
+    })
+    it("returns an error for a missing file", fn() {
+      _, err := fs.stat(path.join(root, "nope"))
+      expect(err.Error()).to_end_with(": no such file or directory")
+    })
+  })
+
+  describe("append_file", fn() {
+    it("adds to the end of the file", fn() {
+      expect(fs.append_file(path.join(root, "a/z.txt"), "-more", 0o600)).to_be_nil()
+      s, _ := fs.read_file(path.join(root, "a/z.txt"))
+      expect(s).to_equal("zz-more")
+    })
+  })
+
+  describe("listing", fn() {
+    it("lists the names of a directory, sorted", fn() {
+      names, err := fs.list_dir(path.join(root, "a"))
+      expect(err).to_be_nil()
+      expect(names).to_equal([]str{"b", "z.txt"})
+    })
+    it("tells directories from files in read_dir", fn() {
+      es, _ := fs.read_dir(path.join(root, "a"))
+      expect(len(es)).to_equal(2)
+      expect([]bool{es[0].is_dir, es[0].is_file, es[0].is_symlink}).to_equal([]bool{true, false, false})
+      expect([]bool{es[1].is_dir, es[1].is_file, es[1].is_symlink}).to_equal([]bool{false, true, false})
+    })
+    it("walks the whole tree depth first, in order", fn() {
+      all, err := fs.walk(root)
+      expect(err).to_be_nil()
+      expect(all).to_equal([]str{"a", "a/b", "a/b/c", "a/b/c/x.caju", "a/b/y.txt", "a/z.txt"})
+    })
+    it("walks only the files with walk_files", fn() {
+      files, _ := fs.walk_files(root)
+      expect(files).to_equal([]str{"a/b/c/x.caju", "a/b/y.txt", "a/z.txt"})
+    })
+    it("finds paths that match a pattern with glob", fn() {
+      txt, _ := fs.glob(root, "a/*.txt")
+      expect(txt).to_equal([]str{"a/z.txt"})
+      deep, _ := fs.glob(root, "*/*/*/*.caju")
+      expect(deep).to_equal([]str{"a/b/c/x.caju"})
+    })
+  })
+
+  describe("symbolic links", fn() {
+    it("creates a link and reads where it points", fn() {
+      link := path.join(root, "a/link")
+      expect(fs.symlink("b/c/x.caju", link)).to_be_nil()
+      l, _ := fs.lstat(link)
+      expect(l.is_symlink).to_be_true()
+      t, _ := fs.readlink(link)
+      expect(t).to_equal("b/c/x.caju")
+      expect(fs.is_file(link)).to_be_true()
+    })
+  })
+
+  describe("copying and renaming", fn() {
+    it("copies a directory tree, keeping links as links", fn() {
+      fs.symlink("b/c/x.caju", path.join(root, "a/link"))
+      expect(fs.copy_dir(path.join(root, "a"), path.join(root, "copy"))).to_be_nil()
+      all, _ := fs.walk(path.join(root, "copy"))
+      expect(all).to_equal([]str{"b", "b/c", "b/c/x.caju", "b/y.txt", "link", "z.txt"})
+      c, _ := fs.read_file(path.join(root, "copy/link"))
+      expect(c).to_equal("print(1)\n")
+    })
+    it("refuses to copy over a directory that exists", fn() {
+      fs.copy_dir(path.join(root, "a"), path.join(root, "copy"))
+      err := fs.copy_dir(path.join(root, "a"), path.join(root, "copy"))
+      expect(err.Error()).to_end_with("/copy already exists")
+    })
+    it("renames a directory", fn() {
+      expect(fs.rename(path.join(root, "a"), path.join(root, "moved"))).to_be_nil()
+      expect(fs.exists(path.join(root, "a"))).to_be_false()
+      expect(fs.is_dir(path.join(root, "moved"))).to_be_true()
+    })
+    it("copies a file with its permission bits", fn() {
+      expect(fs.copy_file(path.join(root, "a/z.txt"), path.join(root, "z2.txt"))).to_be_nil()
+      z2, _ := fs.stat(path.join(root, "z2.txt"))
+      expect(z2.mode).to_equal(0o600)
+      expect(z2.size).to_equal(2)
+    })
+  })
+
+  describe("removing", fn() {
+    it("refuses to remove a directory that is not empty", fn() {
+      err := fs.remove(path.join(root, "a"))
+      expect(err.Error()).to_end_with("directory not empty")
+    })
+    it("removes a whole tree with remove_all", fn() {
+      expect(fs.remove_all(root)).to_be_nil()
+      expect(fs.exists(root)).to_be_false()
+    })
+    it("does nothing when removing a tree that does not exist", fn() {
+      fs.remove_all(root)
+      expect(fs.remove_all(root)).to_be_nil()
+    })
+  })
+})

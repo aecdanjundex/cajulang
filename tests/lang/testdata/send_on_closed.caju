@@ -1,0 +1,4 @@
+c := make(chan int, 2)
+c <- 1
+close(c)
+c <- 5

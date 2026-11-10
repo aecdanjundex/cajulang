@@ -1,0 +1,99 @@
+import "std/path"
+import { describe, it, expect } from "std/testing"
+
+describe("path.clean", fn() {
+  it("removes repeated slashes, dots and dir/.. pairs", fn() {
+    expect(path.clean("a//b/./c/../d/")).to_equal("a/b/d")
+  })
+  it("does not go above the root", fn() {
+    expect(path.clean("/../x")).to_equal("/x")
+    expect(path.clean("/")).to_equal("/")
+  })
+  it("keeps leading .. of a relative path", fn() {
+    expect(path.clean("../../a")).to_equal("../../a")
+  })
+  it("turns an empty path into .", fn() {
+    expect(path.clean("")).to_equal(".")
+  })
+})
+
+describe("path.join", fn() {
+  it("joins two paths and cleans the result", fn() {
+    expect(path.join("a", "b/c")).to_equal("a/b/c")
+    expect(path.join("/a/", "../b")).to_equal("/b")
+  })
+  it("ignores empty parts", fn() {
+    expect(path.join("", "x")).to_equal("x")
+    expect(path.join_all([]str{"a", "", "b", "c.caju"})).to_equal("a/b/c.caju")
+  })
+})
+
+describe("path.base and path.dir", fn() {
+  it("gives the last part", fn() {
+    expect(path.base("/a/b.caju")).to_equal("b.caju")
+    expect(path.base("a/b/")).to_equal("b")
+    expect(path.base("/")).to_equal("/")
+  })
+  it("gives everything but the last part", fn() {
+    expect(path.dir("/a/b.caju")).to_equal("/a")
+    expect(path.dir("b.caju")).to_equal(".")
+    expect(path.dir("/x")).to_equal("/")
+  })
+})
+
+describe("path.ext and path.stem", fn() {
+  it("gives the extension of the last part", fn() {
+    expect(path.ext("a/b.tar.gz")).to_equal(".gz")
+    expect(path.ext("a/b")).to_equal("")
+  })
+  it("does not take a leading dot as an extension", fn() {
+    expect(path.ext("a/.hidden")).to_equal("")
+  })
+  it("gives the name without the extension", fn() {
+    expect(path.stem("dir/main.caju")).to_equal("main")
+  })
+})
+
+describe("path.is_abs and path.abs", fn() {
+  it("tells absolute paths", fn() {
+    expect(path.is_abs("/a")).to_be_true()
+    expect(path.is_abs("a")).to_be_false()
+  })
+  it("makes a relative path absolute", fn() {
+    expect(path.is_abs(path.abs("a"))).to_be_true()
+  })
+})
+
+describe("path.rel", fn() {
+  it("goes up and down between absolute paths", fn() {
+    r, err := path.rel("/a/b", "/a/c/d")
+    expect(err).to_be_nil()
+    expect(r).to_equal("../c/d")
+  })
+  it("works between relative paths", fn() {
+    r, _ := path.rel("a", "a/b/c")
+    expect(r).to_equal("b/c")
+  })
+  it("refuses an absolute and a relative path together", fn() {
+    _, err := path.rel("/a", "b")
+    expect(err).to_be_error("rel: b and /a must both be absolute or both relative")
+  })
+})
+
+describe("path.split_all", fn() {
+  it("gives the parts without empty ones", fn() {
+    expect(path.split_all("/a//b/")).to_equal([]str{"a", "b"})
+  })
+})
+
+describe("path.match", fn() {
+  it("matches * within one part only", fn() {
+    expect(path.match("*.caju", "main.caju")).to_be_true()
+    expect(path.match("*.caju", "dir/main.caju")).to_be_false()
+  })
+  it("matches ? and character classes", fn() {
+    expect(path.match("?a[bc]", "xab")).to_be_true()
+    expect(path.match("[!a-c]x", "dx")).to_be_true()
+    expect(path.match("[!a-c]x", "bx")).to_be_false()
+  })
+})

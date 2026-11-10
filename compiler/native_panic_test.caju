@@ -1,0 +1,131 @@
+# defer, panic and recover in the native compiler (migrated from tests/native/panic.caju)
+import { describe, it, expect, before_each, run_file } from "std/testing"
+
+let log: []str = []str{}
+fn note(s: str) { log = append(log, s) }
+
+fn level(n: int) {
+  defer note("leaving level " + str(n))
+  if n == 0 { panic("bottom") }
+  level(n - 1)
+}
+fn protect(name: str, f: fn()) {
+  defer fn() {
+    r := recover()
+    note(name + " recovered: " + str(r))
+  }()
+  f()
+  note(name + " finished normally")
+}
+
+fn helper() -> any { return recover() }
+fn indirect() -> (r: str) {
+  defer fn() {
+    x := helper()
+    note("helper saw: " + str(x))
+    y := recover()
+    r = "caught " + str(y)
+  }()
+  panic("x")
+}
+
+fn double() -> (s: str) {
+  defer fn() { s = s + " | second: " + str(recover()) }()
+  defer fn() { panic("again") }()
+  panic("first")
+}
+
+fn count() -> (n: int) {
+  defer fn() { n *= 10 }()
+  defer fn() { n += 1 }()
+  n = 4
+  return n + 1
+}
+
+struct Err { code: int }
+fn fail_with() -> (e: any) {
+  defer fn() { e = recover() }()
+  panic(Err{7})
+}
+
+fn bottom(n: int) -> int { return bottom(n + 1) + 1 }
+fn recursion() -> (msg: str) {
+  defer fn() { msg = str(recover()) }()
+  bottom(0)
+  return "never reached"
+}
+
+struct Cnt { v: int }
+fn (c: Cnt) show(tag: str) { note(tag + " " + str(c.v)) }
+fn method() {
+  c := Cnt{1}
+  defer c.show("deferred")
+  c.v = 99
+  note("now " + str(c.v))
+}
+
+fn loop() {
+  for i := 0; i < 3; i++ { defer fn() { note("closure " + str(i)) }() }
+}
+
+fn errs() {
+  defer fn() {
+    if r := recover(); r != nil {
+      if e, ok := r.(error); ok { note("error: " + e.Error()) }
+    }
+  }()
+  let m: map[str]int = nil
+  m["x"] = 1
+}
+
+describe("panic and recover", fn() {
+  before_each(fn() { log = []str{} })
+  it("runs the deferred calls of every level while unwinding, then recovers", fn() {
+    protect("a", fn() { level(3) })
+    expect(log).to_equal([]str{"leaving level 0", "leaving level 1", "leaving level 2", "leaving level 3", "a recovered: bottom"})
+  })
+  it("gives nil to recover when nothing panicked", fn() {
+    protect("b", fn() { note("nothing") })
+    expect(log).to_equal([]str{"nothing", "b finished normally", "b recovered: nil"})
+  })
+  it("only recovers in the deferred function itself, not in a function it calls", fn() {
+    expect(indirect()).to_equal("caught x")
+    expect(log).to_equal([]str{"helper saw: nil"})
+  })
+  it("replaces the panic when a deferred call panics again", fn() {
+    expect(double()).to_equal(" | second: again")
+  })
+  it("returns any value given to panic", fn() {
+    expect(fail_with()).to_equal(Err{7})
+  })
+  it("turns too deep a recursion into a recoverable error", fn() {
+    expect(recursion()).to_equal("Too much recursion: more than 10,000 nested function calls")
+  })
+  it("turns runtime errors into recoverable error values", fn() {
+    errs()
+    expect(log).to_equal([]str{"error: Assignment to a nil map or slice"})
+  })
+  it("gives nil outside of a deferred call", fn() {
+    expect(recover()).to_be_nil()
+  })
+})
+
+describe("defer", fn() {
+  before_each(fn() { log = []str{} })
+  it("lets deferred calls change named results, last deferred first", fn() {
+    expect(count()).to_equal(60)
+  })
+  it("evaluates the receiver and the arguments when the defer runs", fn() {
+    method()
+    expect(log).to_equal([]str{"now 99", "deferred 1"})
+  })
+  it("runs the calls deferred in a loop in reverse order", fn() {
+    loop()
+    expect(log).to_equal([]str{"closure 2", "closure 1", "closure 0"})
+  })
+  it("still runs when a runtime error stops the program", fn() {
+    r := run_file("testdata/panic_unrecovered.caju")
+    expect(r.output).to_equal("defer runs before the end\nRuntime error in panic_unrecovered.caju, line 6: Access to field \"v\" through a nil pointer.")
+    expect(r.code).to_equal(1)
+  })
+})

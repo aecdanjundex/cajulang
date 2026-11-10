@@ -1,0 +1,61 @@
+import { describe, it, expect } from "std/testing"
+
+describe("texts", fn() {
+  it("range gives the byte position and the rune of each character", fn() {
+    got := []str{}
+    for i, c := range "café" { got = append(got, str(i) + " " + str(c) + " " + string(c)) }
+    expect(got).to_equal([]str{"0 99 c", "1 97 a", "2 102 f", "3 233 é"})
+  })
+  it("range handles multi-byte runes and spaces", fn() {
+    got := []str{}
+    for i, r := range "Café ☕" { got = append(got, str(i) + " " + str(r) + " " + string(r)) }
+    expect(got).to_equal([]str{"0 67 C", "1 97 a", "2 102 f", "3 233 é", "5 32  ", "6 9749 ☕"})
+  })
+  it("range over a 4-byte rune advances by 4", fn() {
+    got := []str{}
+    for i, r := range "aé😀" { got = append(got, str(i) + " " + str(r)) }
+    expect(got).to_equal([]str{"0 97", "1 233", "3 128512"})
+  })
+  it("converts to bytes and runes and back", fn() {
+    bs := []byte("abc")
+    expect(bs).to_equal([]int{97, 98, 99})
+    expect(string(bs)).to_equal("abc")
+    expect([]rune("é!")).to_equal([]int{233, 33})
+    expect([]byte("é")).to_equal([]int{195, 169})
+    expect([]rune("é😀")).to_equal([]int{233, 128512})
+    expect(str([]byte{72, 105})).to_equal("[72 105]")
+  })
+  it("len counts bytes, not characters", fn() {
+    expect(len("é")).to_equal(2)
+    expect(len([]rune("é"))).to_equal(1)
+    expect(len("café")).to_equal(5)
+  })
+  it("indexing gives a byte and slicing gives a substring", fn() {
+    s := "Héllo, world"
+    expect(len(s)).to_equal(13)
+    expect(s[0]).to_equal(72)
+    expect(s[1:4]).to_equal("él")
+    expect(s[5:]).to_equal("o, world")
+  })
+  it("a substring cut in the middle of a character is not the escaped text", fn() {
+    expect("café"[2:4] == "f\xc3").to_be_false()
+  })
+  it("rune literals and string(rune)", fn() {
+    r := 'é'
+    expect(r).to_equal(233)
+    expect(string(r)).to_equal("é")
+    expect(string(rune(65))).to_equal("A")
+    expect(string(65)).to_equal("A")
+    expect(string(0x1F600)).to_equal("😀")
+  })
+  it("concatenates with str() and compares by bytes", fn() {
+    expect(str(3) + "!").to_equal("3!")
+    expect("a" < "b").to_be_true()
+    expect("façade" > "facade").to_be_true()
+  })
+  it("+ builds long texts", fn() {
+    txt := ""
+    for i := 0; i < 2000; i++ { txt = txt + "ab" }
+    expect(len(txt)).to_equal(4000)
+  })
+})

@@ -1,0 +1,56 @@
+# Programs that only run on Windows (FFI with extern, DLLs, message boxes): on Linux we check
+# that the native compiler builds each one into a Windows executable (a PE file, starting with
+# "MZ"). The programs are in testdata/windows/ (migrated from tests/windows/).
+import "std/os"
+import "std/fs"
+import { describe, it, skip, expect } from "std/testing"
+
+# builds a program for Windows; the compiler's output and the first two bytes of the .exe
+fn build_windows(file: str) -> (out: str, head: str) {
+  tmp, err0 := fs.temp_dir("", "caju-windows-test-")
+  expect(err0).to_be_nil()
+  defer fs.remove_all(tmp)
+  exe := tmp + "/program.exe"
+  p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "--target", "windows", "-o", exe, file}, nil, true)
+  expect(err).to_be_nil()
+  expect(p.output).to_equal("")
+  expect(p.code).to_equal(0)
+  data, err2 := os.read_file(exe)
+  expect(err2).to_be_nil()
+  return p.output, data[0:2]
+}
+
+describe("building for Windows", fn() {
+  it("builds a program that calls user32 to show a message box", fn() {
+    _, head := build_windows("testdata/windows/windows-message-box.caju")
+    expect(head).to_equal("MZ")
+  })
+  it("builds a program that beeps and sleeps through kernel32", fn() {
+    _, head := build_windows("testdata/windows/windows-beeps-and-pauses.caju")
+    expect(head).to_equal("MZ")
+  })
+  it("builds a program with dllexport functions (as an executable for now)", fn() {
+    _, head := build_windows("testdata/windows/dll-calculator.caju")
+    expect(head).to_equal("MZ")
+  })
+  it("builds a program of several files that exports DLL functions", fn() {
+    _, head := build_windows("testdata/windows/dll-geometry-in-modules/main.caju")
+    expect(head).to_equal("MZ")
+  })
+  it("builds a program that uses a Windows library written in Caju", fn() {
+    _, head := build_windows("testdata/windows/windows-caju-windows-library/main.caju")
+    expect(head).to_equal("MZ")
+  })
+  skip("builds a DLL program that uses channels (needs goroutines and channels: phase 6)", fn() {
+    build_windows("testdata/windows/dll-prog.caju")
+  })
+  skip("builds a program that reads wide strings from a DLL (needs readwstr: phase 7)", fn() {
+    build_windows("testdata/windows/ffi.caju")
+  })
+  skip("builds a program that reads the date and the computer name (needs alloc: phase 7)", fn() {
+    build_windows("testdata/windows/windows-date-and-computer.caju")
+  })
+  skip("builds a program that reads the system memory status (needs alloc: phase 7)", fn() {
+    build_windows("testdata/windows/windows-system-memory.caju")
+  })
+})

@@ -1,1 +1,0 @@
-Link error in main.caju, line 3: "SECRET" exists in data.caju but is not exported. Write export before its declaration.

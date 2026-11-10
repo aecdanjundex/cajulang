@@ -1,4 +1,0 @@
-Ana: insufficient balance to withdraw 500
-• Ana has $ 120 (operations: 2)
-• Bia has $ 15 (operations: 1)
-Account{owner: "Ana", balance: 120, operations: 2}

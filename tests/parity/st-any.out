@@ -1,2 +1,0 @@
-27 3
-Runtime error in st-any.caju, line 8: Only structs have methods, and this value is number.

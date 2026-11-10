@@ -1,1 +1,0 @@
-Type error in types-type-error.caju, line 12: Parameter "product" of label is str, but got num. Use str(...) to convert to a string.

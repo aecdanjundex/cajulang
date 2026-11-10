@@ -1,0 +1,103 @@
+import { describe, it, expect } from "std/testing"
+
+fn divide(a: int, b: int) -> (int, error) {
+  if b == 0 { return 0, errors.New("division by zero") }
+  return a / b, nil
+}
+
+fn minmax(xs: []int) -> (lo: int, hi: int) {
+  lo = xs[0]
+  hi = xs[0]
+  for _, x := range xs {
+    if x < lo { lo = x }
+    if x > hi { hi = x }
+  }
+  return
+}
+
+# untyped functions (gradual typing: parameters without a type are any)
+fn factorial(n) {
+  if n <= 1 { return 1 }
+  return n * factorial(n - 1)
+}
+fn fib(n) {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+fn sum_to(n) {
+  if n == 0 { return 0 }
+  let t = 0
+  for i = 1 to n { t = t + i }
+  return t + sum_to(n - 1)
+}
+fn even(n) {
+  if n == 0 { return true }
+  return odd(n - 1)
+}
+fn odd(n) {
+  if n == 0 { return false }
+  return even(n - 1)
+}
+fn repeat(t, n) {
+  let r = ""
+  for i = 1 to n { r = r + t }
+  return r
+}
+fn half(a, b) { return a / b }
+
+const PI = 3
+let x = 10
+fn shadow(x) {
+  let PI = 99
+  return x + PI
+}
+
+let counter = 0
+fn increment(q) { counter = counter + q }
+
+describe("functions", fn() {
+  it("return a result and an error", fn() {
+    q, err := divide(10, 3)
+    expect(q).to_equal(3)
+    expect(err).to_be_nil()
+    q, err = divide(1, 0)
+    expect(err).to_be_error("division by zero")
+  })
+  it("named results are returned by a bare return", fn() {
+    lo, hi := minmax([]int{5, 2, 9, 1})
+    expect([]int{lo, hi}).to_equal([]int{1, 9})
+  })
+  it("recurse (factorial; past 2^53 numbers become floats, factorial(170) prints 0 like the VM)", fn() {
+    expect(factorial(10)).to_equal(3628800)
+    expect(str(factorial(20))).to_equal("2432902008176640000")
+    expect(str(factorial(170))).to_equal("0")
+  })
+  it("recurse twice (fibonacci)", fn() {
+    got := []any{}
+    for i = 0 to 22 { got = append(got, fib(i)) }
+    expect(got).to_equal([]any{0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765, 10946, 17711})
+  })
+  it("keep their own locals in each recursive call", fn() {
+    expect(sum_to(60)).to_equal(37820)
+  })
+  it("can call each other before being declared (mutual recursion)", fn() {
+    expect([]any{even(1000), odd(777), even(7)}).to_equal([]any{true, true, false})
+  })
+  it("without types work on texts too", fn() {
+    expect(repeat("ab", 5)).to_equal("ababababab")
+    expect(repeat("é", 3)).to_equal("ééé")
+  })
+  it("untyped division of numbers gives a float", fn() {
+    expect(half(1, 2)).to_equal(0.5)
+  })
+  it("parameters and locals shadow globals and constants", fn() {
+    expect(shadow(1)).to_equal(100)
+    expect(x).to_equal(10)
+    expect(PI).to_equal(3)
+  })
+  it("can change globals", fn() {
+    increment(5)
+    increment(7)
+    expect(counter).to_equal(12)
+  })
+})

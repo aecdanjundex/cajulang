@@ -1,0 +1,7 @@
+# used by os_test.caju: print and os.stdout keep their order; os.exit ends with a code
+import "std/os"
+print("before")
+os.stdout("raw stdout\n")
+print("after")
+os.exit(3)
+print("not printed")

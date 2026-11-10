@@ -1,0 +1,62 @@
+import "std/strconv"
+import "std/math"
+import { describe, it, expect } from "std/testing"
+
+describe("strconv.format_int", fn() {
+  it("writes a number in any base", fn() {
+    expect(strconv.format_int(255, 16)).to_equal("ff")
+    expect(strconv.format_int(-255, 2)).to_equal("-11111111")
+  })
+  it("writes the smallest int", fn() {
+    expect(strconv.format_int(math.MIN_INT, 10)).to_equal("-9223372036854775808")
+  })
+})
+
+describe("strconv.parse_int", fn() {
+  it("reads a 0x prefix when the base is 0", fn() {
+    v, err := strconv.parse_int("0x7fffffffffffffff", 0)
+    expect(err).to_be_nil()
+    expect(v).to_equal(math.MAX_INT)
+  })
+  it("reads the smallest int", fn() {
+    v, err := strconv.parse_int("-9223372036854775808", 10)
+    expect(err).to_be_nil()
+    expect(v).to_equal(math.MIN_INT)
+  })
+  it("returns an error for a number that does not fit in 64 bits", fn() {
+    v, err := strconv.parse_int("9223372036854775808", 10)
+    expect(v).to_equal(0)
+    expect(err).to_be_error("number out of range: \"9223372036854775808\"")
+  })
+})
+
+describe("strconv.atoi", fn() {
+  it("returns an error for a text that is not a number", fn() {
+    v, err := strconv.atoi("12a")
+    expect(v).to_equal(0)
+    expect(err).to_be_error("invalid number: \"12a\"")
+  })
+})
+
+describe("strconv.parse_float", fn() {
+  it("gives the same double as JavaScript's Number(text), bit for bit", fn() {
+    inputs := []str{"0.1", "1.5", "3.14159", "1e21", "1e-7", "5e-324", "2.2250738585072014e-308", "1.7976931348623157e308", "1e400", "9007199254740993", "0.30000000000000004", "123456789012345678901234567890", "4.9406564584124654e-324", "2.4703282292062327e-324", "2.4703282292062328e-324", "1_000.5", ".5", "7e22", "1e23", "8.98846567431158e307", "0.000001", "1.0000000000000002"}
+    got := []str{}
+    for _, s := range inputs {
+      f, e := strconv.parse_float(s)
+      expect(e).to_be_nil()
+      got = append(got, str(math.bits(f)))
+    }
+    expect(got).to_equal([]str{"4591870180066957722", "4609434218613702656", "4614256650576692846", "4921056587992461136", "4502148214488346440", "1", "4503599627370496", "9218868437227405311", "9218868437227405312", "4845873199050653696", "4599075939470750516", "5042042089369253694", "1", "0", "1", "4652011706887700480", "4602678819172646912", "4948793441493988800", "4950912855330343670", "9214364837600034816", "4517329193108106637", "4607182418800017409"})
+  })
+  it("returns an error for a malformed number", fn() {
+    _, e := strconv.parse_float("1.2.3")
+    expect(e).to_be_error("invalid number: \"1.2.3\"")
+  })
+})
+
+describe("strconv.quote", fn() {
+  it("writes a text in quotes with escapes", fn() {
+    expect(strconv.quote("a\"b\\c\n\t\x01")).to_equal("\"a\\\"b\\\\c\\n\\t\\x01\"")
+  })
+})

@@ -1,0 +1,356 @@
+import "std/toml"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+fn dump(v: *toml.Value) -> str {
+  if v.kind == "bool" {
+    if v.b { return "true" }
+    return "false"
+  }
+  if v.kind == "int" { return "i:" + str(v.i) }
+  if v.kind == "float" { return "f:" + toml.format_float(v.f) }
+  if v.kind == "string" { return toml.quote(v.s) }
+  if v.kind == "datetime" { return "d:" + v.s }
+  if v.kind == "array" {
+    parts := []str{}
+    for _, it := range v.items { parts = append(parts, dump(it)) }
+    return "[" + strings.join(parts, ", ") + "]"
+  }
+  kv := []str{}
+  for _, k := range v.keys { kv = append(kv, toml.quote(k) + ": " + dump(v.fields[k])) }
+  return "{" + strings.join(kv, ", ") + "}"
+}
+
+# the same as dump, with the keys of every table sorted (encode puts plain values before tables)
+fn sorted_dump(v: *toml.Value) -> str {
+  if v.kind == "array" {
+    parts := []str{}
+    for _, it := range v.items { parts = append(parts, sorted_dump(it)) }
+    return "[" + strings.join(parts, ", ") + "]"
+  }
+  if v.kind != "table" { return dump(v) }
+  keys := []str{}
+  for _, k := range v.keys { keys = append(keys, k) }
+  for a := 1; a < len(keys); a++ {
+    for c := a; c > 0 && keys[c] < keys[c - 1]; c-- {
+      t := keys[c]
+      keys[c] = keys[c - 1]
+      keys[c - 1] = t
+    }
+  }
+  kv := []str{}
+  for _, k := range keys { kv = append(kv, toml.quote(k) + ": " + sorted_dump(v.fields[k])) }
+  return "{" + strings.join(kv, ", ") + "}"
+}
+
+# parse(encode(v)) has the same data, and encoding again gives the same text
+fn round_trip(v: *toml.Value) -> bool {
+  text := toml.encode(v)
+  again, err := toml.parse(text)
+  return err == nil && sorted_dump(again) == sorted_dump(v) && toml.encode(again) == text
+}
+
+let docs: []str = []str{
+  "# manifest\n[package]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndescription = \"JSON for Caju\"\nauthors = [\"Aecio\"]\nlicense = \"MIT\"\nentry = \"json.caju\"\n\n[dependencies]\n\"github.com/aecdanjundex/strutil\" = \"0.3.1\"\n",
+  "version = 1\n[[package]]\nname = \"github.com/aecdanjundex/strutil\"\nversion = \"0.3.1\"\ncommit = \"0123abcd\"\nhash = \"sha256-abc\"\ndependencies = []\n\n[[package]]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndependencies = [\"github.com/aecdanjundex/strutil\"]\n",
+  "bare_key-1 = 1\n\"quoted key\" = 2\n'literal.key' = 3\na.b.c = 4\na . b . d = 5\n\"\" = 6\nsite.\"google.com\" = true\n",
+  "s1 = \"tab\\there \\\"q\\\" back\\\\slash \\u00e9 \\U0001F600 \\b\\f\"\ns2 = 'C:\\Users\\nodejs'\ns3 = \"\"\"\nroses\nare \"red\"\"\"\"\ns4 = \"\"\"\\\n    The quick \\\n    brown fox.\"\"\"\ns5 = '''\nfirst line\n  'quoted' line'''\ns6 = \"\"\"two quotes at the end\"\"\"\"\"\ns7 = \"olá 世界\"\n",
+  "i1 = +99\ni2 = -17\ni3 = 0\ni4 = 1_000_000\nh = 0xDEAD_beef\no = 0o755\nb = 0b1101\nmax = 9223372036854775807\nmin = -9223372036854775808\nf1 = 3.1415\nf2 = -0.01\nf3 = 5e+22\nf4 = 1e06\nf5 = -2E-2\nf6 = 6.626e-34\nf7 = 224_617.445_991\nf8 = inf\nf9 = -inf\nf10 = nan\nf11 = -0.0\nf12 = 0.1\n",
+  "a1 = [ 1, 2, 3 ]\na2 = [ \"red\", \"yellow\", ]\na3 = [ [ 1, 2 ], [\"a\", 'b'] ]\na4 = [\n  1, # one\n  2,\n]\na5 = []\na6 = [ { x = 1 }, { y = 2, z = [true] } ]\n",
+  "name = { first = \"Tom\", last = \"Preston-Werner\" }\npoint = { x = 1, y = 2 }\nanimal = { type.name = \"pug\" }\nempty = {}\n\n[fruit]\napple.color = \"red\"\napple.taste.sweet = true\n\n[fruit.apple.texture]\nsmooth = true\n\n[x.y.z.w]\nv = 1\n\n[x]\nu = 2\n",
+  "[[fruits]]\nname = \"apple\"\n\n[fruits.physical]\ncolor = \"red\"\n\n[[fruits.varieties]]\nname = \"red delicious\"\n\n[[fruits.varieties]]\nname = \"granny smith\"\n\n[[fruits]]\nname = \"banana\"\n\n[[fruits.varieties]]\nname = \"plantain\"\n",
+}
+
+
+describe("toml.parse", fn() {
+  it("reads a caju.toml manifest", fn() {
+    doc, err := toml.parse(docs[0])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"package\": {\"name\": \"github.com/aecdanjundex/json\", \"version\": \"1.2.0\", \"description\": \"JSON for Caju\", \"authors\": [\"Aecio\"], \"license\": \"MIT\", \"entry\": \"json.caju\"}, \"dependencies\": {\"github.com/aecdanjundex/strutil\": \"0.3.1\"}}")
+  })
+  it("reads a caju.lock with arrays of tables", fn() {
+    doc, err := toml.parse(docs[1])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"version\": i:1, \"package\": [{\"name\": \"github.com/aecdanjundex/strutil\", \"version\": \"0.3.1\", \"commit\": \"0123abcd\", \"hash\": \"sha256-abc\", \"dependencies\": []}, {\"name\": \"github.com/aecdanjundex/json\", \"version\": \"1.2.0\", \"dependencies\": [\"github.com/aecdanjundex/strutil\"]}]}")
+  })
+  it("reads bare, quoted, literal and dotted keys", fn() {
+    doc, err := toml.parse(docs[2])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"bare_key-1\": i:1, \"quoted key\": i:2, \"literal.key\": i:3, \"a\": {\"b\": {\"c\": i:4, \"d\": i:5}}, \"\": i:6, \"site\": {\"google.com\": true}}")
+  })
+  it("reads basic, literal and multi-line strings with escapes", fn() {
+    doc, err := toml.parse(docs[3])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"s1\": \"tab\\there \\\"q\\\" back\\\\slash é 😀 \\b\\f\", \"s2\": \"C:\\\\Users\\\\nodejs\", \"s3\": \"roses\\nare \\\"red\\\"\", \"s4\": \"The quick brown fox.\", \"s5\": \"first line\\n  'quoted' line\", \"s6\": \"two quotes at the end\\\"\\\"\", \"s7\": \"olá 世界\"}")
+  })
+  it("reads integers in every base and floats, inf and nan", fn() {
+    doc, err := toml.parse(docs[4])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"i1\": i:99, \"i2\": i:-17, \"i3\": i:0, \"i4\": i:1000000, \"h\": i:3735928559, \"o\": i:493, \"b\": i:13, \"max\": i:9223372036854775807, \"min\": i:-9223372036854775808, \"f1\": f:3.1415, \"f2\": f:-0.01, \"f3\": f:5e+22, \"f4\": f:1000000.0, \"f5\": f:-0.02, \"f6\": f:6.626e-34, \"f7\": f:224617.445991, \"f8\": f:inf, \"f9\": f:-inf, \"f10\": f:nan, \"f11\": f:-0.0, \"f12\": f:0.1}")
+  })
+  it("reads arrays, nested and multi-line, with trailing commas", fn() {
+    doc, err := toml.parse(docs[5])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"a1\": [i:1, i:2, i:3], \"a2\": [\"red\", \"yellow\"], \"a3\": [[i:1, i:2], [\"a\", \"b\"]], \"a4\": [i:1, i:2], \"a5\": [], \"a6\": [{\"x\": i:1}, {\"y\": i:2, \"z\": [true]}]}")
+  })
+  it("reads inline tables, dotted keys and subtables in any order", fn() {
+    doc, err := toml.parse(docs[6])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"name\": {\"first\": \"Tom\", \"last\": \"Preston-Werner\"}, \"point\": {\"x\": i:1, \"y\": i:2}, \"animal\": {\"type\": {\"name\": \"pug\"}}, \"empty\": {}, \"fruit\": {\"apple\": {\"color\": \"red\", \"taste\": {\"sweet\": true}, \"texture\": {\"smooth\": true}}}, \"x\": {\"y\": {\"z\": {\"w\": {\"v\": i:1}}}, \"u\": i:2}}")
+  })
+  it("reads arrays of tables with subtables inside", fn() {
+    doc, err := toml.parse(docs[7])
+    expect(err).to_be_nil()
+    expect(dump(doc)).to_equal("{\"fruits\": [{\"name\": \"apple\", \"physical\": {\"color\": \"red\"}, \"varieties\": [{\"name\": \"red delicious\"}, {\"name\": \"granny smith\"}]}, {\"name\": \"banana\", \"varieties\": [{\"name\": \"plantain\"}]}]}")
+  })
+  it("keeps dates and times as text", fn() {
+    dates, err := toml.parse("odt1 = 1979-05-27T07:32:00Z\nodt2 = 1979-05-27 00:32:00.999999-07:00\nld = 1979-05-27\nlt = 07:32:00\narr = [1979-05-27, 07:32:00]\n")
+    expect(err).to_be_nil()
+    expect(dump(dates)).to_equal("{\"odt1\": d:1979-05-27T07:32:00Z, \"odt2\": d:1979-05-27 00:32:00.999999-07:00, \"ld\": d:1979-05-27, \"lt\": d:07:32:00, \"arr\": [d:1979-05-27, d:07:32:00]}")
+  })
+})
+
+describe("toml.encode", fn() {
+  it("writes a manifest back in the same shape", fn() {
+    doc, _ := toml.parse(docs[0])
+    expect(toml.encode(doc)).to_equal("[package]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndescription = \"JSON for Caju\"\nauthors = [\"Aecio\"]\nlicense = \"MIT\"\nentry = \"json.caju\"\n\n[dependencies]\n\"github.com/aecdanjundex/strutil\" = \"0.3.1\"\n")
+  })
+  it("writes arrays of tables as [[name]]", fn() {
+    doc, _ := toml.parse(docs[1])
+    expect(toml.encode(doc)).to_equal("version = 1\n\n[[package]]\nname = \"github.com/aecdanjundex/strutil\"\nversion = \"0.3.1\"\ncommit = \"0123abcd\"\nhash = \"sha256-abc\"\ndependencies = []\n\n[[package]]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndependencies = [\"github.com/aecdanjundex/strutil\"]\n")
+  })
+  it("writes plain values before subtables", fn() {
+    doc, _ := toml.parse(docs[6])
+    expect(toml.encode(doc)).to_equal("[name]\nfirst = \"Tom\"\nlast = \"Preston-Werner\"\n\n[point]\nx = 1\ny = 2\n\n[animal.type]\nname = \"pug\"\n\n[empty]\n\n[fruit.apple]\ncolor = \"red\"\n\n[fruit.apple.taste]\nsweet = true\n\n[fruit.apple.texture]\nsmooth = true\n\n[x]\nu = 2\n\n[x.y.z.w]\nv = 1\n")
+  })
+  it("writes nested arrays of tables", fn() {
+    doc, _ := toml.parse(docs[7])
+    expect(toml.encode(doc)).to_equal("[[fruits]]\nname = \"apple\"\n\n[fruits.physical]\ncolor = \"red\"\n\n[[fruits.varieties]]\nname = \"red delicious\"\n\n[[fruits.varieties]]\nname = \"granny smith\"\n\n[[fruits]]\nname = \"banana\"\n\n[[fruits.varieties]]\nname = \"plantain\"\n")
+  })
+  it("writes dates and times without quotes", fn() {
+    dates, _ := toml.parse("odt1 = 1979-05-27T07:32:00Z\nodt2 = 1979-05-27 00:32:00.999999-07:00\nld = 1979-05-27\nlt = 07:32:00\narr = [1979-05-27, 07:32:00]\n")
+    expect(toml.encode(dates)).to_equal("odt1 = 1979-05-27T07:32:00Z\nodt2 = 1979-05-27 00:32:00.999999-07:00\nld = 1979-05-27\nlt = 07:32:00\narr = [1979-05-27, 07:32:00]\n")
+  })
+  it("reads back what it writes, for every document", fn() {
+    for _, d := range docs {
+      doc, _ := toml.parse(d)
+      expect(round_trip(doc)).to_be_true()
+    }
+    dates, _ := toml.parse("odt1 = 1979-05-27T07:32:00Z\nld = 1979-05-27\narr = [1979-05-27, 07:32:00]\n")
+    expect(round_trip(dates)).to_be_true()
+  })
+})
+
+describe("reading values", fn() {
+  it("gets a text by its dotted path, with a default", fn() {
+    m, _ := toml.parse(docs[0])
+    expect(m.get_str("package.name", "?")).to_equal("github.com/aecdanjundex/json")
+    expect(m.get_str("package.nothing", "default")).to_equal("default")
+  })
+  it("returns the default when the value has another type", fn() {
+    m, _ := toml.parse(docs[0])
+    expect(m.get_int("package.name", -1)).to_equal(-1)
+    expect(m.get_bool("package.name", false)).to_be_false()
+  })
+  it("gets lists of texts and the keys of a table", fn() {
+    m, _ := toml.parse(docs[0])
+    expect(m.get_strs("package.authors")).to_equal([]str{"Aecio"})
+    expect(m.table_keys("dependencies")).to_equal([]str{"github.com/aecdanjundex/strutil"})
+    expect(m.table_keys("package.name")).to_equal([]str{})
+  })
+  it("returns nil for a path that does not exist, and the value itself for an empty path", fn() {
+    m, _ := toml.parse(docs[0])
+    expect(m.get("package.version").s).to_equal("1.2.0")
+    expect(m.get("no.such.path") == nil).to_be_true()
+    expect(m.get("") == m).to_be_true()
+  })
+  it("reaches keys that contain dots with field", fn() {
+    m, _ := toml.parse(docs[0])
+    expect(m.field("dependencies").field("github.com/aecdanjundex/strutil").s).to_equal("0.3.1")
+  })
+  it("reads an integer as a float with get_float", fn() {
+    n, _ := toml.parse("a = 2\nb = 2.5\nc = true\n")
+    expect(n.get_float("a", 0.0)).to_equal(2)
+    expect(n.get_float("b", 0.0)).to_equal(2.5)
+    expect(n.get_bool("c", false)).to_be_true()
+    expect(n.get_bool("a", false)).to_be_false()
+    expect(len(n.get_array("a"))).to_equal(0)
+  })
+})
+
+fn build_lock() -> *toml.Value {
+  lock := toml.new_table()
+  lock.set("version", toml.new_int(1))
+  pkgs := toml.new_array()
+  for _, name := range []str{"github.com/x/a", "github.com/x/b"} {
+    p := toml.new_table()
+    p.set("name", toml.new_string(name))
+    p.set("version", toml.new_string("1.0.0"))
+    p.set("hash", toml.new_string("sha256-00ff"))
+    deps := toml.new_array()
+    if name == "github.com/x/a" { deps.push(toml.new_string("github.com/x/b")) }
+    p.set("dependencies", deps)
+    pkgs.push(p)
+  }
+  lock.set("package", pkgs)
+  lock.set("note", toml.new_string("tab\tquote\" é"))
+  lock.set("ratio", toml.new_float(0.5))
+  lock.set("ok", toml.new_bool(true))
+  lock.set("version", toml.new_int(2))
+  return lock
+}
+
+describe("building values", fn() {
+  it("encodes a table built in code, replacing a key in place", fn() {
+    expect(toml.encode(build_lock())).to_equal("version = 2\nnote = \"tab\\tquote\\\" é\"\nratio = 0.5\nok = true\n\n[[package]]\nname = \"github.com/x/a\"\nversion = \"1.0.0\"\nhash = \"sha256-00ff\"\ndependencies = [\"github.com/x/b\"]\n\n[[package]]\nname = \"github.com/x/b\"\nversion = \"1.0.0\"\nhash = \"sha256-00ff\"\ndependencies = []\n")
+  })
+  it("reads back a table built in code", fn() {
+    expect(round_trip(build_lock())).to_be_true()
+  })
+  it("removes keys, ignoring keys that are not there", fn() {
+    lock := build_lock()
+    lock.remove("note")
+    lock.remove("missing")
+    expect(lock.keys).to_equal([]str{"version", "package", "ratio", "ok"})
+  })
+  it("quotes keys only when needed", fn() {
+    got := []str{toml.key_text("plain-key_1"), toml.key_text("with space"), toml.key_text(""), toml.key_text("a.b")}
+    expect(got).to_equal([]str{"plain-key_1", "\"with space\"", "\"\"", "\"a.b\""})
+  })
+  it("writes floats with the shortest text that reads back the same", fn() {
+    got := []str{}
+    for _, f := range []num{0.1, 1e16, 1e15, 0.0001, 0.00001, 5e-324, 1.7976931348623157e308, 100.0, -0.0, 2.5e-8} { got = append(got, toml.format_float(f)) }
+    expect(got).to_equal([]str{"0.1", "1e+16", "1000000000000000.0", "0.0001", "1e-05", "5e-324", "1.7976931348623157e+308", "100.0", "-0.0", "2.5e-08"})
+  })
+})
+
+describe("toml.parse errors", fn() {
+  it("rejects a = 1 ⏎ a = 2", fn() {
+    _, err := toml.parse("a = 1\na = 2\n")
+    expect(err).to_be_error("toml: line 2: duplicate key \"a\"")
+  })
+  it("rejects [a] ⏎ x = 1 ⏎ [a]", fn() {
+    _, err := toml.parse("[a]\nx = 1\n[a]\n")
+    expect(err).to_be_error("toml: line 3: table \"a\" is defined more than once")
+  })
+  it("rejects a.b = 1 ⏎ [a.b]", fn() {
+    _, err := toml.parse("a.b = 1\n[a.b]\n")
+    expect(err).to_be_error("toml: line 2: table \"a.b\" is defined more than once")
+  })
+  it("rejects [a] ⏎ b = 1 ⏎ [a.b]", fn() {
+    _, err := toml.parse("[a]\nb = 1\n[a.b]\n")
+    expect(err).to_be_error("toml: line 3: table \"a.b\" is defined more than once")
+  })
+  it("rejects a = { x = 1 } ⏎ [a]", fn() {
+    _, err := toml.parse("a = { x = 1 }\n[a]\n")
+    expect(err).to_be_error("toml: line 2: table \"a\" is defined more than once")
+  })
+  it("rejects a = { x = 1 } ⏎ [a.y]", fn() {
+    _, err := toml.parse("a = { x = 1 }\n[a.y]\n")
+    expect(err).to_be_error("toml: line 2: \"a\" is already defined as a value and cannot be used as a table")
+  })
+  it("rejects a = [1] ⏎ [[a]]", fn() {
+    _, err := toml.parse("a = [1]\n[[a]]\n")
+    expect(err).to_be_error("toml: line 2: \"a\" is already defined and is not an array of tables")
+  })
+  it("rejects [[a]] ⏎ [a]", fn() {
+    _, err := toml.parse("[[a]]\n[a]\n")
+    expect(err).to_be_error("toml: line 2: table \"a\" is defined more than once")
+  })
+  it("rejects a.b = 1 ⏎ a.b.c = 2", fn() {
+    _, err := toml.parse("a.b = 1\na.b.c = 2\n")
+    expect(err).to_be_error("toml: line 2: \"a.b\" is already defined and cannot be extended with a dotted key")
+  })
+  it("rejects [a.b] ⏎ [a] ⏎ b.c = 1", fn() {
+    _, err := toml.parse("[a.b]\n[a]\nb.c = 1\n")
+    expect(err).to_be_error("toml: line 3: \"b\" is already defined and cannot be extended with a dotted key")
+  })
+  it("rejects s = \"abc", fn() {
+    _, err := toml.parse("s = \"abc\n")
+    expect(err).to_be_error("toml: line 1: unterminated string")
+  })
+  it("rejects s = \"\\q\"", fn() {
+    _, err := toml.parse("s = \"\\q\"\n")
+    expect(err).to_be_error("toml: line 1: invalid escape \"\\q\"")
+  })
+  it("rejects s = \"\"\"abc", fn() {
+    _, err := toml.parse("s = \"\"\"abc\n")
+    expect(err).to_be_error("toml: line 2: unterminated multi-line string")
+  })
+  it("rejects s = \"a\\\\x01\"", fn() {
+    _, err := toml.parse("s = \"a\x01\"\n")
+    expect(err).to_be_error("toml: line 1: control characters must be escaped in strings")
+  })
+  it("rejects s = \"\\uD800\"", fn() {
+    _, err := toml.parse("s = \"\\uD800\"\n")
+    expect(err).to_be_error("toml: line 1: invalid unicode escape: not a unicode scalar value")
+  })
+  it("rejects s = \"\\u12\"", fn() {
+    _, err := toml.parse("s = \"\\u12\"\n")
+    expect(err).to_be_error("toml: line 1: invalid unicode escape: expected 4 hexadecimal digits")
+  })
+  it("rejects n = 012", fn() {
+    _, err := toml.parse("n = 012\n")
+    expect(err).to_be_error("toml: line 1: leading zeros are not allowed in \"012\"")
+  })
+  it("rejects n = 1__0", fn() {
+    _, err := toml.parse("n = 1__0\n")
+    expect(err).to_be_error("toml: line 1: invalid value \"1__0\"")
+  })
+  it("rejects n = _1", fn() {
+    _, err := toml.parse("n = _1\n")
+    expect(err).to_be_error("toml: line 1: expected a value, found \"_\"")
+  })
+  it("rejects n = 9223372036854775808", fn() {
+    _, err := toml.parse("n = 9223372036854775808\n")
+    expect(err).to_be_error("toml: line 1: integer out of range \"9223372036854775808\"")
+  })
+  it("rejects n = +0x10", fn() {
+    _, err := toml.parse("n = +0x10\n")
+    expect(err).to_be_error("toml: line 1: a sign is not allowed in \"+0x10\"")
+  })
+  it("rejects f = 1.", fn() {
+    _, err := toml.parse("f = 1.\n")
+    expect(err).to_be_error("toml: line 1: invalid value \"1.\"")
+  })
+  it("rejects f = .5", fn() {
+    _, err := toml.parse("f = .5\n")
+    expect(err).to_be_error("toml: line 1: expected a value, found \".\"")
+  })
+  it("rejects f = 1e", fn() {
+    _, err := toml.parse("f = 1e\n")
+    expect(err).to_be_error("toml: line 1: invalid value \"1e\"")
+  })
+  it("rejects x = ", fn() {
+    _, err := toml.parse("x = \n")
+    expect(err).to_be_error("toml: line 1: expected a value, found the end of the line")
+  })
+  it("rejects x = 1 2", fn() {
+    _, err := toml.parse("x = 1 2\n")
+    expect(err).to_be_error("toml: line 1: expected the end of the line, found \"2\"")
+  })
+  it("rejects x = { a = 1, }", fn() {
+    _, err := toml.parse("x = { a = 1, }\n")
+    expect(err).to_be_error("toml: line 1: a trailing comma is not allowed in an inline table")
+  })
+  it("rejects x = [1 2]", fn() {
+    _, err := toml.parse("x = [1 2]\n")
+    expect(err).to_be_error("toml: line 1: expected \",\" or \"]\" in the array, found \"2\"")
+  })
+  it("rejects = 1", fn() {
+    _, err := toml.parse("= 1\n")
+    expect(err).to_be_error("toml: line 1: expected a key, found \"=\"")
+  })
+  it("rejects x = tru", fn() {
+    _, err := toml.parse("x = tru\n")
+    expect(err).to_be_error("toml: line 1: invalid value \"tru\"")
+  })
+  it("rejects x = 1 ⏎  ⏎  ⏎ [t", fn() {
+    _, err := toml.parse("x = 1\n\n\n[t\n")
+    expect(err).to_be_error("toml: line 4: expected \"]\", found the end of the line")
+  })
+  it("rejects k = \"\"\"a\"\"\"\"\"\"", fn() {
+    _, err := toml.parse("k = \"\"\"a\"\"\"\"\"\"\n")
+    expect(err).to_be_error("toml: line 1: too many quotes at the end of a multi-line string")
+  })
+})

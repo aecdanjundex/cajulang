@@ -1,0 +1,186 @@
+# Goroutines, channels and select. The native compiler does not support them yet (phase 6),
+# so `caju test` skips this whole file until it does.
+import { describe, it, expect, run_file } from "std/testing"
+
+fn sorted(xs: []str) -> []str {
+  out := []str{}
+  for _, x := range xs { out = append(out, x) }
+  for i := 1; i < len(out); i++ {
+    j := i
+    while j > 0 && out[j] < out[j - 1] {
+      t := out[j]
+      out[j] = out[j - 1]
+      out[j - 1] = t
+      j--
+    }
+  }
+  return out
+}
+
+fn worker(id: int, jobs: chan int, results: chan str) {
+  for t := range jobs {
+    sleep(0.1)
+    results <- "worker " + str(id) + " did job " + str(t)
+  }
+}
+
+fn squarer(id: int, jobs: chan int, res: chan int) {
+  for j := range jobs {
+    sleep(0.01 * id)
+    res <- j * j
+  }
+}
+
+fn count(id: int, n: int, c: chan int) {
+  t := 0
+  for i := 0; i < n; i++ { t += i % 7 }
+  c <- id * 1000000 + t
+}
+
+describe("goroutines and channels", fn() {
+  it("a pool of workers takes jobs from a channel in turns", fn() {
+    jobs := make(chan int, 10)
+    results := make(chan str, 10)
+    for w := 1; w <= 3; w++ { go worker(w, jobs, results) }
+    for t := 1; t <= 6; t++ { jobs <- t }
+    close(jobs)
+    got := []str{}
+    for i := 0; i < 6; i++ { got = append(got, <-results) }
+    expect(got).to_equal([]str{"worker 1 did job 1", "worker 2 did job 2", "worker 3 did job 3", "worker 1 did job 4", "worker 2 did job 5", "worker 3 did job 6"})
+  })
+  it("workers' results can be summed", fn() {
+    jobs := make(chan int, 100)
+    res := make(chan int, 100)
+    for w := 1; w <= 3; w++ { go squarer(w, jobs, res) }
+    for j := 1; j <= 9; j++ { jobs <- j }
+    close(jobs)
+    sum := 0
+    for k := 0; k < 9; k++ { sum += <-res }
+    expect(sum).to_equal(285)
+  })
+  it("unbuffered channels hand values back and forth (ping pong)", fn() {
+    ping := make(chan str)
+    pong := make(chan str)
+    go fn() {
+      for i := 0; i < 3; i++ {
+        msg := <-ping
+        pong <- msg + " pong"
+      }
+    }()
+    got := []str{}
+    for i := 0; i < 3; i++ {
+      ping <- "ping" + str(i)
+      got = append(got, <-pong)
+    }
+    expect(got).to_equal([]str{"ping0 pong", "ping1 pong", "ping2 pong"})
+  })
+  it("a closed channel gives its buffered values, then the zero value and false", fn() {
+    c := make(chan int, 2)
+    c <- 1
+    close(c)
+    v, ok := <-c
+    expect([]any{v, ok}).to_equal([]any{1, true})
+    v, ok = <-c
+    expect([]any{v, ok}).to_equal([]any{0, false})
+    n := 0
+    for x := range c { n += x }
+    expect(n).to_equal(0)
+  })
+  it("long goroutines are preempted so all of them finish", fn() {
+    c := make(chan int, 10)
+    for k := 1; k <= 5; k++ { go count(k, 3000 * k, c) }
+    got := []str{}
+    for k := 1; k <= 5; k++ { got = append(got, str(<-c)) }
+    expect(sorted(got)).to_equal([]str{"1008994", "2017997", "3026995", "4035995", "5044997"})
+  })
+  it("goroutines sharing a variable without locks still all run (the total depends on preemption)", fn() {
+    done := make(chan bool)
+    total := 0
+    for k := 0; k < 4; k++ {
+      go fn() {
+        for i := 0; i < 2500; i++ { total++ }
+        done <- true
+      }()
+    }
+    for k := 0; k < 4; k++ { <-done }
+    expect(total).to_be_at_least(2500)
+    expect(total).to_be_at_most(10000)
+  })
+  it("a goroutine runs while main sleeps", fn() {
+    log := []str{}
+    go fn() {
+      sleep(0.2)
+      log = append(log, "goroutine slept")
+    }()
+    sleep(0.5)
+    log = append(log, "end of main")
+    expect(log).to_equal([]str{"goroutine slept", "end of main"})
+  })
+})
+
+describe("select", fn() {
+  it("waits for the first channel that is ready", fn() {
+    ticker := make(chan int)
+    done := make(chan bool)
+    go fn() {
+      for i := 1; i <= 3; i++ {
+        sleep(0.2)
+        ticker <- i
+      }
+      done <- true
+    }()
+    got := []str{}
+    outer:
+    for {
+      select {
+      case n := <-ticker: got = append(got, "tick " + str(n))
+      case <-done:
+        got = append(got, "finished")
+        break outer
+      }
+    }
+    expect(got).to_equal([]str{"tick 1", "tick 2", "tick 3", "finished"})
+  })
+  it("with a loop flag instead of a label", fn() {
+    done := make(chan bool)
+    data := make(chan int)
+    go fn() {
+      for i := 0; i < 3; i++ {
+        data <- i
+        sleep(0.1)
+      }
+      done <- true
+    }()
+    got := []int{}
+    finished := false
+    for !finished {
+      select {
+      case v := <-data: got = append(got, v)
+      case <-done: finished = true
+      }
+    }
+    expect(got).to_equal([]int{0, 1, 2})
+  })
+  it("default runs when no channel is ready", fn() {
+    c := make(chan int, 1)
+    got := ""
+    select {
+    case v := <-c: got = "received " + str(v)
+    default: got = "nothing ready"
+    }
+    expect(got).to_equal("nothing ready")
+  })
+})
+
+describe("deadlocks and channel errors", fn() {
+  it("the program stops when every goroutine is waiting", fn() {
+    r := run_file("testdata/deadlock.caju")
+    expect(r.output).to_equal("1\nRuntime error in deadlock.caju, line 4: All goroutines are blocked, waiting for each other (deadlock).")
+    expect(r.code).to_equal(1)
+  })
+  it("sending on a closed channel is a runtime error", fn() {
+    r := run_file("testdata/send_on_closed.caju")
+    expect(r.output).to_equal("Runtime error in send_on_closed.caju, line 4: Send on a closed channel.")
+    expect(r.code).to_equal(1)
+  })
+})

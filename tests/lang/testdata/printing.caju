@@ -1,0 +1,7 @@
+# print separates its arguments with spaces and formats each value like str()
+struct Point { x: int, y: int }
+print(1, 2.5, "text", true, nil)
+print([]int{1, 2}, []str{"a", "b"}, map[str]int{"b": 2, "a": 1})
+print(Point{1, 2}, &Point{3, 4}, errors.New("oops"))
+for i := 0; i < 3; i++ { defer print("defer", i) }
+print("body")

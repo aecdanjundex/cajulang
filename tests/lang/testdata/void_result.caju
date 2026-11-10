@@ -1,0 +1,7 @@
+let counter = 0
+fn increment(q) {
+  counter = counter + q
+}
+increment(5)
+increment(7)
+print(counter, increment(1))

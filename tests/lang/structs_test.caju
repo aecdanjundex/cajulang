@@ -1,0 +1,94 @@
+import { describe, it, expect } from "std/testing"
+
+struct P { x: num, y: num, name: str, ok: bool }
+fn (p: P) sum() -> num { return p.x + p.y }
+fn (p: *P) double() {
+  p.x = p.x * 2
+  p.y = p.y * 2
+}
+
+struct Pt { x: num }
+struct Line { a: Pt, b: Pt, t: str }
+fn (p: *Pt) advance(d: num) { p.x = p.x + d }
+
+struct Item { v: int, next: any }
+
+struct Engine { power: int }
+fn (m: Engine) start() -> str { return "vroom " + str(m.power) }
+fn (m: *Engine) boost() { m.power *= 2 }
+struct Car { Engine; model: str }
+interface Startable { start() -> str }
+
+describe("structs", fn() {
+  it("are values: assignment copies them", fn() {
+    let a = P{x: 1.5, y: 2, name: "one \"a\""}
+    let b = a
+    b.double()
+    expect(str(a)).to_equal("P{x: 1.5, y: 2, name: \"one \"a\"\", ok: false}")
+    expect(str(b)).to_equal("P{x: 3, y: 4, name: \"one \"a\"\", ok: false}")
+    expect([]any{a.sum(), b.sum()}).to_equal([]any{3.5, 7})
+  })
+  it("compare field by field", fn() {
+    let a = P{x: 1.5, y: 2, name: "one \"a\""}
+    let b = a
+    b.double()
+    expect(a == b).to_be_false()
+    expect(a == P{x: 1.5, y: 2, name: "one \"a\""}).to_be_true()
+  })
+  it("concatenated to a text show their fields", fn() {
+    let a = P{x: 1.5, y: 2, name: "one \"a\""}
+    expect("text: " + a).to_equal("text: P{x: 1.5, y: 2, name: \"one \"a\"\", ok: false}")
+  })
+  it("nested struct fields can be changed through pointer methods", fn() {
+    let l = Line{a: Pt{x: 1}}
+    l.b.advance(5)
+    l.a.advance(1)
+    let c = l.a
+    c.advance(100)
+    expect(str(l)).to_equal("Line{a: Pt{x: 2}, b: Pt{x: 5}, t: \"\"}")
+    expect(str(c)).to_equal("Pt{x: 102}")
+    expect(l.a == Pt{x: 2}).to_be_true()
+  })
+  it("can build a list through any fields", fn() {
+    let list: any = 0
+    for i = 1 to 50 { list = Item{v: i, next: list} }
+    let s = 0
+    let p = list
+    while p != 0 {
+      s = s + p.v
+      p = p.next
+    }
+    expect(s).to_equal(1275)
+  })
+  it("survive many short-lived allocations", fn() {
+    let total = 0
+    for i = 1 to 200000 {
+      let a = Item{v: i}
+      let b = Item{v: i * 2, next: a}
+      total = total + b.next.v + b.v
+    }
+    expect(total).to_equal(60000300000)
+  })
+})
+
+describe("embedded structs", fn() {
+  it("give their fields and methods to the outer struct", fn() {
+    car := Car{Engine{100}, "beetle"}
+    expect(car.power).to_equal(100)
+    expect(car.start()).to_equal("vroom 100")
+    car.boost()
+    expect([]int{car.power, car.Engine.power}).to_equal([]int{200, 200})
+    expect(car.model).to_equal("beetle")
+  })
+  it("make the outer struct satisfy interfaces", fn() {
+    car := Car{Engine{200}, "beetle"}
+    let l: Startable = car
+    expect(l.start()).to_equal("vroom 200")
+  })
+  it("a method value copies a value receiver when it is taken", fn() {
+    car := Car{Engine{200}, "beetle"}
+    g := car.start
+    car.power = 1
+    expect(g()).to_equal("vroom 200")
+  })
+})

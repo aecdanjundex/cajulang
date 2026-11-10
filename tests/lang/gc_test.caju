@@ -1,0 +1,36 @@
+import { describe, it, expect } from "std/testing"
+
+struct Node { v: int, next: *Node }
+
+describe("the garbage collector", fn() {
+  it("frees long lists that become unreachable", fn() {
+    let list: *Node = nil
+    count := 0
+    for i := 0; i < 300000; i++ {
+      list = &Node{v: i, next: list}
+      if i % 1000 == 0 { list = nil }
+    }
+    for p := list; p != nil; p = p.next { count++ }
+    expect(count).to_equal(999)
+  })
+  it("keeps every live entry of a big map with deletes", fn() {
+    m := map[int]str{}
+    for i := 0; i < 50000; i++ {
+      m[i] = "v" + str(i)
+      if i % 3 == 0 { delete(m, i / 2) }
+    }
+    expect(len(m)).to_equal(33333)
+    expect(m[49999]).to_equal("v49999")
+    expect(m[10]).to_equal("")
+  })
+  it("keeps the rows of a matrix built in a loop", fn() {
+    mat := [][]int{}
+    for i := 0; i < 300; i++ {
+      row := make([]int, 300)
+      for j := range row { row[j] = i * j }
+      mat = append(mat, row)
+    }
+    expect(mat[299][299]).to_equal(89401)
+    expect(len(mat)).to_equal(300)
+  })
+})

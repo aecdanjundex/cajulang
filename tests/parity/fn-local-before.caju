@@ -1,5 +1,0 @@
-fn f() {
-  if false { let q = 1 }
-  return q
-}
-print(f())

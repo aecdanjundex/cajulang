@@ -1,0 +1,52 @@
+import { describe, it, expect } from "std/testing"
+
+fn counter() -> fn() -> int {
+  n := 0
+  return fn() -> int {
+    n++
+    return n
+  }
+}
+
+fn apply(xs: []int, f: fn(int) -> int) -> []int {
+  out := []int{}
+  for _, x := range xs { out = append(out, f(x)) }
+  return out
+}
+
+struct Account { balance: int }
+fn (c: *Account) deposit(v: int) { c.balance += v }
+
+describe("closures", fn() {
+  it("keep their own copy of the captured variables", fn() {
+    c1 := counter()
+    c2 := counter()
+    expect([]int{c1(), c1(), c1(), c2()}).to_equal([]int{1, 2, 3, 1})
+  })
+  it("functions are values that can be passed", fn() {
+    expect(apply([]int{1, 2, 3}, fn(x: int) -> int { return x * x })).to_equal([]int{1, 4, 9})
+    double := fn(x: int) -> int { return 2 * x }
+    expect(apply([]int{1, 2, 3}, double)).to_equal([]int{2, 4, 6})
+  })
+  it("each loop iteration has its own variable (as in Go 1.22)", fn() {
+    fns := []fn() -> int{}
+    for i := 0; i < 3; i++ { fns = append(fns, fn() -> int { return i * 10 }) }
+    got := []int{}
+    for _, f := range fns { got = append(got, f()) }
+    expect(got).to_equal([]int{0, 10, 20})
+  })
+  it("a method value binds its receiver", fn() {
+    c := &Account{}
+    dep := c.deposit
+    dep(50)
+    dep(25)
+    expect(c.balance).to_equal(75)
+  })
+  it("thousands of closures each keep their value", fn() {
+    fs := []fn() -> int{}
+    for i := 0; i < 1000; i++ { fs = append(fs, fn() -> int { return i * i }) }
+    s := 0
+    for _, f := range fs { s += f() }
+    expect(s).to_equal(332833500)
+  })
+})

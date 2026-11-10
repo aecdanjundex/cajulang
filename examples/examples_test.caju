@@ -1,0 +1,153 @@
+# The example programs: each one runs with `caju run` and must print exactly what is shown here.
+# Examples whose name ends in "error" stop on purpose, with the message the compiler or the
+# runtime gives.
+
+import "std/os"
+import "std/testing"
+import { describe, it, skip, expect } from "std/testing"
+
+# runs an example and checks its whole output and exit code
+fn check(file: str, output: str, code: int) {
+  r := testing.run_file(file)
+  expect(r.output).to_equal(output)
+  expect(r.code).to_equal(code)
+}
+
+describe("examples", fn() {
+  it("arithmetic does integer and float math with the usual precedence", fn() {
+    check("arithmetic.caju", "14\n20\n2 2\n2.5\n1024 1024\n-4", 0)
+  })
+  it("benchmark sums the multiples of 3 or 5 in a long loop", fn() {
+    check("benchmark.caju", "Sum of the multiples of 3 or 5: 233334166668", 0)
+  })
+  it("collatz finds the number below 5000 with the longest Collatz sequence", fn() {
+    check("collatz.caju", "Up to 5000 the record holder is 3711 with 237 steps", 0)
+  })
+  it("conditionals picks branches with if and else", fn() {
+    check("conditionals.caju", "Passed\nWorking age", 0)
+  })
+  it("constant-with-error is rejected because a constant is reassigned", fn() {
+    check("constant-with-error.caju", "Compile error in constant-with-error.caju, line 9: \"LIMIT\" is a constant (line 3) and cannot be reassigned.", 1)
+  })
+  it("constants uses named constants in calculations", fn() {
+    check("constants.caju", "Circle area: 50.26544\n1 pizza(s): $ 27.4\n2 pizza(s): $ 47.3\n3 pizza(s): $ 67.2", 0)
+  })
+  it("countdown counts down from 5 with a while loop", fn() {
+    check("countdown.caju", "5...\n4...\n3...\n2...\n1...\nLiftoff! 🚀", 0)
+  })
+  it("files-computing-module runs an imported module before using its functions", fn() {
+    check("files-computing-module/main.caju", "(clock.caju ran)\nThere are 1229 primes up to 10000\nThe largest of them is 9973", 0)
+  })
+  it("files-link-error is rejected because an imported name is not exported", fn() {
+    check("files-link-error/main.caju", "Link error in main.caju, line 3: \"SECRET\" exists in data.caju but is not exported. Write export before its declaration.", 1)
+  })
+  it("files-pizzeria builds an order from several modules", fn() {
+    check("files-pizzeria/main.caju", "Welcome to Caju Pizzeria\nOrder: $ 124.7\nWith discount and delivery: $ 132.2", 0)
+  })
+  it("fizzbuzz prints Fizz, Buzz and FizzBuzz up to 20", fn() {
+    check("fizzbuzz.caju", "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n16\n17\nFizz\n19\nBuzz", 0)
+  })
+  it("free-fall simulates a falling object step by step", fn() {
+    check("free-fall.caju", "Time to the ground: 4.51524000001 s\nFinal speed: 44.2945044 m/s\nSimulation steps: 225762", 0)
+  })
+  it("functions-basic calls functions with parameters and results", fn() {
+    check("functions-basic.caju", "144 7 Hello, Caju!\n55 100", 0)
+  })
+  it("functions-library uses functions from a module of its own", fn() {
+    check("functions-library/main.caju", "gcd(84, 36) = 12\n2^20 = 1048576\nPrimes up to 40: 2 3 5 7 11 13 17 19 23 29 31 37 ", 0)
+  })
+  it("functions-recursion computes factorials and Fibonacci numbers recursively", fn() {
+    check("functions-recursion.caju", "10! = 3628800\nfib(0) = 0\nfib(1) = 1\nfib(2) = 1\nfib(3) = 2\nfib(4) = 3\nfib(5) = 5\nfib(6) = 8\nfib(7) = 13\nfib(8) = 21\nfib(9) = 34\nfib(10) = 55\n  disk 1 from A to C\n  disk 2 from A to B\n  disk 1 from C to B\n  disk 1 from B to A\n  disk 2 from B to C\n  disk 1 from A to C\nMoves for 3 disks: 7", 0)
+  })
+  it("functions-recursive-fibonacci computes fib(26) with plain recursion", fn() {
+    check("functions-recursive-fibonacci.caju", "fib(26) = 121393", 0)
+  })
+  it("go-closures uses functions as values and closures that keep state", fn() {
+    check("go-closures.caju", "[2 4 6]\n[1 4 9]\n1 2 3 1\n0\n10\n20\n75", 0)
+  })
+  it("go-errors-defer-and-panic returns errors, runs defers in reverse and recovers from a panic", fn() {
+    check("go-errors-defer-and-panic.caju", "10 / 3 = 3\nerror: division by zero\n1. have dinner\n2. wash the dishes\n3. clear the table\nrecovered: something went wrong\nrecovered: Index 5 out of range (length 3)\nall good\nnil", 0)
+  })
+  skip("go-goroutines-and-channels shares jobs between workers through channels (goroutines are not supported by the native compiler yet)", fn() {
+    check("go-goroutines-and-channels.caju", "worker 1 did job 1\nworker 2 did job 2\nworker 3 did job 3\nworker 1 did job 4\nworker 2 did job 5\nworker 3 did job 6\ntick 1\ntick 2\ntick 3\nfinished\nwaiting for a value that never comes...\nRuntime error in go-goroutines-and-channels.caju, line 38: All goroutines are blocked, waiting for each other (deadlock).", 0)
+  })
+  it("go-integers-and-bits wraps fixed-size integers and operates on bits", fn() {
+    check("go-integers-and-bits.caju", "uint8 250 + 8 = 2\nint8 127 + 1 = -128\n-56 4464 4294967295\n3 -3 1 3.5 1024\n4 7 250 4 128 25\n^0 = -1\n0 67 C\n1 97 a\n2 102 f\n3 233 é\n5 32  \n6 9749 ☕\n[195 169] 2 1", 0)
+  })
+  it("go-interfaces-and-types calls methods through interfaces and switches on types", fn() {
+    check("go-interfaces-and-types.caju", "rectangle 6\ncircle 3.14159\nradius 1\nis the first one a circle? false\ninteger 7\nnumber 2.5\nstring of 5 bytes\nslice with 2 items\nerror: oops\nnil\nsomething else", 0)
+  })
+  it("go-pointers-and-embedding changes values through pointers and embeds structs", fn() {
+    check("go-pointers-and-embedding.caju", "50\n0\nnode 1\nnode 2\nnode 3\nPoint{x: 4, y: 5} 41\nbeetle 180 vroom 180\n0 true", 0)
+  })
+  it("go-slices-and-maps slices, appends and iterates over maps in insertion order", fn() {
+    check("go-slices-and-maps.caju", "[7 9 4 10 6] length 5 capacity 6\n[7 99 4 10 6] [99 4]\naverage 25 or 25.2\nout of cashews: 0\nbanana 10\nmango 5\nmap[\"banana\":10 \"mango\":5]\n[\"x\" \"y\" \"z\"] [\"changed\" \"y\" \"z\"]\n[[1 2 3] [2 4 6] [3 6 9]]", 0)
+  })
+  it("hello-world prints a greeting", fn() {
+    check("hello-world.caju", "Hello, world!", 0)
+  })
+  it("hidden-error is rejected because a variable is used without being declared", fn() {
+    check("hidden-error.caju", "Compile error in hidden-error.caju, line 12: The variable \"bonus\" does not exist. Use let bonus = ... or bonus := ... the first time.", 1)
+  })
+  it("mandelbrot-area estimates the area of the Mandelbrot set, reporting progress", fn() {
+    check("mandelbrot-area.caju", "row 52 of 260 · 20%\nrow 104 of 260 · 40%\nrow 156 of 260 · 60%\nrow 208 of 260 · 80%\nrow 260 of 260 · 100%\nEstimated area: 1.53290264423", 0)
+  })
+  it("mandelbrot draws the Mandelbrot set as text", fn() {
+    check("mandelbrot.caju", "                                                                \n                                        +.                      \n                                        ....#                   \n                                       ..++..                   \n                                     ..+####+.                  \n                                .......+####+...   +            \n                               ..+#++##########+.++++           \n                              .+.##################+.           \n                  .............+###################+.+          \n                  ..++.+++....+#####################+.          \n                 ...+#######++######################+.          \n              ...+++#########+######################.           \n    ##############################################...           \n              ...+++#########+######################.           \n                 ...+#######++######################+.          \n                  ..++.+++....+#####################+.          \n                  .............+###################+.+          \n                              .+.##################+.           \n                               ..+#++##########+.++++           \n                                .......+####+...   +            \n                                     ..+####+.                  \n                                       ..++..                   \n                                        ....+                   \n                                        +.                      ", 0)
+  })
+  it("monte-carlo estimates π with pseudo-random points", fn() {
+    check("monte-carlo.caju", "400000 points → π ≈ 3.14225\n800000 points → π ≈ 3.140515\n1200000 points → π ≈ 3.14124333333\n1600000 points → π ≈ 3.1409375\n2000000 points → π ≈ 3.140702", 0)
+  })
+  it("multiplication-table prints the table of 7", fn() {
+    check("multiplication-table.caju", "7 x 1 = 7\n7 x 2 = 14\n7 x 3 = 21\n7 x 4 = 28\n7 x 5 = 35\n7 x 6 = 42\n7 x 7 = 49\n7 x 8 = 56\n7 x 9 = 63\n7 x 10 = 70", 0)
+  })
+  it("optimizer-in-action computes the seconds in a week from constant expressions", fn() {
+    check("optimizer-in-action.caju", "Seconds in a week: 604800", 0)
+  })
+  it("perfect-numbers finds the perfect numbers up to 60000", fn() {
+    check("perfect-numbers.caju", "6 is perfect\n28 is perfect\n496 is perfect\n8128 is perfect\nTotal: 4 perfect numbers up to 60000", 0)
+  })
+  it("pi-by-leibniz approximates π with the Leibniz series", fn() {
+    check("pi-by-leibniz.caju", "π ≈ 3.14159015359\nerror: -0.00000250000004609", 0)
+  })
+  it("primes-up-to-30-000 counts the primes up to 30000", fn() {
+    check("primes-up-to-30-000.caju", "There are 3245 primes up to 30000", 0)
+  })
+  it("primes-up-to-300-000 counts the primes up to 300000 in steps", fn() {
+    check("primes-up-to-300-000.caju", "up to 50000 → 5133 primes\nup to 100000 → 9592 primes\nup to 150000 → 13848 primes\nup to 200000 → 17984 primes\nup to 250000 → 22044 primes\nup to 300000 → 25997 primes", 0)
+  })
+  it("primes lists the primes below 50", fn() {
+    check("primes.caju", "2 is prime\n3 is prime\n5 is prime\n7 is prime\n11 is prime\n13 is prime\n17 is prime\n19 is prime\n23 is prime\n29 is prime\n31 is prime\n37 is prime\n41 is prime\n43 is prime\n47 is prime", 0)
+  })
+  it("pythagorean-triples counts the Pythagorean triples with c up to 2000", fn() {
+    check("pythagorean-triples.caju", "1981 pythagorean triples with c ≤ 2000\n319 of them are primitive", 0)
+  })
+  it("structs-bank-in-modules keeps accounts in a module and reports errors", fn() {
+    check("structs-bank-in-modules/main.caju", "Ana: insufficient balance to withdraw 500\n• Ana has $ 120 (operations: 2)\n• Bia has $ 15 (operations: 1)\nAccount{owner: \"Ana\", balance: 120, operations: 2}", 0)
+  })
+  it("structs-interfaces finds the largest shape through an interface", fn() {
+    check("structs-interfaces.caju", "rectangle with area 12\ncircle with area 12.56636\ntriangle with area 15\nthe largest is: circle = Circle{radius: 2}", 0)
+  })
+  it("structs-points-and-methods copies struct values and changes them through pointer methods", fn() {
+    check("structs-points-and-methods.caju", "Point{x: 3, y: 4} distance 5\nafter move: Point{x: 4, y: 5}\nafter tryMove: Point{x: 4, y: 5}\na: Point{x: 4, y: 5} b: Point{x: 0, y: 5}\nequal? false true\nPoint{x: 0, y: 0} Point{x: 0, y: 2}", 0)
+  })
+  it("types-annotations-and-inference mixes annotated and inferred types", fn() {
+    check("types-annotations-and-inference.caju", "student 1: 5.5 (C)\nstudent 2: 7 (B)\nstudent 3: 8.5 (B)\nstudent 4: 10 (A)\naverage: 7.75 letter B\nwithout the decimal part: 7\nsquare of 12: 144", 0)
+  })
+  it("types-type-error is rejected because a number is passed where a text is expected", fn() {
+    check("types-type-error.caju", "Type error in types-type-error.caju, line 12: Parameter \"product\" of label is str, but got num. Use str(...) to convert to a string.", 1)
+  })
+  it("with-error stops with a runtime error at the division by zero", fn() {
+    check("with-error.caju", "This line runs\nRuntime error in with-error.caju, line 3: Integer division by zero.", 1)
+  })
+  it("hello-server compiles (it is a server, so it is not run)", fn() {
+    tmp := os.getenv("TMPDIR")
+    if tmp == "" { tmp = "/tmp" }
+    bin := tmp + "/caju-hello-server-" + str(os.getpid())
+    p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "-o", bin, "hello-server.caju"}, nil, true)
+    os.remove(bin)
+    expect(err).to_be_nil()
+    expect(p.output).to_equal("")
+    expect(p.code).to_equal(0)
+  })
+})

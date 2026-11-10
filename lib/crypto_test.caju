@@ -1,0 +1,240 @@
+import "std/crypto"
+import "std/hex"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+fn unhex(s: str) -> str {
+  b, err := hex.decode(s)
+  if err != nil { panic(err) }
+  return b
+}
+
+let long = strings.repeat("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu", 3)
+
+describe("crypto.sha256", fn() {
+  it("hashes empty text to the known digest", fn() {
+    expect(crypto.sha256_hex("")).to_equal("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  })
+  it("hashes \"abc\" to the known digest", fn() {
+    expect(crypto.sha256_hex("abc")).to_equal("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+  })
+  it("hashes a sentence to the known digest", fn() {
+    expect(crypto.sha256_hex("The quick brown fox jumps over the lazy dog")).to_equal("d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
+  })
+  it("hashes a text of several blocks to the known digest", fn() {
+    expect(crypto.sha256_hex(long)).to_equal("b584a05e1af03e9e2201550df419266f1a18993eb8999fa98bda4a140da36a66")
+  })
+  it("hashes a million \"a\" to the known digest", fn() {
+    expect(crypto.sha256_hex(strings.repeat("a", 1000000))).to_equal("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+  })
+  it("returns a binary digest of 32 bytes", fn() {
+    expect(len(crypto.sha256("x"))).to_equal(32)
+  })
+  it("handles lengths around the padding boundaries", fn() {
+    got := []str{}
+    for _, n := range []int{55, 56, 63, 64, 65, 111, 112, 127, 128, 129} { got = append(got, crypto.sha256_hex(strings.repeat("z", n))[0:16]) }
+    expect(got).to_equal([]str{"5a383411d906da80", "c66a5b692b9a2022", "85021e4907c21645", "72996563049cc84d", "57685f5e43ddac15", "386b0b03dcbf1261", "9c5ec581e8e2e62a", "87cdeb380917879f", "8169c725edd39f00", "be5aab1a91c510a7"})
+  })
+})
+
+describe("crypto.sha512", fn() {
+  it("hashes empty text to the known digest", fn() {
+    expect(crypto.sha512_hex("")).to_equal("cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e")
+  })
+  it("hashes \"abc\" to the known digest", fn() {
+    expect(crypto.sha512_hex("abc")).to_equal("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+  })
+  it("hashes a sentence to the known digest", fn() {
+    expect(crypto.sha512_hex("The quick brown fox jumps over the lazy dog")).to_equal("07e547d9586f6a73f73fbac0435ed76951218fb7d0c8d788a309d785436bbb642e93a252a954f23912547d1e8a3b5ed6e1bfd7097821233fa0538f3db854fee6")
+  })
+  it("hashes a text of several blocks to the known digest", fn() {
+    expect(crypto.sha512_hex(long)).to_equal("6e59d86c93e5aee5e08c8d6ca7b84f8f47fec3fce309d18e50acd71bfac857038ccea47330191965f3ec37eaa5e45f67356f3c32475bb1525b12a43dc24036b9")
+  })
+  it("hashes a million \"a\" to the known digest", fn() {
+    expect(crypto.sha512_hex(strings.repeat("a", 1000000))).to_equal("e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
+  })
+  it("returns a binary digest of 64 bytes", fn() {
+    expect(len(crypto.sha512("x"))).to_equal(64)
+  })
+  it("handles lengths around the padding boundaries", fn() {
+    got := []str{}
+    for _, n := range []int{55, 56, 63, 64, 65, 111, 112, 127, 128, 129} { got = append(got, crypto.sha512_hex(strings.repeat("z", n))[0:16]) }
+    expect(got).to_equal([]str{"86aba16e3a6a6413", "f5f52ddafa6cac61", "d4178f56d7151262", "0c5ecbd58212e686", "86335b8af0873f0c", "3937caac51b53357", "fa3bf4fa804efc34", "25cac568f0057daa", "ea6239790dc45b4c", "834188c0e0d4fe80"})
+  })
+})
+
+describe("crypto.sha1", fn() {
+  it("hashes empty text to the known digest", fn() {
+    expect(crypto.sha1_hex("")).to_equal("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+  })
+  it("hashes \"abc\" to the known digest", fn() {
+    expect(crypto.sha1_hex("abc")).to_equal("a9993e364706816aba3e25717850c26c9cd0d89d")
+  })
+  it("hashes a sentence to the known digest", fn() {
+    expect(crypto.sha1_hex("The quick brown fox jumps over the lazy dog")).to_equal("2fd4e1c67a2d28fced849ee1bb76e7391b93eb12")
+  })
+  it("hashes a text of several blocks to the known digest", fn() {
+    expect(crypto.sha1_hex(long)).to_equal("9541f9c758b829f3c24836692aaa18f743847800")
+  })
+  it("returns a binary digest of 20 bytes", fn() {
+    expect(len(crypto.sha1("x"))).to_equal(20)
+  })
+  it("handles lengths around the padding boundaries", fn() {
+    got := []str{}
+    for _, n := range []int{55, 56, 63, 64, 65, 111, 112, 127, 128, 129} { got = append(got, crypto.sha1_hex(strings.repeat("z", n))[0:16]) }
+    expect(got).to_equal([]str{"5a8c825e7bddd45f", "aaf29dd7fdb380d3", "5576b79ef97c2119", "668cd5ae72f64e81", "b4d0bc233838cba6", "bba2a9a5f6437f68", "9dd1092456ce3f6e", "80a44e6933e0174f", "ee07a43b8b7f44b7", "d253b872e3c164ae"})
+  })
+})
+
+describe("crypto.md5", fn() {
+  it("hashes empty text to the known digest", fn() {
+    expect(crypto.md5_hex("")).to_equal("d41d8cd98f00b204e9800998ecf8427e")
+  })
+  it("hashes \"abc\" to the known digest", fn() {
+    expect(crypto.md5_hex("abc")).to_equal("900150983cd24fb0d6963f7d28e17f72")
+  })
+  it("hashes a sentence to the known digest", fn() {
+    expect(crypto.md5_hex("The quick brown fox jumps over the lazy dog")).to_equal("9e107d9d372bb6826bd81d3542a419d6")
+  })
+  it("hashes a text of several blocks to the known digest", fn() {
+    expect(crypto.md5_hex(long)).to_equal("70c27a21942537fec2622d2089825470")
+  })
+  it("returns a binary digest of 16 bytes", fn() {
+    expect(len(crypto.md5("x"))).to_equal(16)
+  })
+  it("handles lengths around the padding boundaries", fn() {
+    got := []str{}
+    for _, n := range []int{55, 56, 63, 64, 65, 111, 112, 127, 128, 129} { got = append(got, crypto.md5_hex(strings.repeat("z", n))[0:16]) }
+    expect(got).to_equal([]str{"b687791f373f9a09", "fa2cae340242b29b", "cac9376765157678", "3ecc49f9d9d6c263", "2923dd566a757405", "42a9cea09041effb", "32d820c68dcfab6d", "90ef4c1b220c1c28", "8bb019c50645823a", "200e0d64fc225c0b"})
+  })
+})
+
+describe("crypto.new_sha256", fn() {
+  it("gives the same digest when the text is written in pieces", fn() {
+    h := crypto.new_sha256()
+    partial_ok := false
+    for i := 0; i < len(long); i += 7 {
+      end := i + 7
+      if end > len(long) { end = len(long) }
+      h.write(long[i:end])
+      if i == 70 { partial_ok = h.sum_hex() == crypto.sha256_hex(long[0:end]) }
+    }
+    expect(partial_ok).to_be_true()
+    expect(h.sum_hex()).to_equal(crypto.sha256_hex(long))
+  })
+  it("reports its digest and block sizes", fn() {
+    h := crypto.new_sha256()
+    expect(h.size()).to_equal(32)
+    expect(h.block_size()).to_equal(64)
+  })
+  it("clones the state without changing the original", fn() {
+    h := crypto.new_sha256()
+    h.write(long)
+    c := h.clone()
+    c.write("more")
+    expect(h.sum_hex()).to_equal(crypto.sha256_hex(long))
+    expect(c.sum_hex()).to_equal(crypto.sha256_hex(long + "more"))
+  })
+})
+
+describe("crypto.new_sha512", fn() {
+  it("gives the same digest when the text is written in pieces", fn() {
+    h := crypto.new_sha512()
+    h.write("ab")
+    h.write("c")
+    expect(h.sum_hex()).to_equal(crypto.sha512_hex("abc"))
+    expect(h.size()).to_equal(64)
+    expect(h.block_size()).to_equal(128)
+  })
+})
+
+describe("crypto.hmac_sha256", fn() {
+  it("matches RFC 4231 test case 1", fn() {
+    expect(crypto.hmac_sha256_hex(unhex(strings.repeat("0b", 20)), "Hi There")).to_equal("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+  })
+  it("matches RFC 4231 test case 2", fn() {
+    expect(crypto.hmac_sha256_hex(unhex(hex.encode("Jefe")), "what do ya want for nothing?")).to_equal("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+  })
+  it("matches RFC 4231 test case 3", fn() {
+    expect(crypto.hmac_sha256_hex(unhex(strings.repeat("aa", 20)), unhex(strings.repeat("dd", 50)))).to_equal("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe")
+  })
+  it("matches RFC 4231 test case 6", fn() {
+    expect(crypto.hmac_sha256_hex(unhex(strings.repeat("aa", 131)), "Test Using Larger Than Block-Size Key - Hash Key First")).to_equal("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+  })
+  it("matches RFC 4231 test case 7", fn() {
+    expect(crypto.hmac_sha256_hex(unhex(strings.repeat("aa", 131)), "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.")).to_equal("9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2")
+  })
+  it("gives the same result when the message is written in pieces", fn() {
+    m := crypto.new_hmac_sha256("key")
+    m.write("The quick brown fox ")
+    m.write("jumps over the lazy dog")
+    expect(m.sum_hex()).to_equal("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+  })
+})
+
+describe("crypto.hmac_sha512", fn() {
+  it("matches RFC 4231 test case 1", fn() {
+    expect(crypto.hmac_sha512_hex(unhex(strings.repeat("0b", 20)), "Hi There")).to_equal("87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854")
+  })
+  it("matches RFC 4231 test case 2", fn() {
+    expect(crypto.hmac_sha512_hex(unhex(hex.encode("Jefe")), "what do ya want for nothing?")).to_equal("164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737")
+  })
+  it("matches RFC 4231 test case 3", fn() {
+    expect(crypto.hmac_sha512_hex(unhex(strings.repeat("aa", 20)), unhex(strings.repeat("dd", 50)))).to_equal("fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb")
+  })
+  it("matches RFC 4231 test case 6", fn() {
+    expect(crypto.hmac_sha512_hex(unhex(strings.repeat("aa", 131)), "Test Using Larger Than Block-Size Key - Hash Key First")).to_equal("80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598")
+  })
+  it("matches RFC 4231 test case 7", fn() {
+    expect(crypto.hmac_sha512_hex(unhex(strings.repeat("aa", 131)), "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.")).to_equal("e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58")
+  })
+})
+
+describe("crypto.pbkdf2_sha256", fn() {
+  it("derives the known key with the RFC 6070 inputs (1 iteration)", fn() {
+    expect(hex.encode(crypto.pbkdf2_sha256("password", "salt", 1, 32))).to_equal("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+  })
+  it("derives the known key with the RFC 6070 inputs (2 iterations)", fn() {
+    expect(hex.encode(crypto.pbkdf2_sha256("password", "salt", 2, 32))).to_equal("ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+  })
+  it("derives the known key with the RFC 6070 inputs (4096 iterations)", fn() {
+    expect(hex.encode(crypto.pbkdf2_sha256("password", "salt", 4096, 32))).to_equal("c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+  })
+  it("derives the known key with the RFC 6070 inputs (long password and salt)", fn() {
+    expect(hex.encode(crypto.pbkdf2_sha256("passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 40))).to_equal("348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9")
+  })
+  it("derives the known key with the RFC 6070 inputs (zero bytes in password and salt)", fn() {
+    expect(hex.encode(crypto.pbkdf2_sha256("pass\x00word", "sa\x00lt", 4096, 16))).to_equal("89b69d0516f829893c696226650a8687")
+  })
+})
+
+describe("crypto.constant_time_eq", fn() {
+  it("is true only for equal texts", fn() {
+    expect(crypto.constant_time_eq("abc", "abc")).to_be_true()
+    expect(crypto.constant_time_eq("", "")).to_be_true()
+    expect(crypto.constant_time_eq("abc", "abd")).to_be_false()
+  })
+  it("is false for texts of different lengths", fn() {
+    expect(crypto.constant_time_eq("abc", "ab")).to_be_false()
+  })
+})
+
+describe("crypto.random_bytes", fn() {
+  it("returns as many bytes as asked", fn() {
+    r, err := crypto.random_bytes(32)
+    expect(err).to_be_nil()
+    expect(r).to_have_length(32)
+    z, err0 := crypto.random_bytes(0)
+    expect(err0).to_be_nil()
+    expect(z).to_have_length(0)
+  })
+  it("returns different bytes each time", fn() {
+    a, _ := crypto.random_bytes(32)
+    b, _ := crypto.random_bytes(32)
+    expect(a).not_().to_equal(b)
+  })
+  it("refuses a negative length", fn() {
+    _, err := crypto.random_bytes(-1)
+    expect(err).to_be_error("crypto: negative length")
+  })
+})

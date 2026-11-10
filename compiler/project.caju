@@ -1,6 +1,8 @@
 # Project loading: reads the entry file and every file it imports. Port of bootstrap/project.js.
 # Import paths are relative to the entry file's directory; paths starting with "std/" come from
-# the standard library directory (lib_dir).
+# the standard library directory (lib_dir); paths that start with the name of an installed package
+# ("github.com/user/repo" or "github.com/user/repo/file") come from that package's directory
+# (see compiler/pkg.caju).
 
 import "std/os"
 import "std/strings"
@@ -12,6 +14,40 @@ struct Loader {
   lib_dir: str
   files: []*ast.SourceFile
   seen: map[str]bool
+  pkgs: map[str]*Package
+}
+
+# the files loaded so far (to name the file of an error raised while loading)
+export let loading: []*ast.SourceFile = nil
+
+# an installed package: its name (the import path) and where its files are
+export struct Package {
+  name: str
+  dir: str
+  entry: str      # the file imported by `import "<name>"`, relative to dir
+}
+
+# the package that a file (by its import name) belongs to, or ""
+fn package_of(pkgs: map[str]*Package, name: str) -> str {
+  if pkgs == nil { return "" }
+  p := strings.trim_suffix(name, ".caju")
+  for k, _ := range pkgs { if p == k || strings.has_prefix(p, k + "/") { return k } }
+  return ""
+}
+
+# the file of an import that names a package (or a file inside one), or "" if it names none
+fn package_file(pkgs: map[str]*Package, name: str) -> str {
+  if pkgs == nil || len(pkgs) == 0 { return "" }
+  p := strings.trim_suffix(name, ".caju")
+  if pk, ok := pkgs[p]; ok { return join_path(pk.dir, pk.entry) }
+  # the longest package name that is a prefix of p ("github.com/u/r/sub/file")
+  i := len(p)
+  while true {
+    i = strings.last_index(p[0:i], "/")
+    if i <= 0 { return "" }
+    if pk, ok := pkgs[p[0:i]]; ok { return join_path(pk.dir, name[i + 1:]) }
+  }
+  return ""
 }
 
 export fn resolve_import(base: str, name: str, lib_dir: str) -> str {
@@ -57,6 +93,7 @@ fn (ld: *Loader) add(name: str, file: str) {
   src, err := os.read_file(file)
   if err != nil { return }
   ld.files = append(ld.files, &ast.SourceFile{name: name, src: src})
+  loading = ld.files
   toks := try_lex(src, len(ld.files) - 1)
   if toks == nil { return }
   for i := 0; i + 1 < len(toks); i++ {
@@ -70,15 +107,26 @@ fn (ld: *Loader) add(name: str, file: str) {
     if j < len(toks) && toks[j].type == "STRING" {
       nm := toks[j].value
       if !strings.has_suffix(nm, ".caju") { nm = nm + ".caju" }
-      ld.add(nm, resolve_import(ld.base, nm, ld.lib_dir))
+      file := package_file(ld.pkgs, nm)
+      if file == "" {
+        owner := package_of(ld.pkgs, name)
+        if owner != "" && !strings.has_prefix(nm, "std/") {
+          ast.fail("link", "Files of the package " + owner + " must import with the full path: import \"" + owner + "/" + strings.trim_suffix(nm, ".caju") + "\", or the package that has \"" + strings.trim_suffix(nm, ".caju") + "\" is missing from caju.lock (run caju pkg install)", toks[j].line, toks[j].col)
+        }
+        file = resolve_import(ld.base, nm, ld.lib_dir)
+      }
+      ld.add(nm, file)
     }
   }
 }
 
 # the entry first, then the files in the order their imports were found
-export fn load_project(entry: str, lib_dir: str) -> []*ast.SourceFile {
+export fn load_project(entry: str, lib_dir: str) -> []*ast.SourceFile { return load_project_with(entry, lib_dir, nil) }
+
+# like load_project, with the installed packages (name -> package) for imports that name them
+export fn load_project_with(entry: str, lib_dir: str, pkgs: map[str]*Package) -> []*ast.SourceFile {
   abs := absolute(entry)
-  ld := &Loader{base: dir_name(abs), lib_dir: lib_dir, files: []*ast.SourceFile{}, seen: map[str]bool{}}
+  ld := &Loader{base: dir_name(abs), lib_dir: lib_dir, files: []*ast.SourceFile{}, seen: map[str]bool{}, pkgs: pkgs}
   ld.add(base_name(entry), abs)
   return ld.files
 }

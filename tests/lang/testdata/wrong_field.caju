@@ -1,0 +1,4 @@
+struct C { r: num }
+let v: any = C{}
+print(v)
+print(v.q)

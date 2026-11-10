@@ -1,0 +1,395 @@
+# std/fs: files and directories (Linux x86-64): information about a file, listing and walking
+# directories, creating and removing whole trees, renaming, copying, temporary directories.
+# Reading and writing whole files is in std/os (read_file, write_file); fs repeats them so a
+# program that only handles files needs a single import.
+
+import "std/os"
+import "std/strings"
+import "std/path"
+
+const SYS_OPEN = 2
+const SYS_CLOSE = 3
+const SYS_STAT = 4
+const SYS_LSTAT = 6
+const SYS_WRITE = 1
+const SYS_RENAME = 82
+const SYS_MKDIR = 83
+const SYS_RMDIR = 84
+const SYS_UNLINK = 87
+const SYS_SYMLINK = 88
+const SYS_READLINK = 89
+const SYS_CHMOD = 90
+const SYS_GETDENTS64 = 217
+
+const O_RDONLY = 0
+const O_WRONLY = 1
+const O_CREAT = 64
+const O_APPEND = 1024
+const O_DIRECTORY = 65536
+const O_CLOEXEC = 524288
+
+const S_IFMT = 0o170000
+const S_IFDIR = 0o040000
+const S_IFREG = 0o100000
+const S_IFLNK = 0o120000
+
+const EEXIST = -17
+
+fn cstr(s: str) -> int { return __strp(s) + 8 }
+
+# what stat says about a file
+export struct FileInfo {
+  name: str          # the last part of the path
+  size: int          # in bytes
+  mode: int          # the permission bits (0o755, ...)
+  is_dir: bool
+  is_file: bool      # a regular file
+  is_symlink: bool   # only from lstat; stat follows links
+  mtime: int         # last modification, in nanoseconds since 1970
+}
+
+# one entry of a directory listing
+export struct DirEntry {
+  name: str
+  is_dir: bool
+  is_file: bool
+  is_symlink: bool
+}
+
+fn stat_with(call: int, what: str, p: str) -> (*FileInfo, error) {
+  buf := __newstr(144)
+  r := __syscall(call, cstr(p), buf + 8, 0, 0, 0, 0)
+  if r < 0 { return nil, os.syscall_error(what, p, r) }
+  m := __load64(buf + 8 + 24) & 0xFFFFFFFF
+  t := m & S_IFMT
+  fi := &FileInfo{name: path.base(p), size: __load64(buf + 8 + 48), mode: m & 0o7777}
+  fi.is_dir = t == S_IFDIR
+  fi.is_file = t == S_IFREG
+  fi.is_symlink = t == S_IFLNK
+  fi.mtime = __load64(buf + 8 + 88) * 1000000000 + __load64(buf + 8 + 96)
+  return fi, nil
+}
+
+# information about the file at p, following symbolic links
+export fn stat(p: str) -> (*FileInfo, error) { return stat_with(SYS_STAT, "stat", p) }
+# like stat, but a symbolic link is described itself (is_symlink), not its target
+export fn lstat(p: str) -> (*FileInfo, error) { return stat_with(SYS_LSTAT, "lstat", p) }
+
+export fn exists(p: str) -> bool { return os.exists(p) }
+export fn is_dir(p: str) -> bool {
+  fi, err := stat(p)
+  return err == nil && fi.is_dir
+}
+export fn is_file(p: str) -> bool {
+  fi, err := stat(p)
+  return err == nil && fi.is_file
+}
+
+export fn read_file(p: str) -> (str, error) { return os.read_file(p) }
+export fn write_file(p: str, data: str, mode: int) -> error { return os.write_file(p, data, mode) }
+
+# adds data to the end of the file, creating it (with mode) if it does not exist
+export fn append_file(p: str, data: str, mode: int) -> error {
+  fd := __syscall(SYS_OPEN, cstr(p), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, mode, 0, 0, 0)
+  if fd < 0 { return os.syscall_error("open", p, fd) }
+  ptr := cstr(data)
+  n := len(data)
+  while n > 0 {
+    w := __syscall(SYS_WRITE, fd, ptr, n, 0, 0, 0)
+    if w < 0 {
+      __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+      return os.syscall_error("write", p, w)
+    }
+    ptr += w
+    n -= w
+  }
+  __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+  return nil
+}
+
+# the entries of a directory (without "." and ".."), sorted by name (byte order)
+export fn read_dir(p: str) -> ([]*DirEntry, error) {
+  fd := __syscall(SYS_OPEN, cstr(p), O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, 0, 0, 0)
+  if fd < 0 { return nil, os.syscall_error("open", p, fd) }
+  out := []*DirEntry{}
+  buf := __newstr(32768)
+  while true {
+    n := __syscall(SYS_GETDENTS64, fd, buf + 8, 32768, 0, 0, 0)
+    if n < 0 {
+      __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+      return nil, os.syscall_error("read_dir", p, n)
+    }
+    if n == 0 { break }
+    off := 0
+    while off < n {
+      e := buf + 8 + off
+      reclen := __load8(e + 16) | (__load8(e + 17) << 8)
+      dtype := __load8(e + 18)
+      name := c_name(e + 19)
+      if name != "." && name != ".." {
+        d := &DirEntry{name: name}
+        if dtype == 0 {
+          # DT_UNKNOWN (some file systems): ask stat
+          fi, err := lstat(path.join(p, name))
+          if err == nil {
+            d.is_dir = fi.is_dir
+            d.is_file = fi.is_file
+            d.is_symlink = fi.is_symlink
+          }
+        } else {
+          d.is_dir = dtype == 4
+          d.is_file = dtype == 8
+          d.is_symlink = dtype == 10
+        }
+        out = append(out, d)
+      }
+      off += reclen
+    }
+  }
+  __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+  sort_entries(out)
+  return out, nil
+}
+
+# the names in a directory, sorted
+export fn list_dir(p: str) -> ([]str, error) {
+  es, err := read_dir(p)
+  if err != nil { return nil, err }
+  out := []str{}
+  for _, e := range es { out = append(out, e.name) }
+  return out, nil
+}
+
+fn c_name(ptr: int) -> str {
+  b := strings.Builder{}
+  i := 0
+  while __load8(ptr + i) != 0 {
+    b.write_byte(__load8(ptr + i))
+    i++
+  }
+  return b.string()
+}
+
+# merge sort by name (stable, n log n)
+fn sort_entries(xs: []*DirEntry) {
+  if len(xs) < 2 { return }
+  tmp := make([]*DirEntry, len(xs))
+  merge_sort(xs, tmp, 0, len(xs))
+}
+fn merge_sort(xs: []*DirEntry, tmp: []*DirEntry, lo: int, hi: int) {
+  if hi - lo < 2 { return }
+  mid := (lo + hi) / 2
+  merge_sort(xs, tmp, lo, mid)
+  merge_sort(xs, tmp, mid, hi)
+  i := lo
+  j := mid
+  k := lo
+  while i < mid && j < hi {
+    if xs[j].name < xs[i].name {
+      tmp[k] = xs[j]
+      j++
+    } else {
+      tmp[k] = xs[i]
+      i++
+    }
+    k++
+  }
+  while i < mid {
+    tmp[k] = xs[i]
+    i++
+    k++
+  }
+  while j < hi {
+    tmp[k] = xs[j]
+    j++
+    k++
+  }
+  for t := lo; t < hi; t++ { xs[t] = tmp[t] }
+}
+
+# creates one directory (its parent must exist)
+export fn mkdir(p: str, mode: int) -> error { return os.mkdir(p, mode) }
+
+# creates the directory and every missing parent; no error if it already exists as a directory
+export fn mkdir_all(p: str, mode: int) -> error {
+  p = path.clean(p)
+  if is_dir(p) { return nil }
+  parent := path.dir(p)
+  if parent != p && parent != "." && parent != "/" {
+    err := mkdir_all(parent, mode)
+    if err != nil { return err }
+  }
+  r := __syscall(SYS_MKDIR, cstr(p), mode, 0, 0, 0, 0)
+  if r == EEXIST && is_dir(p) { return nil }
+  if r < 0 { return os.syscall_error("mkdir", p, r) }
+  return nil
+}
+
+# removes a file or an empty directory
+export fn remove(p: str) -> error {
+  fi, err := lstat(p)
+  if err != nil { return err }
+  if fi.is_dir {
+    r := __syscall(SYS_RMDIR, cstr(p), 0, 0, 0, 0, 0)
+    if r < 0 { return os.syscall_error("remove", p, r) }
+    return nil
+  }
+  return os.remove(p)
+}
+
+# removes p and everything inside it; no error if p does not exist. Symbolic links are removed,
+# never followed.
+export fn remove_all(p: str) -> error {
+  fi, err := lstat(p)
+  if err != nil {
+    if !os.exists(p) { return nil }
+    return err
+  }
+  if fi.is_dir {
+    es, err2 := read_dir(p)
+    if err2 != nil { return err2 }
+    for _, e := range es {
+      err3 := remove_all(path.join(p, e.name))
+      if err3 != nil { return err3 }
+    }
+  }
+  return remove(p)
+}
+
+# renames (moves) a file or directory; both paths must be on the same file system
+export fn rename(from_: str, to_: str) -> error {
+  r := __syscall(SYS_RENAME, cstr(from_), cstr(to_), 0, 0, 0, 0)
+  if r < 0 { return os.syscall_error("rename", from_ + " to", r) }
+  return nil
+}
+
+export fn chmod(p: str, mode: int) -> error {
+  r := __syscall(SYS_CHMOD, cstr(p), mode, 0, 0, 0, 0)
+  if r < 0 { return os.syscall_error("chmod", p, r) }
+  return nil
+}
+
+export fn symlink(target: str, link: str) -> error {
+  r := __syscall(SYS_SYMLINK, cstr(target), cstr(link), 0, 0, 0, 0)
+  if r < 0 { return os.syscall_error("symlink", link, r) }
+  return nil
+}
+
+# where a symbolic link points to
+export fn readlink(p: str) -> (str, error) {
+  m := __newstr(4096)
+  r := __syscall(SYS_READLINK, cstr(p), m + 8, 4096, 0, 0, 0)
+  if r < 0 { return "", os.syscall_error("readlink", p, r) }
+  __store64(m, r)
+  __store8(m + 8 + r, 0)
+  return __pstr(m), nil
+}
+
+# copies a regular file, keeping its permission bits
+export fn copy_file(from_: str, to_: str) -> error {
+  fi, err := stat(from_)
+  if err != nil { return err }
+  if !fi.is_file { return errors.New("copy " + from_ + ": not a regular file") }
+  data, err2 := os.read_file(from_)
+  if err2 != nil { return err2 }
+  return os.write_file(to_, data, fi.mode)
+}
+
+# copies a directory tree (files, directories and symbolic links, as links); to_ must not exist
+export fn copy_dir(from_: str, to_: str) -> error {
+  fi, err := stat(from_)
+  if err != nil { return err }
+  if !fi.is_dir { return errors.New("copy " + from_ + ": not a directory") }
+  if os.exists(to_) { return errors.New("copy " + from_ + ": " + to_ + " already exists") }
+  err = os.mkdir(to_, fi.mode)
+  if err != nil { return err }
+  es, err2 := read_dir(from_)
+  if err2 != nil { return err2 }
+  for _, e := range es {
+    src := path.join(from_, e.name)
+    dst := path.join(to_, e.name)
+    if e.is_symlink {
+      t, err3 := readlink(src)
+      if err3 != nil { return err3 }
+      err = symlink(t, dst)
+    } else if e.is_dir {
+      err = copy_dir(src, dst)
+    } else {
+      err = copy_file(src, dst)
+    }
+    if err != nil { return err }
+  }
+  return nil
+}
+
+# every entry under root (files, directories and links, not root itself), as paths relative to
+# root, in a fixed order: depth first, each directory's entries sorted by name. Symbolic links to
+# directories are listed but not followed.
+export fn walk(root: str) -> ([]str, error) {
+  w := &Walker{root: root, out: []str{}, files_only: false}
+  err := w.into("")
+  if err != nil { return nil, err }
+  return w.out, nil
+}
+
+# like walk, but only regular files and symbolic links (no directories)
+export fn walk_files(root: str) -> ([]str, error) {
+  w := &Walker{root: root, out: []str{}, files_only: true}
+  err := w.into("")
+  if err != nil { return nil, err }
+  return w.out, nil
+}
+
+struct Walker {
+  root: str
+  out: []str
+  files_only: bool
+}
+
+fn (w: *Walker) into(rel: str) -> error {
+  dir := w.root
+  if rel != "" { dir = path.join(w.root, rel) }
+  es, err := read_dir(dir)
+  if err != nil { return err }
+  for _, e := range es {
+    r := e.name
+    if rel != "" { r = rel + "/" + e.name }
+    if e.is_dir {
+      if !w.files_only { w.out = append(w.out, r) }
+      err = w.into(r)
+      if err != nil { return err }
+    } else {
+      w.out = append(w.out, r)
+    }
+  }
+  return nil
+}
+
+# the entries under root whose path relative to root matches the shell pattern (see path.match),
+# for example glob(".", "*.caju") or glob("src", "*/*.caju")
+export fn glob(root: str, pattern: str) -> ([]str, error) {
+  all, err := walk(root)
+  if err != nil { return nil, err }
+  out := []str{}
+  for _, r := range all { if path.match(pattern, r) { out = append(out, r) } }
+  return out, nil
+}
+
+let temp_counter: int = 0
+
+# creates a new, empty directory inside dir (or, if dir is "", inside $TMPDIR or /tmp) whose name
+# starts with prefix, and returns its path
+export fn temp_dir(dir: str, prefix: str) -> (str, error) {
+  base := dir
+  if base == "" { base = os.getenv("TMPDIR") }
+  if base == "" { base = "/tmp" }
+  for tries := 0; tries < 100; tries++ {
+    temp_counter += 1
+    n := os.nanotime() ^ (os.getpid() << 20)
+    p := path.join(base, prefix + str(os.getpid()) + "-" + str(n & 0xFFFFFF) + "-" + str(temp_counter))
+    r := __syscall(SYS_MKDIR, cstr(p), 0o700, 0, 0, 0, 0)
+    if r == 0 { return p, nil }
+    if r != EEXIST { return "", os.syscall_error("mkdir", p, r) }
+  }
+  return "", errors.New("temp_dir: could not create a directory in " + base)
+}

@@ -1,0 +1,94 @@
+import { describe, it, expect } from "std/testing"
+
+struct Node { value: int, next: *Node }
+struct Point { x: int, y: int }
+fn (p: *Point) scale(k: int) {
+  p.x *= k
+  p.y *= k
+}
+fn (p: *Point) move(dx: int, dy: int) {
+  p.x += dx
+  p.y += dy
+}
+fn (p: Point) sum() -> int { return p.x + p.y }
+fn (p: Point) dist() -> int { return p.x * p.x + p.y * p.y }
+fn incr(n: *int) { *n++ }
+fn zero(p: *int) { *p = 0 }
+fn swap(a: *int, b: *int) { *a, *b = *b, *a }
+
+describe("pointers", fn() {
+  it("link structs into a list", fn() {
+    list := &Node{value: 1}
+    list.next = &Node{value: 2, next: &Node{value: 3}}
+    got := []int{}
+    for p := list; p != nil; p = p.next { got = append(got, p.value) }
+    expect(got).to_equal([]int{1, 2, 3})
+  })
+  it("methods with a *T receiver change the original", fn() {
+    a := Point{1, 2}
+    pa := &a
+    pa.scale(10)
+    expect(a).to_equal(Point{10, 20})
+    expect(pa.sum()).to_equal(30)
+    expect(*pa).to_equal(Point{10, 20})
+    pt := Point{3, 4}
+    pt.move(1, 1)
+    expect(str(pt)).to_equal("Point{x: 4, y: 5}")
+    expect(pt.dist()).to_equal(41)
+  })
+  it("dereferencing copies the struct", fn() {
+    a := Point{10, 20}
+    pa := &a
+    b := *pa
+    b.x = 0
+    expect([]int{a.x, b.x}).to_equal([]int{10, 0})
+  })
+  it("a pointer sees later assignments to the variable", fn() {
+    a := Point{1, 2}
+    pa := &a
+    a = Point{5, 5}
+    expect(str(pa)).to_equal("Point{x: 5, y: 5}")
+  })
+  it("*p reads and writes the variable", fn() {
+    x := 10
+    px := &x
+    *px = 20
+    *px += 1
+    expect([]int{x, *px}).to_equal([]int{21, 21})
+    incr(&x)
+    expect(x).to_equal(22)
+    y := 42
+    p := &y
+    *p += 8
+    expect(y).to_equal(50)
+    zero(&y)
+    expect(y).to_equal(0)
+  })
+  it("new allocates a zero value", fn() {
+    q := new(int)
+    expect(*q).to_equal(0)
+    expect(q != nil).to_be_true()
+    *q = 7
+    expect(*q).to_equal(7)
+    r := new(Point)
+    r.x = 3
+    expect(str(r)).to_equal("Point{x: 3, y: 0}")
+    expect(*r).to_equal(Point{3, 0})
+  })
+  it("can point into a slice element", fn() {
+    nums := []int{1, 2, 3}
+    pe := &nums[1]
+    *pe = 50
+    expect(nums).to_equal([]int{1, 50, 3})
+  })
+  it("swap through pointers", fn() {
+    u, v := 1, 2
+    swap(&u, &v)
+    expect([]int{u, v}).to_equal([]int{2, 1})
+  })
+  it("a nil pointer compares equal to nil, and reading a field through it is a runtime error", fn() {
+    let nilp: *Point = nil
+    expect(nilp == nil).to_be_true()
+    expect(fn() { print(nilp.x) }).to_panic_with("Access to field \"x\" through a nil pointer")
+  })
+})

@@ -1,0 +1,93 @@
+import { describe, it, expect } from "std/testing"
+
+# runs f and turns a panic into an error "recovered: ..."
+fn safe(f: fn()) -> (err: error) {
+  defer fn() {
+    if r := recover(); r != nil { err = errors.New("recovered: " + str(r)) }
+  }()
+  f()
+  return nil
+}
+
+fn safe_div(a: int, b: int) -> (r: int, err: error) {
+  defer fn() {
+    if x := recover(); x != nil { err = errors.New("recovered: " + str(x)) }
+  }()
+  r = a / b
+  return
+}
+
+let log: []str = []str{}
+
+fn order() {
+  for i := 0; i < 3; i++ { defer fn() { log = append(log, "defer " + str(i)) }() }
+  log = append(log, "body")
+}
+
+fn chores() {
+  defer fn() { log = append(log, "3. clear the table") }()
+  defer fn() { log = append(log, "2. wash the dishes") }()
+  log = append(log, "1. have dinner")
+}
+
+fn pair() -> (int, str) {
+  defer fn() { recover() }()
+  panic(42)
+}
+
+describe("errors", fn() {
+  it("are values made with errors.New", fn() {
+    e := errors.New("division by zero")
+    expect(e.Error()).to_equal("division by zero")
+    expect(str(e)).to_equal("division by zero")
+  })
+})
+
+describe("defer", fn() {
+  it("runs the deferred calls when the function ends, last to first", fn() {
+    log = []str{}
+    order()
+    expect(log).to_equal([]str{"body", "defer 2", "defer 1", "defer 0"})
+  })
+  it("runs after the body (chores example)", fn() {
+    log = []str{}
+    chores()
+    expect(log).to_equal([]str{"1. have dinner", "2. wash the dishes", "3. clear the table"})
+  })
+})
+
+describe("panic and recover", fn() {
+  it("recover stops a panic and gives its value", fn() {
+    expect(safe(fn() { panic("ouch") })).to_be_error("recovered: ouch")
+  })
+  it("runtime errors become panics with their message", fn() {
+    expect(safe(fn() {
+      a := []int{1, 2}
+      print(a[5])
+    })).to_be_error("recovered: Index 5 out of range (length 2)")
+    expect(safe(fn() {
+      x := 0
+      print(10 / x)
+    })).to_be_error("recovered: Integer division by zero")
+    expect(safe(fn() {
+      let mm: map[str]int = nil
+      mm["a"] = 1
+    })).to_be_error("recovered: Assignment to a nil map or slice")
+  })
+  it("a function that does not panic gives nil", fn() {
+    expect(safe(fn() {})).to_be_nil()
+  })
+  it("recover can set named results", fn() {
+    r, err := safe_div(10, 2)
+    expect(r).to_equal(5)
+    expect(err).to_be_nil()
+    r, err = safe_div(1, 0)
+    expect(r).to_equal(0)
+    expect(err).to_be_error("recovered: Integer division by zero")
+  })
+  it("a recovered function returns the zero values", fn() {
+    a, b := pair()
+    expect(a).to_equal(0)
+    expect(b).to_equal("")
+  })
+})

@@ -1,0 +1,128 @@
+import "std/os"
+import "std/strings"
+import { describe, it, expect, before_each, after_each, repr } from "std/testing"
+
+struct Block { n: int }
+
+
+describe("expect", fn() {
+  describe("to_equal", fn() {
+    it("accepts equal numbers, texts and lists", fn() {
+      expect(1 + 1).to_equal(2)
+      expect("caju").to_equal("caju")
+      expect([]str{"a", "b"}).to_equal([]str{"a", "b"})
+      expect(map[str]int{"x": 1}).to_equal(map[str]int{"x": 1})
+    })
+    it("tells a text from a number", fn() {
+      expect(fn() { expect("1").to_equal(1) }).to_panic_with("expected: 1\n     got: \"1\"")
+    })
+    it("shows both values when they differ", fn() {
+      expect(fn() { expect([]int{1, 2}).to_equal([]int{1, 3}) }).to_panic_with("expected: [1 3]\n     got: [1 2]")
+    })
+  })
+  describe("not", fn() {
+    it("reverses the expectation", fn() {
+      expect(1).not_().to_equal(2)
+      expect("abc").not_().to_contain("z")
+      expect(fn() { expect(1).not_().to_equal(1) }).to_panic_with("expected a value different from 1")
+    })
+  })
+  describe("booleans and nil", fn() {
+    it("checks true, false and nil", fn() {
+      expect(3 > 2).to_be_true()
+      expect(3 < 2).to_be_false()
+      expect(nil).to_be_nil()
+      let e: error = nil
+      expect(e).to_be_nil()
+      let np: *Block = nil
+      expect(np).to_be_nil()
+      expect(fn() { expect(5).to_be_nil() }).to_panic_with("expected 5 to be nil")
+    })
+  })
+  describe("to_contain and to_have_length", fn() {
+    it("looks inside texts, lists and maps", fn() {
+      expect("hello world").to_contain("o w")
+      expect([]str{"a", "b"}).to_contain("b")
+      expect([]int{4, 5}).to_contain(5)
+      expect(map[str]int{"k": 1}).to_contain("k")
+      expect("abc").to_have_length(3)
+      expect([]int{}).to_have_length(0)
+    })
+    it("explains a wrong length", fn() {
+      expect(fn() { expect([]int{1}).to_have_length(2) }).to_panic_with("expected [1] to have length 2\nlength: 1")
+    })
+  })
+  describe("numbers", fn() {
+    it("compares ints and floats", fn() {
+      expect(3).to_be_greater_than(2)
+      expect(2.5).to_be_less_than(3)
+      expect(3).to_be_at_least(3)
+      expect(3).to_be_at_most(3.0)
+      expect(0.1 + 0.2).to_be_close_to(0.3, 0.000001)
+    })
+  })
+  describe("texts", fn() {
+    it("checks the start and the end", fn() {
+      expect("main.caju").to_start_with("main")
+      expect("main.caju").to_end_with(".caju")
+    })
+  })
+  describe("errors and panics", fn() {
+    it("checks an error message", fn() {
+      expect(errors.New("boom")).to_be_error("boom")
+    })
+    it("catches panics and runtime errors", fn() {
+      expect(fn() { panic("no") }).to_panic()
+      expect(fn() { panic("no") }).to_panic_with("no")
+      expect(fn() {
+        xs := []int{1}
+        print(xs[3])
+      }).to_panic_with("Index 3 out of range (length 1)")
+      expect(fn() {}).not_().to_panic()
+    })
+  })
+  it("shows texts quoted in repr", fn() {
+    expect(repr("a")).to_equal("\"a\"")
+    expect(repr([]any{"a", 1, nil})).to_equal("[\"a\" 1 nil]")
+  })
+})
+
+describe("before_each and after_each", fn() {
+  log := []str{}
+  before_each(fn() { log = append(log, "before") })
+  after_each(fn() { log = append(log, "after") })
+  it("runs before the first test", fn() {
+    expect(log).to_equal([]str{"before"})
+  })
+  it("runs after each test and before the next", fn() {
+    expect(log).to_equal([]str{"before", "after", "before"})
+  })
+})
+
+describe("caju test", fn() {
+  out := ""
+  code := 0
+  before_each(fn() {
+    if out != "" { return }
+    p, err := os.run([]str{os.getenv("CAJU_BIN"), "test", "-v", "testdata/sample_test.caju"}, nil, true)
+    expect(err).to_be_nil()
+    out = p.output
+    code = p.code
+  })
+  it("prints each test under its describe titles", fn() {
+    expect(out).to_contain("a sample\n  ✓ passes\n  ✗ fails with a message\n      expected: [1 3]\n           got: [1 2]\n")
+    expect(out).to_contain("  inside\n    ✗ stops at a runtime error\n        panic: Index 2 out of range (length 0)\n    - is not written yet (skipped)\n")
+  })
+  it("lists the failures with their full titles", fn() {
+    expect(out).to_contain("FAIL: a sample › fails with a message\nFAIL: a sample › inside › stops at a runtime error\n")
+  })
+  it("counts the results and fails when a test fails", fn() {
+    expect(out).to_contain("1 passed, 2 failed, 1 skipped in 1 files")
+    expect(code).to_equal(1)
+  })
+  it("runs only the tests whose title matches --run", fn() {
+    p, _ := os.run([]str{os.getenv("CAJU_BIN"), "test", "--run", "passes", "testdata/sample_test.caju"}, nil, true)
+    expect(p.output).to_contain("1 passed, 0 failed, 0 skipped")
+    expect(p.code).to_equal(0)
+  })
+})

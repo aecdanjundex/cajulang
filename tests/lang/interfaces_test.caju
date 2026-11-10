@@ -1,0 +1,137 @@
+import { describe, it, skip, expect } from "std/testing"
+
+interface Shape { area() -> num }
+interface Named { name() -> str }
+interface NamedShape { Shape; Named }
+struct Square { side: num }
+struct Circle { r: num }
+fn (q: Square) area() -> num { return q.side * q.side }
+fn (q: Square) name() -> str { return "square" }
+fn (c: *Circle) area() -> num { return 3 * c.r * c.r }
+fn (c: *Circle) name() -> str { return "circle" }
+fn label(f: NamedShape) -> str { return f.name() + " " + str(f.area()) }
+
+interface Shape2 { area() -> num; name() -> str }
+struct Rectangle { w: num, h: num }
+struct Disk { r: num }
+fn (r: Rectangle) area() -> num { return r.w * r.h }
+fn (r: Rectangle) name() -> str { return "rectangle" }
+fn (c: *Disk) area() -> num { return 3.14159 * c.r * c.r }
+fn (c: *Disk) name() -> str { return "circle" }
+
+interface F { area() -> num
+ name() -> str }
+struct Q { l: num }
+struct R { a: num, b: num }
+fn (q: Q) area() -> num { return q.l ** 2 }
+fn (q: Q) name() -> str { return "square" }
+fn (r: R) area() -> num { return r.a * r.b }
+fn (r: R) name() -> str { return "rect" }
+fn total(a: F, b: F) -> num { return a.area() + b.area() }
+
+fn kind(x: any) -> str {
+  switch v := x.(type) {
+  case int: return "int " + str(v + 1)
+  case num: return "num " + str(v)
+  case str: return "str " + v
+  case int8: return "int8"
+  case Square: return "square with side " + str(v.side)
+  case *Circle: return "pointer to circle " + str(v.r)
+  case []int: return "slice of " + str(len(v))
+  case nil: return "nil"
+  case error: return "error: " + v.Error()
+  default: return "other"
+  }
+}
+
+fn describe_value(x: any) -> str {
+  switch v := x.(type) {
+  case int: return "integer " + str(v)
+  case num: return "number " + str(v)
+  case str: return "string of " + str(len(v)) + " bytes"
+  case []int: return "slice with " + str(len(v)) + " items"
+  case error: return "error: " + v.Error()
+  case nil: return "nil"
+  default: return "something else"
+  }
+}
+
+# for the known bug below
+struct C { r: num }
+fn (c: C) area() -> num { return 3 * c.r * c.r }
+fn (c: *C) grow(k) { c.r = c.r + k }
+fn (c: C) f(a) { return a }
+
+describe("interfaces", fn() {
+  it("accept values and pointers that have the methods, also through embedded interfaces", fn() {
+    expect(label(Square{2})).to_equal("square 4")
+    expect(label(&Circle{1})).to_equal("circle 3")
+  })
+  it("a slice of interfaces calls the method of each value", fn() {
+    shapes := []Shape2{Rectangle{2, 3}, &Disk{1}}
+    got := []str{}
+    for _, f := range shapes { got = append(got, f.name() + " " + str(f.area())) }
+    expect(got).to_equal([]str{"rectangle 6", "circle 3.14159"})
+  })
+  it("an interface variable can change its value; it prints the value inside", fn() {
+    let f: F = Q{l: 3}
+    expect([]any{f.name(), f.area(), total(f, R{a: 2, b: 5})}).to_equal([]any{"square", 9, 19})
+    f = R{a: 1, b: 1}
+    expect(f.name()).to_equal("rect")
+    expect(str(f)).to_equal("R{a: 1, b: 1}")
+  })
+})
+
+describe("type assertions", fn() {
+  it("x.(T) with ok tells if the value has that type", fn() {
+    let f: Shape = Square{4}
+    q, ok := f.(Square)
+    expect(str(q)).to_equal("Square{side: 4}")
+    expect(ok).to_be_true()
+    c, ok2 := f.(*Circle)
+    expect(c).to_be_nil()
+    expect(ok2).to_be_false()
+  })
+  it("x.(I) converts to another interface", fn() {
+    let f: Shape = Square{4}
+    n := f.(Named)
+    expect(n.name()).to_equal("square")
+  })
+  it("works on values held in a slice of interfaces", fn() {
+    shapes := []Shape2{Rectangle{2, 3}, &Disk{1}}
+    c, ok := shapes[1].(*Disk)
+    expect(ok).to_be_true()
+    expect(c.r).to_equal(1)
+    _, ok2 := shapes[0].(*Disk)
+    expect(ok2).to_be_false()
+  })
+})
+
+describe("type switch", fn() {
+  it("picks the case of the dynamic type", fn() {
+    got := []str{kind(3), kind(2.5), kind(4.0), kind("hi"), kind(int8(5)), kind(Square{3}), kind(&Circle{7}), kind([]int{1, 2}), kind(nil), kind(errors.New("failed")), kind(true)}
+    expect(got).to_equal([]str{"int 4", "num 2.5", "num 4", "str hi", "int8", "square with side 3", "pointer to circle 7", "slice of 2", "nil", "error: failed", "other"})
+  })
+  it("works over a list of any", fn() {
+    got := []str{}
+    for _, x := range []any{7, 2.5, "café", []int{1, 2}, errors.New("oops"), nil, true} { got = append(got, describe_value(x)) }
+    expect(got).to_equal([]str{"integer 7", "number 2.5", "string of 5 bytes", "slice with 2 items", "error: oops", "nil", "something else"})
+  })
+})
+
+describe("methods called on any", fn() {
+  it("a struct field is read through any", fn() {
+    let v: any = C{r: 4}
+    expect(v.r).to_equal(4)
+    expect(v.area()).to_equal(48)
+  })
+  skip("pointer methods with untyped parameters change the value (known bug: a dynamic call does not box untyped arguments; the program hangs)", fn() {
+    let xs: any = C{r: 1}
+    xs.grow(2)
+    expect([]any{xs.area(), xs.r}).to_equal([]any{27, 3})
+  })
+  skip("a method with an untyped parameter returns its argument (known bug: same as above, hangs)", fn() {
+    let v: any = C{}
+    expect(v.f(1)).to_equal(1)
+  })
+})

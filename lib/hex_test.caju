@@ -1,0 +1,44 @@
+import "std/hex"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+# every byte value, 0 to 255
+fn all_bytes() -> str {
+  b := strings.Builder{}
+  for i := 0; i < 256; i++ { b.write_byte(i) }
+  return b.string()
+}
+
+describe("hex.encode", fn() {
+  it("writes two lowercase digits per byte", fn() {
+    expect(hex.encode("")).to_equal("")
+    expect(hex.encode("abc")).to_equal("616263")
+    expect(hex.encode("Olá")).to_equal("4f6cc3a1")
+  })
+  it("encodes every byte value", fn() {
+    expect(hex.encode(all_bytes())).to_equal("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+  })
+})
+
+describe("hex.decode", fn() {
+  it("gives back what encode wrote", fn() {
+    d, err := hex.decode(hex.encode(all_bytes()))
+    expect(err).to_be_nil()
+    expect(d == all_bytes()).to_be_true()
+  })
+  it("accepts uppercase and lowercase digits", fn() {
+    d, err := hex.decode("4A6b4c")
+    expect(err).to_be_nil()
+    expect(d).to_equal("JkL")
+  })
+  it("returns an error for an odd number of digits", fn() {
+    d, err := hex.decode("abc")
+    expect(d).to_equal("")
+    expect(err).to_be_error("hex: odd length")
+  })
+  it("returns an error for a character that is not a digit", fn() {
+    d, err := hex.decode("zz")
+    expect(d).to_equal("")
+    expect(err).to_be_error("hex: invalid byte at position 0")
+  })
+})

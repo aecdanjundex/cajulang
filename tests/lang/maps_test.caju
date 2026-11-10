@@ -1,0 +1,66 @@
+import { describe, it, expect } from "std/testing"
+
+describe("maps", fn() {
+  it("keep the keys in insertion order", fn() {
+    m := map[str]int{"one": 1, "two": 2}
+    m["three"] = 3
+    expect(m).to_equal(map[str]int{"one": 1, "two": 2, "three": 3})
+    expect(str(m)).to_equal("map[\"one\":1 \"three\":3 \"two\":2]")
+    expect(len(m)).to_equal(3)
+  })
+  it("return the value and whether the key exists", fn() {
+    m := map[str]int{"one": 1, "two": 2}
+    v, ok := m["two"]
+    expect(v).to_equal(2)
+    expect(ok).to_be_true()
+    v, ok = m["zero"]
+    expect(v).to_equal(0)
+    expect(ok).to_be_false()
+  })
+  it("range visits the keys in insertion order, after deletes", fn() {
+    m := map[str]int{"one": 1, "two": 2}
+    m["three"] = 3
+    delete(m, "one")
+    seen := []str{}
+    for k, x := range m { seen = append(seen, k + "=" + str(x)) }
+    expect(seen).to_equal([]str{"two=2", "three=3"})
+  })
+  it("print sorted by key but iterate in insertion order", fn() {
+    m := map[str]int{"b": 2, "a": 1, "c": 3}
+    delete(m, "b")
+    m["d"] = 4
+    expect(str(m)).to_equal("map[\"a\":1 \"c\":3 \"d\":4]")
+    expect(len(m)).to_equal(3)
+    v, ok := m["z"]
+    expect(v).to_equal(0)
+    expect(ok).to_be_false()
+    keys := []str{}
+    for k, _ := range m { keys = append(keys, k) }
+    expect(keys).to_equal([]str{"a", "c", "d"})
+  })
+  it("can hold slices as values", fn() {
+    type_m := map[int][]str{}
+    type_m[3] = append(type_m[3], "x", "y")
+    expect(str(type_m)).to_equal("map[3:[\"x\" \"y\"]]")
+  })
+  it("support updating and deleting (stock example)", fn() {
+    stock := map[str]int{"banana": 12, "cashew": 30}
+    stock["mango"] = 5
+    stock["banana"] -= 2
+    delete(stock, "cashew")
+    qty, ok := stock["cashew"]
+    expect(ok).to_be_false()
+    expect(qty).to_equal(0)
+    pairs := []str{}
+    for fruit, q := range stock { pairs = append(pairs, fruit + " " + str(q)) }
+    expect(pairs).to_equal([]str{"banana 10", "mango 5"})
+    expect(str(stock)).to_equal("map[\"banana\":10 \"mango\":5]")
+  })
+  it("can be indexed right after a literal in an if", fn() {
+    if v, ok := map[str]int{"a": 1}["a"]; ok {
+      expect(v).to_equal(1)
+    } else {
+      expect(ok).to_be_true()
+    }
+  })
+})

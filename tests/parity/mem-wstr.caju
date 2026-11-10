@@ -1,7 +1,0 @@
-let p = alloc(16)
-poke16(p, 72)
-poke16(p + 2, 105)
-poke16(p + 4, 225)
-print(readwstr(p), readstr(p))
-free(p)
-free(0)

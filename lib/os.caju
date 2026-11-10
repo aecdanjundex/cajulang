@@ -30,7 +30,9 @@ let ERRNO_NAMES = []str{"", "operation not permitted", "no such file or director
   "resource temporarily unavailable", "out of memory", "permission denied", "bad address", "block device required",
   "device or resource busy", "file exists", "invalid cross-device link", "no such device", "not a directory", "is a directory",
   "invalid argument", "too many open files in system", "too many open files", "not a terminal", "text file busy",
-  "file too large", "no space left on device", "illegal seek", "read-only file system"}
+  "file too large", "no space left on device", "illegal seek", "read-only file system", "too many links", "broken pipe",
+  "numerical argument out of domain", "numerical result out of range", "resource deadlock avoided", "file name too long",
+  "no locks available", "function not implemented", "directory not empty", "too many levels of symbolic links"}
 
 # the message for a failed system call (it returns -errno)
 fn errno_text(r: int) -> str {
@@ -41,6 +43,8 @@ fn errno_text(r: int) -> str {
 fn sys_error(what: str, path: str, r: int) -> error {
   return errors.New(what + " " + path + ": " + errno_text(r))
 }
+# the error for a failed system call r (-errno): "what path: message" (used by std/fs)
+export fn syscall_error(what: str, path: str, r: int) -> error { return sys_error(what, path, r) }
 
 # a C string (pointer to bytes ending in 0) copied into a Caju string
 fn from_cstr(p: int) -> str {
