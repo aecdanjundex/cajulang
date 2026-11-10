@@ -29,6 +29,7 @@ garantida pela suíte de testes e pela autocompilação.
 | 3 | a[i] com índice simples e leitura num só mov; atribuição única sem temporários; constantes como imediato; teste de int sem normalizar para 0/1 | 92 ms | 317 ms | 576 ms | 237 ms | 212 ms | 390 ms | 1.60 s |
 | 4 | expressões num avaliadas em registradores XMM; comparações de num viram ucomisd + jcc | 91 ms | 320 ms | 532 ms | 127 ms | 214 ms | 397 ms | 1.60 s |
 | 5 | profundidade de chamadas no registrador R15 em vez de uma global em memória | 65 ms | 304 ms | 516 ms | 128 ms | 213 ms | 394 ms | 1.53 s |
+| 6 | variáveis locais inteiras, bool e num mais usadas em RBX, R12, R13, R14 | 66 ms | 218 ms | 449 ms | 125 ms | 210 ms | 287 ms | 1.28 s |
 
 Para comparar: Go faz 39 / 24 / 172 / 38 / 32 / 141 / 599 ms e Rust 21 / 24 / 66 / 38 / 11 / 135 / 359 ms
 (`RESULTS.md`).
@@ -36,29 +37,29 @@ Para comparar: Go faz 39 / 24 / 172 / 38 / 32 / 141 / 599 ms e Rust 21 / 24 / 66
 ## Todas as medições
 
 <!-- python3 bench/compare/rounds/table.py -->
-| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | total gain |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 1.40× |
-| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 1.77× |
-| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 1.94× |
-| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 1.50× |
-| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 1.52× |
-| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 1.43× |
-| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 1.29× |
-| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 1.40× |
-| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 1.43× |
-| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 1.77× |
-| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 1.87× |
-| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 1.91× |
-| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 1.18× |
-| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 1.17× |
-| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 1.20× |
-| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 1.59× |
-| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 1.60× |
-| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 1.62× |
-| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 1.45× |
-| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 1.50× |
-| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.31× |
+| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | total gain |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 1.43× |
+| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 1.82× |
+| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 1.92× |
+| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 1.99× |
+| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 2.24× |
+| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 1.99× |
+| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 1.41× |
+| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 1.62× |
+| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 1.64× |
+| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 1.83× |
+| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 1.88× |
+| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 1.95× |
+| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 1.23× |
+| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 1.21× |
+| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 1.22× |
+| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 2.09× |
+| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 2.21× |
+| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 2.22× |
+| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 2.21× |
+| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 1.87× |
+| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.57× |
 
 A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
 código dela não foi salvo à parte).
@@ -169,3 +170,25 @@ por chamada, uma dependência em série de uma chamada para a outra.
 
 `rounds/round4-fib.asm` → `rounds/round5-fib.asm`.
 **Resultado:** fib −29% (91 → 65 ms); maps −4%, sieve −5% (todos chamam funções).
+
+## Rodada 6: variáveis em registradores
+
+**Hipótese:** depois das rodadas anteriores, o laço do crivo é quase só `mov rax,[rbp-x]` e
+`mov [rbp-x],rax`: as variáveis do laço (`i`, `j`, `n`) vão e voltam da memória a cada uso.
+**Mudança:** alocação de registradores simples, por função:
+- Conta os usos de cada variável local (peso 8 por nível de laço) e escolhe até 4 com pelo
+  menos 4 usos, que vão para RBX, R12, R13 e R14 (registradores preservados pelas funções
+  chamadas, inclusive as externas).
+- Só variáveis que nunca guardam ponteiro (inteiros, bool, num): o coletor de lixo procura
+  ponteiros só na pilha, e um ponteiro que vivesse só num registrador seria perdido.
+- Fora: variáveis em célula (endereço tomado com `&`), capturadas por funções anônimas, e todas
+  as de funções com `defer`.
+- O prólogo guarda os registradores usados no quadro e a saída os restaura; parâmetros escolhidos
+  são carregados no registrador na entrada.
+- Um `panic` recuperado pula os quadros que guardaram esses registradores; por isso uma função
+  com `defer` guarda os 4 na entrada e os restaura no ponto de recuperação.
+
+`rounds/round4-sieve.asm` (84 instruções) → `rounds/round6-sieve.asm`.
+**Resultado:** sieve −28%, sort −27%, maps −16% (o runtime dos mapas também é compilado por este
+gerador), nbody −13%. O matmul e o mandelbrot não mudaram: os programas do benchmark fazem os
+laços no nível de cima do arquivo, onde as variáveis são globais (rodada 7).

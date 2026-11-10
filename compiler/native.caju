@@ -30,6 +30,9 @@ const R8 = 8
 const R9 = 9
 const R10 = 10
 const R11 = 11
+const R12 = 12
+const R13 = 13
+const R14 = 14
 const R15 = 15
 
 const CC_B = 2
@@ -54,6 +57,7 @@ struct Var {
   t: str
   celled: bool
   cap: int                    # -1: not captured
+  reg: int                    # 0, or the callee-saved register that holds it (alloc_regs)
 }
 
 struct Unit {
@@ -913,6 +917,10 @@ fn (f: *Fn) lookup(name: str, n: *ast.Node) -> *Var {
 }
 fn (f: *Fn) load_slot_r(v: *Var, r: int) {
   A := f.a
+  if v.reg != 0 {
+    if r != v.reg { A.mov(r, v.reg) }
+    return
+  }
   if v.cap >= 0 {
     A.load(r, RBP, f.env_off)
     A.load(r, r, 8 + 8 * v.cap)
@@ -922,6 +930,10 @@ fn (f: *Fn) load_slot_r(v: *Var, r: int) {
 }
 fn (f: *Fn) load_slot(v: *Var) { f.load_slot_r(v, RAX) }
 fn (f: *Fn) store_slot_r(v: *Var, r: int) {
+  if v.reg != 0 {
+    if r != v.reg { f.a.mov(v.reg, r) }
+    return
+  }
   if v.sym != "" { f.a.store_sym(v.sym, r) } else { f.a.store(RBP, v.off, r) }
 }
 fn (f: *Fn) store_slot(v: *Var) { f.store_slot_r(v, RAX) }
@@ -948,6 +960,100 @@ fn (f: *Fn) store_v(v: *Var, decl: bool) {
 }
 fn (f: *Fn) rec_addr(r: int) {
   if f.rec.sym != "" { f.a.lea(r, f.rec.sym) } else { f.a.rmx(0x8D, r, RBP, f.rec.off, 1, 0) }
+}
+
+# ---- register allocation ----
+# The (at most 4) most used local variables of a function that never hold a pointer (integers,
+# booleans, floats) live in the callee-saved registers RBX, R12, R13, R14 instead of the frame.
+# Pointers never live only in a register: the collector looks for them on the stack.
+let SAVED_REGS = []int{RBX, R12, R13, R14}
+
+struct UseCount {
+  n: map[str]int
+  in_lit: map[str]bool        # used inside a function literal: stays in memory
+}
+
+fn (uc: *UseCount) walk(n: *ast.Node, w: int, in_lit: bool) {
+  if n == nil { return }
+  if n.kind == "FuncLit" || n.kind == "Func" {
+    uc.walk(n.fn_, w, true)
+    uc.walk(n.body, w, true)
+    return
+  }
+  name := ""
+  if n.kind == "Var" || n.kind == "ForTo" || (n.kind == "Assign" && n.name != "") { name = n.name }
+  if name != "" {
+    if in_lit { uc.in_lit[name] = true }
+    uc.n[name] = uc.n[name] + w
+  }
+  if n.kind == "VarDecl" { for _, nm := range n.names { uc.n[nm] = uc.n[nm] + w } }
+  inner := w
+  if n.kind == "ForC" || n.kind == "ForTo" || n.kind == "Range" || n.kind == "While" {
+    if w < 4096 { inner = w * 8 }
+  }
+  uc.walk(n.value, w, in_lit)
+  uc.walk(n.left, w, in_lit)
+  uc.walk(n.right, w, in_lit)
+  uc.walk(n.arg, w, in_lit)
+  uc.walk(n.expr, w, in_lit)
+  uc.walk(n.obj, w, in_lit)
+  uc.walk(n.index, w, in_lit)
+  uc.walk(n.lo, w, in_lit)
+  uc.walk(n.hi, w, in_lit)
+  uc.walk(n.key, w, in_lit)
+  uc.walk(n.ch, w, in_lit)
+  uc.walk(n.call, w, in_lit)
+  uc.walk(n.fn_, w, in_lit)
+  uc.walk(n.cond, inner, in_lit)
+  uc.walk(n.init, w, in_lit)
+  uc.walk(n.post, inner, in_lit)
+  uc.walk(n.then, w, in_lit)
+  uc.walk(n.otherwise, w, in_lit)
+  uc.walk(n.tag, w, in_lit)
+  uc.walk(n.subject, w, in_lit)
+  uc.walk(n.from_, w, in_lit)
+  uc.walk(n.to_, inner, in_lit)
+  uc.walk(n.body, inner, in_lit)
+  uc.walk(n.target, w, in_lit)
+  for _, x := range n.stmts { uc.walk(x, w, in_lit) }
+  for _, x := range n.args { uc.walk(x, w, in_lit) }
+  for _, x := range n.values { uc.walk(x, w, in_lit) }
+  for _, x := range n.targets { uc.walk(x, w, in_lit) }
+  for _, x := range n.exprs { uc.walk(x, w, in_lit) }
+  for _, x := range n.cases { uc.walk(x, w, in_lit) }
+  for _, x := range n.elems { uc.walk(x, w, in_lit) }
+  for _, x := range n.vars { uc.walk(x, inner, in_lit) }
+}
+
+# chooses the variables that go to registers; returns the registers used
+fn (f: *Fn) alloc_regs(body: []*ast.Node) -> []int {
+  uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}}
+  for _, st := range body { uc.walk(st, 1, false) }
+  cands := []str{}
+  for name, v := range f.locals {
+    if v.celled || v.sym != "" || v.cap >= 0 || uc.in_lit[name] { continue }
+    c := f.g.cls(v.t, nil)
+    if c != "i" && c != "f" { continue }
+    if uc.n[name] < 4 { continue }
+    cands = append(cands, name)
+  }
+  # most used first (ties: by name, so the output does not depend on map order)
+  for i := 1; i < len(cands); i++ {
+    j := i
+    while j > 0 && (uc.n[cands[j]] > uc.n[cands[j - 1]] || (uc.n[cands[j]] == uc.n[cands[j - 1]] && cands[j] < cands[j - 1])) {
+      t := cands[j]
+      cands[j] = cands[j - 1]
+      cands[j - 1] = t
+      j--
+    }
+  }
+  used := []int{}
+  for i, name := range cands {
+    if i >= len(SAVED_REGS) { break }
+    f.locals[name].reg = SAVED_REGS[i]
+    used = append(used, SAVED_REGS[i])
+  }
+  return used
 }
 
 fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, body: []*ast.Node, ret_t: str, is_top: bool,
@@ -990,6 +1096,22 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   }
   # function with defer: record in the frame (see rt/panic.caju) linked to rt_dtop
   hd := has_defer_list(body)
+  # registers: a function with defer keeps none, but saves them all so that a recovered panic
+  # (which jumps over the frames that saved them) gives its caller the right values back
+  regs := []int{}
+  if !is_top && !hd { regs = f.alloc_regs(body) }
+  if !is_top && hd { regs = SAVED_REGS }
+  saved_regs := []*Var{}
+  for _, r := range regs {
+    sv := &Var{off: f.new_slot(), cap: -1}
+    A.store(RBP, sv.off, r)
+    saved_regs = append(saved_regs, sv)
+  }
+  if !hd {
+    for _, v := range f.locals {
+      if v.reg != 0 && v.off > 0 { A.load(v.reg, RBP, v.off) }     # a parameter
+    }
+  }
   if hd {
     f.landing = A.label()
     if is_top {
@@ -1042,6 +1164,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     f.rec_addr(RCX)
     A.store_sym("r.g.rt_dtop", RCX)
     A.load(R15, RCX, 32)
+    for i, r := range regs { A.load(r, RBP, saved_regs[i].off) }
     if !f.has_rn {
       for i, t := range results_of_t(ret_t) {
         f.push_desc(t, fnode)
@@ -1075,6 +1198,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   } else {
     A.bind(f.exit_l)
   }
+  if !hd { for i, r := range regs { A.load(r, RBP, saved_regs[i].off) } }
   A.mov(RSP, RBP)
   A.pop(RBP)
   A.ret()
