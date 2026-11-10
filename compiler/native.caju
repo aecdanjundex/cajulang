@@ -1505,8 +1505,20 @@ fn (f: *Fn) imm32(n: *ast.Node) -> (int, bool) {
   return 0, false
 }
 
-# RAX = left, RCX = right (left evaluated first)
+# a number, a boolean or a variable: loading it has no effect and cannot fail
+fn is_simple(n: *ast.Node) -> bool {
+  return n.kind == "Number" || n.kind == "Bool" || (n.kind == "Var" && !n.fn_ref)
+}
+
+# RAX = left, RCX = right (left evaluated first; when left is simple and right calls nothing,
+# right is computed first: neither can change what the other sees)
 fn (f: *Fn) operands(left: *ast.Node, right: *ast.Node) {
+  if is_simple(left) && !is_simple(right) && f.no_calls(right) {
+    f.expr(right)
+    f.a.mov(RCX, RAX)
+    f.simple_to(left, RAX)
+    return
+  }
   f.expr(left)
   if f.simple_to(right, RCX) { return }
   f.a.push(RAX)
@@ -1943,12 +1955,18 @@ fn (f: *Fn) elem_check(n: *ast.Node, write: bool) {
   A := f.a
   ot := strip_ptr(types.dflt(n.obj.ty))
   k := f.g.kind_of_t(ot)
-  f.expr(n.obj)
-  if n.index.ty != "int" || !f.simple_to(n.index, RCX) {
-    A.push(RAX)
-    f.expr_to(n.index, "int")
+  if is_simple(n.obj) && n.index.ty == "int" && !is_simple(n.index) && f.no_calls(n.index) {
+    f.expr(n.index)
     A.mov(RCX, RAX)
-    A.pop(RAX)
+    f.simple_to(n.obj, RAX)
+  } else {
+    f.expr(n.obj)
+    if n.index.ty != "int" || !f.simple_to(n.index, RCX) {
+      A.push(RAX)
+      f.expr_to(n.index, "int")
+      A.mov(RCX, RAX)
+      A.pop(RAX)
+    }
   }
   ok := A.label()
   if k == "array" {
@@ -3360,6 +3378,44 @@ fn (f: *Fn) find_loop(n: *ast.Node) -> *Loop {
 fn (f: *Fn) push_loop(brk: str, cont: str, label: str) { f.loops = append(f.loops, &Loop{brk: brk, cont: cont, label: label}) }
 fn (f: *Fn) pop_loop() { f.loops = f.loops[:len(f.loops) - 1] }
 fn (f: *Fn) cond_jump_false(cond: *ast.Node, dest: str) { f.jump_if(cond, false, dest) }
+# a[i] op= v for a list or array element that is not a struct: the address is computed once,
+# the element is read before v is evaluated (like the general case) and written back
+fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
+  A := f.a
+  g := f.g
+  tg := n.target
+  if tg.kind != "Index" || g.kind_of_t(types.dflt(tg.obj.ty)) == "map" || types.dflt(tg.obj.ty) == "str" { return false }
+  if g.is_value_type(tg.ty) || g.is_iface_t(tg.ty) || g.is_iface_t(n.value.ty) { return false }
+  if n.ik != ast.NONE && n.op != "**" && g.cls(tg.ty, n) == "i" {
+    f.elem_addr(tg, true)
+    A.push(RAX)                                   # the element's address
+    A.load(RAX, RAX, 0)
+    if !f.simple_to(n.value, RCX) {
+      A.push(RAX)
+      f.expr(n.value)
+      A.mov(RCX, RAX)
+      A.pop(RAX)
+    }
+    f.int_op(n.op, n.ik, n)
+    A.pop(RCX)
+    A.store(RCX, 0, RAX)
+    return true
+  }
+  if tg.ty == "num" && n.fk == ast.NONE && n.ik == ast.NONE && (n.op == "+" || n.op == "-" || n.op == "*" || n.op == "/") && f.fpure(n.value) {
+    f.elem_addr(tg, true)
+    A.push(RAX)
+    A.load(RAX, RAX, 0)
+    A.movq_x(0, RAX)                              # the current value
+    f.fexpr(n.value, 1)
+    f.fop(n.op, 0, 1, n)
+    A.pop(RCX)
+    A.movq_r(RAX, 0)
+    A.store(RCX, 0, RAX)
+    return true
+  }
+  return false
+}
+
 fn (f: *Fn) stmt(n: *ast.Node) {
   A := f.a
   g := f.g
@@ -3419,6 +3475,7 @@ fn (f: *Fn) stmt(n: *ast.Node) {
       f.store_v(v, false)
       return
     }
+    if f.index_op_assign(n) { return }
     # compound target: prepare once, read, compute and store
     p := f.prep_target(tg)
     cur := f.hidden()
