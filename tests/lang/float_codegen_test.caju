@@ -1,0 +1,77 @@
+# Float expressions are evaluated in XMM registers (compiler/native.caju, fexpr): these tests
+# cover the cases where values must not be lost between registers, calls and conversions.
+import "std/math"
+import { describe, it, expect, run_source } from "std/testing"
+
+fn twice(x: num) -> num { return x * 2.0 }
+
+describe("float expressions", fn() {
+  it("mix int values into nested float operations", fn() {
+    i := 3
+    x := 0.5
+    expect(x + (x * (num(i) + 1.0))).to_equal(2.5)
+    let n = 5
+    count := 0
+    while n > 0 {
+      count++
+      n = n - 1
+    }
+    expect(count).to_equal(5)
+  })
+  it("keep the left side across calls on the right", fn() {
+    a := 1.5
+    expect(a + twice(a) * twice(2.0)).to_equal(13.5)
+    expect(a * (twice(a) + math.sqrt(16.0))).to_equal(10.5)
+    expect((a + 1.0) - twice(a + twice(1.0))).to_equal(-4.5)
+  })
+  it("evaluate expressions deeper than the registers", fn() {
+    x := 1.0
+    deep := x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + (x + x))))))))))))))))
+    expect(deep).to_equal(18)
+    deep2 := (((((((((((((((((x + 1.0) * 2.0) + 1.0) * 2.0) + 1.0) * 2.0) + 1.0) * 2.0) + 1.0) * 2.0) + 1.0) * 2.0) + 1.0) * 2.0) + 1.0) * 2.0) + 1.0)
+    expect(deep2).to_equal(767)
+  })
+  it("negate and divide inside larger expressions", fn() {
+    a := 3.0
+    b := 4.0
+    expect(-a * b + a / -b).to_equal(-12.75)
+    expect(-(a - b) / (b - a)).to_equal(1)
+  })
+  it("stop with an error on a division by zero inside an expression", fn() {
+    r := run_source("a := 1.0\nb := 0.0\nprint(a + (2.0 + a / b))\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 3: Division by zero.")
+  })
+})
+
+describe("float comparisons in conditions", fn() {
+  it("take the right branch for each operator", fn() {
+    a := 1.5
+    b := 2.5
+    got := []bool{}
+    if a < b { got = append(got, true) } else { got = append(got, false) }
+    if a <= b { got = append(got, true) } else { got = append(got, false) }
+    if a > b { got = append(got, true) } else { got = append(got, false) }
+    if a >= b { got = append(got, true) } else { got = append(got, false) }
+    if a == b { got = append(got, true) } else { got = append(got, false) }
+    if a != b { got = append(got, true) } else { got = append(got, false) }
+    expect(got).to_equal([]bool{true, true, false, false, false, true})
+  })
+  it("treat NaN as unordered: only != is true", fn() {
+    nan := math.nan()
+    got := []bool{}
+    if nan < 1.0 { got = append(got, true) } else { got = append(got, false) }
+    if nan <= 1.0 { got = append(got, true) } else { got = append(got, false) }
+    if nan > 1.0 { got = append(got, true) } else { got = append(got, false) }
+    if nan >= 1.0 { got = append(got, true) } else { got = append(got, false) }
+    if nan == nan { got = append(got, true) } else { got = append(got, false) }
+    if nan != nan { got = append(got, true) } else { got = append(got, false) }
+    if !(nan < 1.0) { got = append(got, true) } else { got = append(got, false) }
+    expect(got).to_equal([]bool{false, false, false, false, false, true, true})
+  })
+  it("compare an int with a float", fn() {
+    i := 2
+    expect(num(i) < 2.5 && 2.5 > num(i)).to_be_true()
+    let n = 3
+    expect(n > 2 && n < 4).to_be_true()
+  })
+})

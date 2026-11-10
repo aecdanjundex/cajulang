@@ -1,0 +1,14 @@
+# the inner loop of mandelbrot, to compare the generated float code between rounds
+fn escape(cr: num, ci: num) -> int {
+  zr := 0.0
+  zi := 0.0
+  i := 0
+  while i < 50 && zr * zr + zi * zi <= 4.0 {
+    t := zr * zr - zi * zi + cr
+    zi = 2.0 * zr * zi + ci
+    zr = t
+    i++
+  }
+  return i
+}
+print(escape(-0.5, 0.5))

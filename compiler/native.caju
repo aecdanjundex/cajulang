@@ -396,11 +396,11 @@ fn (g: *Gen) wrap_kind(k: int) {
   case 6: A.movzxb(RAX, RAX)
   case 7: A.rr32(0x0FB7, RAX, RAX)             # movzx eax, ax
   case 8: A.rr32(0x89, RAX, RAX)               # mov eax, eax
-  case 10:                                     # rounds to float32
-    A.movq_x(0, RAX)
-    A.ssep(0x5A, 0, 0, 0xF2)
-    A.ssep(0x5A, 0, 0, 0xF3)
-    A.movq_r(RAX, 0)
+  case 10:                                     # rounds to float32 (xmm15: scratch, see fexpr)
+    A.movq_x(15, RAX)
+    A.ssep(0x5A, 15, 15, 0xF2)
+    A.ssep(0x5A, 15, 15, 0xF3)
+    A.movq_r(RAX, 15)
   }
 }
 fn (g: *Gen) where_text(n: *ast.Node) -> str {
@@ -460,26 +460,27 @@ fn (g: *Gen) coerce(src: str, dst: str, n: *ast.Node) {
   a := g.cls(src, n)
   b := g.cls(dst, n)
   if a == "i" && b == "f" {
+    # xmm15 is the scratch register: fexpr may hold values in xmm0..14 around a coerce
     if kind_code(src) == 5 || kind_code(src) == 9 {
       # uint64 above 2^63: halve, convert, double
       big := A.label()
       done := A.label()
       A.alu("test", RAX, RAX)
       A.jcc(CC_S, big)
-      A.cvtsi2sd(0, RAX)
+      A.cvtsi2sd(15, RAX)
       A.jmp(done)
       A.bind(big)
       A.mov(RCX, RAX)
       A.byte3(0x48, 0xD1, 0xE8)
       A.byte3(0x83, 0xE1, 0x01)
       A.alu("or", RAX, RCX)
-      A.cvtsi2sd(0, RAX)
-      A.sse(0x58, 0, 0)
+      A.cvtsi2sd(15, RAX)
+      A.sse(0x58, 15, 15)
       A.bind(done)
     } else {
-      A.cvtsi2sd(0, RAX)
+      A.cvtsi2sd(15, RAX)
     }
-    A.movq_r(RAX, 0)
+    A.movq_r(RAX, 15)
     if types.dflt(dst) == "float32" { g.wrap_kind(10) }
   } else if a == "f" && b == "f" && types.dflt(dst) == "float32" && types.dflt(src) != "float32" {
     g.wrap_kind(10)
@@ -1156,6 +1157,171 @@ fn (f: *Fn) expr_to(n: *ast.Node, t: str) {
   f.expr(n)
   f.g.coerce(n.ty, t, n)
 }
+# ---- floating point in XMM registers ----
+# fexpr(n, d) leaves a num expression in xmm d, using xmm d..15 and RAX/RCX/RDX. A call clobbers
+# every XMM register, so a subexpression with calls can only be evaluated when nothing is held in
+# XMM (d == 0); deeper ones must be fpure.
+
+# a + - * / of two num values (the result is num)
+fn (f: *Fn) is_fbin(n: *ast.Node) -> bool {
+  if n.kind != "Binary" || n.ty != "num" { return false }
+  if !(n.op == "+" || n.op == "-" || n.op == "*" || n.op == "/") { return false }
+  g := f.g
+  if g.is_iface_t(n.left.ty) || g.is_iface_t(n.right.ty) { return false }
+  return n.ik == ast.NONE && n.fk == ast.NONE
+}
+
+# evaluating n calls no function and uses no XMM register (other than through fexpr)
+fn (f: *Fn) no_calls(n: *ast.Node) -> bool {
+  if n == nil { return true }
+  g := f.g
+  switch n.kind {
+  case "Number", "Bool", "Nil": return true
+  case "Var": return !n.fn_ref
+  case "Paren": return f.no_calls(n.expr)
+  case "Neg", "Not", "BitNot": return g.cls(n.ty, n) == "i" && !g.is_iface_t(n.arg.ty) && f.no_calls(n.arg)
+  case "Binary":
+    if n.op == "**" || g.is_iface_t(n.left.ty) || g.is_iface_t(n.right.ty) { return false }
+    if g.cls(n.left.ty, n) != "i" || g.cls(n.right.ty, n) != "i" || g.cls(n.ty, n) != "i" { return false }
+    if g.is_value_type(n.left.ty) || g.is_value_type(n.right.ty) { return false }
+    return f.no_calls(n.left) && f.no_calls(n.right)
+  case "Logical": return f.no_calls(n.left) && f.no_calls(n.right)
+  case "Index":
+    ot := types.dflt(n.obj.ty)
+    if types.loose(ot) || g.kind_of_t(ot) == "map" || g.is_iface_t(n.index.ty) { return false }
+    return f.no_calls(n.obj) && f.no_calls(n.index)
+  case "Field":
+    if n.bound_method != "" || n.obj.ty == "" || types.loose(types.dflt(n.obj.ty)) { return false }
+    return f.no_calls(n.obj)
+  }
+  return false
+}
+
+# n can be evaluated by fexpr while other XMM registers hold values
+fn (f: *Fn) fpure(n: *ast.Node) -> bool {
+  if f.is_fbin(n) { return f.fpure(n.left) && f.fpure(n.right) }
+  switch n.kind {
+  case "Number": return true
+  case "Var": return !n.fn_ref
+  case "Paren": return f.fpure(n.expr)
+  case "Neg": return n.ty == "num" && n.arg.ty == "num" && f.fpure(n.arg)
+  case "Index", "Field": return f.no_calls(n)
+  }
+  return false
+}
+
+fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
+  A := f.a
+  if f.is_fbin(n) {
+    f.fpair(n.left, n.right, d)
+    f.fop(n.op, d, d + 1, n)
+    return
+  }
+  if n.kind == "Paren" && n.ty == "num" && n.expr.ty == "num" {
+    f.fexpr(n.expr, d)
+    return
+  }
+  if n.kind == "Neg" && n.ty == "num" && n.arg.ty == "num" {
+    f.fexpr(n.arg, d)
+    A.movq_r(RAX, d)
+    A.byte4(0x48, 0x0F, 0xBA, 0xF8)               # btc rax, 63
+    A.byte(63)
+    A.movq_x(d, RAX)
+    return
+  }
+  if n.kind == "Number" && f.g.cls(n.ty, n) == "f" {
+    A.mov_imm(RAX, math.bits(n.num_value))
+    A.movq_x(d, RAX)
+    return
+  }
+  if n.kind == "Var" && n.ty == "num" && f.simple_to(n, RAX) {
+    A.movq_x(d, RAX)
+    return
+  }
+  f.expr_to(n, "num")
+  A.movq_x(d, RAX)
+}
+
+# xmm d = left, xmm d+1 = right (left evaluated first); d <= 14
+fn (f: *Fn) fpair(left: *ast.Node, right: *ast.Node, d: int) {
+  A := f.a
+  f.fexpr(left, d)
+  if d + 1 <= 14 && f.fpure(right) {
+    f.fexpr(right, d + 1)
+    return
+  }
+  A.movq_r(RAX, d)
+  A.push(RAX)
+  f.fexpr(right, d)
+  A.ssep(0x28, d + 1, d, 0x66)                    # movapd xmm d+1, xmm d
+  A.pop(RAX)
+  A.movq_x(d, RAX)
+}
+
+# xmm d = xmm d op xmm s
+fn (f: *Fn) fop(op: str, d: int, s: int, n: *ast.Node) {
+  A := f.a
+  switch op {
+  case "+": A.sse(0x58, d, s)
+  case "-": A.sse(0x5C, d, s)
+  case "*": A.sse(0x59, d, s)
+  case "/":
+    ok := A.label()
+    A.ssep(0x57, 15, 15, 0x66)                    # xorpd xmm15, xmm15
+    A.ucomisd(s, 15)
+    A.jcc(CC_NE, ok)
+    A.jcc(CC_P, ok)
+    f.fail_here(n, "Division by zero")
+    A.bind(ok)
+    A.sse(0x5E, d, s)
+  }
+}
+
+# a comparison of two numbers where at least one is a float (compare() does it with ucomisd)
+fn (f: *Fn) float_compare(n: *ast.Node) -> bool {
+  if n.kind != "Binary" { return false }
+  op := n.op
+  if !(op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") { return false }
+  g := f.g
+  if g.is_iface_t(n.left.ty) || g.is_iface_t(n.right.ty) { return false }
+  lc := g.cls(n.left.ty, n)
+  rc := g.cls(n.right.ty, n)
+  if lc == "s" || rc == "s" { return false }
+  return lc == "f" || rc == "f"
+}
+
+# jumps to dest when the float comparison is true (want) or false; NaN makes every comparison
+# false except !=
+fn (f: *Fn) float_jump(n: *ast.Node, want: bool, dest: str) {
+  A := f.a
+  f.fpair(n.left, n.right, 0)
+  op := n.op
+  if op == "==" || op == "!=" {
+    A.ucomisd(0, 1)
+    is_eq := op == "=="
+    if is_eq == want {
+      # jump when equal and ordered
+      skip := A.label()
+      A.jcc(CC_P, skip)
+      A.jcc(CC_E, dest)
+      A.bind(skip)
+    } else {
+      # jump when different or unordered
+      A.jcc(CC_P, dest)
+      A.jcc(CC_NE, dest)
+    }
+    return
+  }
+  # a < b  is  b > a: ucomisd b, a and "above"; the false side includes unordered
+  if op == "<" || op == "<=" { A.ucomisd(1, 0) } else { A.ucomisd(0, 1) }
+  strict := op == "<" || op == ">"
+  if want {
+    if strict { A.jcc(CC_A, dest) } else { A.jcc(CC_AE, dest) }
+  } else {
+    if strict { A.jcc(CC_BE, dest) } else { A.jcc(CC_B, dest) }
+  }
+}
+
 # loads a simple expression (a number literal, a variable) into register r without touching
 # any other register; false (and no code) if n is not that simple
 fn (f: *Fn) simple_to(n: *ast.Node, r: int) -> bool {
@@ -1254,6 +1420,10 @@ fn (f: *Fn) jump_if(cond: *ast.Node, want: bool, dest: str) {
       if cond.bool_value == want { A.jmp(dest) }
       return
     }
+  }
+  if f.float_compare(cond) {
+    f.float_jump(cond, want, dest)
+    return
   }
   if f.int_compare(cond) {
     imm, is_imm := f.imm32(cond.right)
@@ -1475,12 +1645,7 @@ fn (f: *Fn) compare(n: *ast.Node) {
     return
   }
   if lc == "f" || rc == "f" {
-    f.expr_to(n.left, "num")
-    A.push(RAX)
-    f.expr_to(n.right, "num")
-    A.movq_x(1, RAX)
-    A.pop(RAX)
-    A.movq_x(0, RAX)
+    f.fpair(n.left, n.right, 0)
     switch op {
     case "<":
       A.ucomisd(1, 0)
@@ -1547,6 +1712,11 @@ fn (f: *Fn) binary(n: *ast.Node) {
   if g.is_iface_t(n.left.ty) || g.is_iface_t(n.right.ty) {
     f.dyn_op(n, "rt_dyn_op")
     g.coerce("any", n.ty, n)
+    return
+  }
+  if f.is_fbin(n) {
+    f.fexpr(n, 0)
+    A.movq_r(RAX, 0)
     return
   }
   if n.ik != ast.NONE && op != "**" {
