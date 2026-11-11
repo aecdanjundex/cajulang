@@ -71,6 +71,16 @@ fn enc(v: any) -> str {
   return s
 }
 
+struct Flat {
+  id: int
+  name: str
+  ok: bool
+}
+struct Flat32 {
+  n: int32
+  s: str
+}
+
 describe("json.marshal", fn() {
   it("writes structs with their fields in order, embedded fields promoted", fn() {
     u := User{name: "Ana", age: 30, admin: true, score: 1.5, tags: []str{"a", "b"}, addr: Addr{city: "Rio", zip: 1}}
@@ -366,5 +376,74 @@ describe("json.parse", fn() {
     m := doc.to_any().(map[str]any)
     expect(len(m)).to_equal(2)
     expect(doc.string()).to_equal("{\"a\":[1,2.5,\"s\"],\"b\":null}")
+  })
+})
+
+describe("json flat structs (leaf writers and scanners)", fn() {
+  it("write every kind of field, including texts that need escapes or are not ASCII", fn() {
+    big := (1 << 62) + ((1 << 62) - 1)
+    min := 1 << 63
+    list := []Flat{Flat{id: 0, name: "", ok: false}, Flat{id: -42, name: "a\"b\\c\n", ok: true}, Flat{id: big, name: "olá, ação 0123456789", ok: true}, Flat{id: min, name: "x\ty", ok: false}}
+    s, err := json.marshal(list)
+    expect(err).to_equal(nil)
+    expect(s).to_equal("[{\"id\":0,\"name\":\"\",\"ok\":false},{\"id\":-42,\"name\":\"a\\\"b\\\\c\\n\",\"ok\":true},{\"id\":9223372036854775807,\"name\":\"olá, ação 0123456789\",\"ok\":true},{\"id\":-9223372036854775808,\"name\":\"x\\ty\",\"ok\":false}]")
+    let back: []Flat
+    expect(json.unmarshal(s, &back)).to_equal(nil)
+    expect(len(back)).to_equal(4)
+    expect(back[1].name).to_equal("a\"b\\c\n")
+    expect(back[2].id).to_equal(big)
+    expect(back[2].name).to_equal("olá, ação 0123456789")
+    expect(back[3].id).to_equal(min)
+    expect(back[3].name).to_equal("x\ty")
+  })
+  it("indent the same structs through the general writer", fn() {
+    s, _ := json.marshal_indent(Flat{id: 1, name: "a", ok: true}, "  ")
+    expect(s).to_equal("{\n  \"id\": 1,\n  \"name\": \"a\",\n  \"ok\": true\n}")
+  })
+  it("read objects with spaces, keys out of order, unknown keys and null", fn() {
+    let f: Flat
+    expect(json.unmarshal(" { \"ok\" : true ,\n\t\"name\":\"n\", \"id\": -0 } ", &f)).to_equal(nil)
+    expect(f.ok).to_equal(true)
+    expect(f.name).to_equal("n")
+    expect(f.id).to_equal(0)
+    let g: Flat
+    g.name = "keep"
+    expect(json.unmarshal("{\"id\":7,\"other\":[1,{\"a\":2}],\"name\":null}", &g)).to_equal(nil)
+    expect(g.id).to_equal(7)
+    expect(g.name).to_equal("keep")
+    let h: Flat
+    expect(json.unmarshal("{\"ID\":5,\"Name\":\"x\"}", &h)).to_equal(nil)
+    expect(h.id).to_equal(5)
+    expect(h.name).to_equal("x")
+    let u: []Flat
+    expect(json.unmarshal("[{\"name\":\"\\u00e9\\n\"},{\"name\":\"é\"},{}]", &u)).to_equal(nil)
+    expect(u[0].name).to_equal("é\n")
+    expect(u[1].name).to_equal("é")
+    expect(u[2].id).to_equal(0)
+  })
+  it("give the same errors as the general path", fn() {
+    let f: Flat
+    expect(json.unmarshal("{\"id\":1.5}", &f).Error()).to_equal("json: cannot unmarshal number 1.5 into field Flat.id of type int")
+    expect(json.unmarshal("{\"id\":01}", &f) != nil).to_equal(true)
+    expect(json.unmarshal("{\"id\":\"1\"}", &f).Error()).to_equal("json: cannot unmarshal string into field Flat.id of type int")
+    expect(json.unmarshal("{\"ok\":tru}", &f) != nil).to_equal(true)
+    expect(json.unmarshal("{\"id\":1,\"id\":2}", &f)).to_equal(nil)
+    expect(f.id).to_equal(2)
+    expect(json.unmarshal("{\"id\":12345678901234567890}", &f) != nil).to_equal(true)
+    let g: Flat32
+    expect(json.unmarshal("{\"n\":3000000000}", &g) != nil).to_equal(true)
+    expect(json.unmarshal("{\"n\":-7,\"s\":\"z\"}", &g)).to_equal(nil)
+    expect(g.n).to_equal(int32(-7))
+  })
+  it("reuse its tables across calls without mixing them", fn() {
+    for k := 0; k < 3; k++ {
+      let a: []Flat
+      expect(json.unmarshal("[{\"id\":1},{\"id\":2,\"name\":\"b\"}]", &a)).to_equal(nil)
+      expect(a[1].name).to_equal("b")
+      let b: Flat
+      expect(json.unmarshal("{\"name\":\"c\"}", &b)).to_equal(nil)
+      expect(b.id).to_equal(0)
+      expect(b.name).to_equal("c")
+    }
   })
 })
