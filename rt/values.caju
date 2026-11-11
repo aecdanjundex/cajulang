@@ -520,15 +520,17 @@ fn rt_runes_str(s: int) -> str {
 # the tags match, and above the index mask otherwise (a deleted slot has bit 31 set, which no
 # tag has). Growing the index hashes the keys again, walking the entries in order.
 # kk: the key kind (0 int, 1 num, 2 str), plus 256 when the entries hold no pointers
+# one block of 168 bytes (a size class): the 72-byte header, the first 4 entries and the first
+# index (8 slots); when the map grows, the new arrays are separate objects
 fn rt_map_new(kk: int) -> int {
-  m := rt_alloc(72)
+  m := rt_alloc(72 + 64 + 32)
   ns := kk >> 8
   kk = kk & 255
   __store64(m + 64, ns)
-  __store64(m + 8, rt_alloc_x(16 * 8, ns != 0))
-  __store64(m + 24, 8)
-  __store64(m + 32, rt_alloc_ns(4 * 16))
-  __store64(m + 40, 16)
+  __store64(m + 8, m + 72)
+  __store64(m + 24, 4)
+  __store64(m + 32, m + 136)
+  __store64(m + 40, 8)
   __store64(m + 48, kk)
   return m
 }
