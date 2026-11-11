@@ -58,6 +58,7 @@ struct Var {
   celled: bool
   cap: int                    # -1: not captured
   reg: int                    # 0, or the callee-saved register that holds it (alloc_regs)
+  xr: int                     # 0, or the XMM register that holds this num (saved around calls)
 }
 
 struct Unit {
@@ -104,6 +105,7 @@ struct Gen {
   thunks_m: map[str]*BoundThunk
   thunks: map[str]*ast.Node
   rt_syms: map[str]str
+  fconsts: map[int]str        # bits of a float constant -> data symbol (read with movsd/addsd)
 }
 
 fn nfail(msg: str, n: *ast.Node) {
@@ -230,6 +232,15 @@ fn (g: *Gen) data_sym(sym: str, align: int) -> int {
 fn (g: *Gen) reloc(off: int, sym: str) {
   g.relocs.off = append(g.relocs.off, off)
   g.relocs.sym = append(g.relocs.sym, sym)
+}
+fn (g: *Gen) fconst(bits: int) -> str {
+  sym, ok := g.fconsts[bits]
+  if ok { return sym }
+  sym = "fc." + str(len(g.fconsts))
+  g.data_sym(sym, 8)
+  g.data.u64(bits)
+  g.fconsts[bits] = sym
+  return sym
 }
 fn (g: *Gen) str_lit(s: str) -> str {
   sym, ok := g.str_syms[s]
@@ -680,7 +691,8 @@ export fn compile_native(files: []*ast.SourceFile, rt_sources: []str, target: st
   g := &Gen{a: x64.new_x64(), data: bytes.new_buffer(1 << 16), relocs: &image.Relocs{off: []int{}, sym: []str{}},
     str_syms: map[str]str{}, descs: map[str]str{}, mtabs: map[str]str{}, dlls: []str{}, imports: map[str][]str{},
     imp_seen: map[str]bool{}, file_names: []str{}, target: target, lits: []*Lit{}, static_clos: map[str]bool{},
-    thunks_m: map[str]*BoundThunk{}, thunks: map[str]*ast.Node{}, rt_syms: map[str]str{}}
+    thunks_m: map[str]*BoundThunk{}, thunks: map[str]*ast.Node{}, rt_syms: map[str]str{},
+    fconsts: map[int]str{}}
   for _, sf := range files { g.file_names = append(g.file_names, sf.name) }
   # the user's program first goes through all the checks of the bytecode compiler
   tree := linker.link(files)
@@ -816,6 +828,7 @@ struct Fn {
   fn_used: map[str]bool       # top level: names used inside some function (stay global)
   scache: map[str]*SCache     # lists whose length and data pointer are kept for the current loops
   safe_idx: map[str]str       # index variable -> list it is always in range of (no check needed)
+  xtop: int                   # fexpr uses xmm0..xtop (the registers above hold num variables)
 }
 
 # a list variable that no statement of the enclosing loop assigns: its header (data, length,
@@ -1029,6 +1042,10 @@ fn (f: *Fn) load_slot_r(v: *Var, r: int) {
     if r != v.reg { A.mov(r, v.reg) }
     return
   }
+  if v.xr != 0 {
+    A.movq_r(r, v.xr)
+    return
+  }
   if v.cap >= 0 {
     A.load(r, RBP, f.env_off)
     A.load(r, r, 8 + 8 * v.cap)
@@ -1040,6 +1057,10 @@ fn (f: *Fn) load_slot(v: *Var) { f.load_slot_r(v, RAX) }
 fn (f: *Fn) store_slot_r(v: *Var, r: int) {
   if v.reg != 0 {
     if r != v.reg { f.a.mov(v.reg, r) }
+    return
+  }
+  if v.xr != 0 {
+    f.a.movq_x(v.xr, r)
     return
   }
   if v.sym != "" { f.a.store_sym(v.sym, r) } else { f.a.store(RBP, v.off, r) }
@@ -1079,6 +1100,21 @@ let SAVED_REGS = []int{RBX, R12, R13, R14}
 struct UseCount {
   n: map[str]int
   in_lit: map[str]bool        # used inside a function (or its address is taken): stays in memory
+  f: *Fn                      # nil: calls are not counted
+  calls: int                  # weighted count of the calls (each one saves and reloads the XMM variables)
+}
+
+# a node whose code calls a function that returns (a guess: it only weighs XMM variables)
+fn (uc: *UseCount) is_call(n: *ast.Node) -> bool {
+  switch n.kind {
+  case "MethodCall", "CallValue", "StructLit", "CompositeLit", "FuncLit": return true
+  case "Call":
+    if n.call_kind == "conv" { return false }
+    if n.call_kind == "builtin" { return !(n.name == "len" || n.name == "cap" || n.name == "__sqrt") }
+    if n.call_kind == "func" && uc.f.try_inline(n) != nil { return false }
+    return true
+  }
+  return false
 }
 
 fn (uc: *UseCount) walk(n: *ast.Node, w: int, in_lit: bool) {
@@ -1097,6 +1133,7 @@ fn (uc: *UseCount) walk(n: *ast.Node, w: int, in_lit: bool) {
     uc.n[name] = uc.n[name] + w
   }
   if n.kind == "VarDecl" { for _, nm := range n.names { uc.n[nm] = uc.n[nm] + w } }
+  if uc.f != nil && !in_lit && uc.is_call(n) { uc.calls = uc.calls + w }
   inner := w
   if n.kind == "ForC" || n.kind == "ForTo" || n.kind == "Range" || n.kind == "While" {
     if w < 4096 { inner = w * 8 }
@@ -1144,7 +1181,7 @@ fn (uc: *UseCount) walk(n: *ast.Node, w: int, in_lit: bool) {
 
 # chooses the variables that go to registers; returns the registers used
 fn (f: *Fn) alloc_regs(body: []*ast.Node) -> []int {
-  uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}}
+  uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}, f: f, calls: 0}
   for _, st := range body { uc.walk(st, 1, false) }
   cands := []str{}
   for name, v := range f.locals {
@@ -1164,20 +1201,36 @@ fn (f: *Fn) alloc_regs(body: []*ast.Node) -> []int {
       j--
     }
   }
+  # num variables go to xmm14, xmm13, ... (at most XMM_VARS) when they are used more than the
+  # calls cost (every call stores and reloads them); fexpr keeps the registers below
+  rest := []str{}
+  for _, name := range cands {
+    v := f.locals[name]
+    if v.t == "num" && 14 - f.xtop < XMM_VARS && uc.n[name] > 2 * uc.calls {
+      v.xr = f.xtop
+      f.xtop--
+      f.a.xs_reg = append(f.a.xs_reg, v.xr)
+      f.a.xs_off = append(f.a.xs_off, v.off)
+    } else {
+      rest = append(rest, name)
+    }
+  }
   used := []int{}
-  for i, name := range cands {
+  for i, name := range rest {
     if i >= len(SAVED_REGS) { break }
     f.locals[name].reg = SAVED_REGS[i]
     used = append(used, SAVED_REGS[i])
   }
   return used
 }
+const XMM_VARS = 7
 
 fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, body: []*ast.Node, ret_t: str, is_top: bool,
     celled_set: map[str]bool, fnode: *ast.Node, is_lit: bool, cap_types: []str) {
   A := g.a
   f := &Fn{g: g, a: A, u: u, is_top: is_top, locals: map[str]*Var{}, nloc: 0, caps: map[str]*Var{}, env_off: 16 + 8 * len(params),
-    rnames: []str{}, has_rn: false, ret_t: ret_t, celled_set: celled_set, fnode: fnode, rec: nil, loops: []*Loop{}, tmp_load: nil}
+    rnames: []str{}, has_rn: false, ret_t: ret_t, celled_set: celled_set, fnode: fnode, rec: nil, loops: []*Loop{}, tmp_load: nil,
+    xtop: 14}
   if !is_top {
     for i, p := range params {
       f.locals[p] = &Var{off: 16 + 8 * (len(params) - 1 - i), t: ptypes[i], celled: celled_set[p], cap: -1}
@@ -1233,6 +1286,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   if !hd {
     for _, v := range f.locals {
       if v.reg != 0 && v.off > 0 { A.load(v.reg, RBP, v.off) }     # a parameter
+      if v.xr != 0 && v.off > 0 { A.movsd_load(v.xr, RBP, v.off) }
     }
   }
   if hd {
@@ -1325,6 +1379,8 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   A.mov(RSP, RBP)
   A.pop(RBP)
   A.ret()
+  A.xs_reg = []int{}
+  A.xs_off = []int{}
   size := (8 * f.nloc + 15) / 16 * 16
   A.b.set_u32(frame_at, size)
   if land_at >= 0 { A.b.set_u32(land_at, size) }
@@ -1339,11 +1395,17 @@ fn (f: *Fn) fail_here(n: *ast.Node, msg: str) {
   f.where_arg(n)
   f.a.lea(RAX, f.g.str_lit(msg))
   f.a.push(RAX)
-  f.a.call(f.g.rt_call("rt_fail"))
+  f.a.call_noret(f.g.rt_call("rt_fail"))
 }
 # calls a runtime function with the arguments already pushed
 fn (f: *Fn) rt(name: str, nargs: int) {
-  f.a.call(f.g.rt_call(name))
+  # the runtime errors never return (a recovered panic resumes in the deferring function): no
+  # need to save the XMM variables around them
+  if name == "rt_index_fail" || name == "rt_nil_index" || name == "rt_nil_call" || name == "rt_panic_val" {
+    f.a.call_noret(f.g.rt_call(name))
+  } else {
+    f.a.call(f.g.rt_call(name))
+  }
   if nargs > 0 { f.a.add_imm(RSP, 8 * nargs) }
 }
 fn (f: *Fn) push_desc(t: str, n: *ast.Node) {
@@ -1597,9 +1659,56 @@ fn is_sqrt(n: *ast.Node) -> bool {
   return n.kind == "Call" && n.call_kind == "builtin" && n.name == "__sqrt" && len(n.args) == 1 && n.args[0].ty == "num"
 }
 
+# the bits of a number literal used as a num (a float, or an int literal converted), and true
+fn (f: *Fn) fconst_of(n: *ast.Node) -> (int, bool) {
+  if n.kind != "Number" { return 0, false }
+  if f.g.cls(n.ty, n) == "f" { return math.bits(n.num_value), true }
+  if n.raw == "" && types.dflt(n.ty) == "int" && n.num_value == num(int(n.num_value)) { return math.bits(n.num_value), true }
+  return 0, false
+}
+# the XMM register of a num variable kept in one (alloc_regs), or -1
+fn (f: *Fn) xreg_of(n: *ast.Node) -> int {
+  if n.kind != "Var" || n.fn_ref || n.ty != "num" { return -1 }
+  v := f.lookup(n.name, n)
+  if v.xr == 0 || v.t != "num" { return -1 }
+  return v.xr
+}
+# a num variable in the frame (not in a register, a cell or a capture): its frame offset, or 0
+fn (f: *Fn) fslot_of(n: *ast.Node) -> int {
+  if n.kind != "Var" || n.fn_ref || n.ty != "num" { return 0 }
+  v := f.lookup(n.name, n)
+  if v.t != "num" || v.reg != 0 || v.xr != 0 || v.celled || v.cap >= 0 || v.sym != "" { return 0 }
+  return v.off
+}
+
 fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
   A := f.a
   if f.is_fbin(n) {
+    # right operand in an XMM variable or in the frame: used in place (it cannot change while
+    # the left one is computed: a local that no function captures)
+    x := f.xreg_of(n.right)
+    if x >= 0 {
+      f.fexpr(n.left, d)
+      f.fop(n.op, d, x, n)
+      return
+    }
+    c, is_c := f.fconst_of(n.right)
+    if is_c && (n.op != "/" || c != 0) {
+      # a constant operand (a division by a constant other than zero cannot fail)
+      f.fexpr(n.left, d)
+      op := 0x58
+      if n.op == "-" { op = 0x5C } else if n.op == "*" { op = 0x59 } else if n.op == "/" { op = 0x5E }
+      A.ripx(0x0F00 | op, d, f.g.fconst(c), 0, 0xF2, 0)
+      return
+    }
+    off := f.fslot_of(n.right)
+    if off != 0 && n.op != "/" {
+      f.fexpr(n.left, d)
+      op := 0x58
+      if n.op == "-" { op = 0x5C } else if n.op == "*" { op = 0x59 }
+      A.rmx(0x0F00 | op, d, RBP, off, 0, 0xF2)     # addsd/subsd/mulsd xmm d, [rbp+off]
+      return
+    }
     f.fpair(n.left, n.right, d)
     f.fop(n.op, d, d + 1, n)
     return
@@ -1609,6 +1718,11 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
     return
   }
   if is_sqrt(n) {
+    x := f.xreg_of(n.args[0])
+    if x >= 0 {
+      A.sse(0x51, d, x)                           # sqrtsd xmm d, xmm x
+      return
+    }
     f.fexpr(n.args[0], d)
     A.sse(0x51, d, d)                             # sqrtsd
     return
@@ -1628,9 +1742,20 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
     A.movq_x(d, RAX)
     return
   }
-  if n.kind == "Number" && f.g.cls(n.ty, n) == "f" {
-    A.mov_imm(RAX, math.bits(n.num_value))
-    A.movq_x(d, RAX)
+  c, is_c := f.fconst_of(n)
+  if is_c {
+    A.ripx(0x0F10, d, f.g.fconst(c), 0, 0xF2, 0)  # movsd xmm d, [constant]
+    return
+  }
+  # int -> num: converted straight into xmm d
+  if n.kind == "Call" && n.call_kind == "conv" && n.conv_mode == "num" && n.ty == "num" && len(n.args) == 1 && types.dflt(n.args[0].ty) == "int" {
+    f.expr(n.args[0])
+    A.cvtsi2sd(d, RAX)
+    return
+  }
+  x := f.xreg_of(n)
+  if x >= 0 {
+    A.ssep(0x28, d, x, 0x66)                      # movapd xmm d, xmm x
     return
   }
   if n.kind == "Var" && n.ty == "num" && !n.fn_ref {
@@ -1675,11 +1800,12 @@ fn (f: *Fn) movsd_elem(op: int, x: int) {
   A.byte(0xC8)
 }
 
-# xmm d = left, xmm d+1 = right (left evaluated first); d <= 14
+# xmm d = left, xmm d+1 = right (left evaluated first); d < xtop, so that d+1 is neither an XMM
+# variable nor xmm15 (the scratch register of a division)
 fn (f: *Fn) fpair(left: *ast.Node, right: *ast.Node, d: int) {
   A := f.a
   f.fexpr(left, d)
-  if d + 1 <= 14 && f.fpure(right) {
+  if d + 2 <= f.xtop && f.fpure(right) {
     f.fexpr(right, d + 1)
     return
   }
@@ -1727,10 +1853,23 @@ fn (f: *Fn) float_compare(n: *ast.Node) -> bool {
 # false except !=
 fn (f: *Fn) float_jump(n: *ast.Node, want: bool, dest: str) {
   A := f.a
-  f.fpair(n.left, n.right, 0)
+  # l, r: the registers compared (XMM variables are compared in place)
+  l := 0
+  r := 1
+  xl := f.xreg_of(n.left)
+  xr := f.xreg_of(n.right)
+  if xr >= 0 {
+    if xl >= 0 { l = xl } else { f.fexpr(n.left, 0) }
+    r = xr
+  } else if xl >= 0 && f.fpure(n.right) {
+    l = xl
+    f.fexpr(n.right, 1)
+  } else {
+    f.fpair(n.left, n.right, 0)
+  }
   op := n.op
   if op == "==" || op == "!=" {
-    A.ucomisd(0, 1)
+    A.ucomisd(l, r)
     is_eq := op == "=="
     if is_eq == want {
       # jump when equal and ordered
@@ -1746,7 +1885,7 @@ fn (f: *Fn) float_jump(n: *ast.Node, want: bool, dest: str) {
     return
   }
   # a < b  is  b > a: ucomisd b, a and "above"; the false side includes unordered
-  if op == "<" || op == "<=" { A.ucomisd(1, 0) } else { A.ucomisd(0, 1) }
+  if op == "<" || op == "<=" { A.ucomisd(r, l) } else { A.ucomisd(l, r) }
   strict := op == "<" || op == ">"
   if want {
     if strict { A.jcc(CC_A, dest) } else { A.jcc(CC_AE, dest) }
@@ -2915,7 +3054,7 @@ fn (f: *Fn) call_value(n: *ast.Node, mode: int, v: *Var, ft: str, args: []*ast.N
   f.depth_in(n)
   A.load(RAX, RSP, 8 * len(args))
   A.load(RAX, RAX, 0)
-  A.byte2(0xFF, 0xD0)                             # call rax
+  A.call_rax()                                   # call rax
   f.depth_out()
   A.add_imm(RSP, 8 * (len(args) + 1))
 }
@@ -3034,7 +3173,7 @@ fn (f: *Fn) iface_call(n: *ast.Node) {
   f.depth_in(n)
   f.load_slot(he)
   A.load(RAX, RAX, 8)
-  A.byte2(0xFF, 0xD0)
+  A.call_rax()
   f.depth_out()
   A.add_imm(RSP, 8 * (len(n.args) + 1))
   # on an any, the result gets boxed with the type the method returns
@@ -3652,6 +3791,15 @@ fn (f: *Fn) assign_var(name: str, value: *ast.Node, n: *ast.Node, decl: bool) {
     f.rt("rt_copy_into", 3)
     return
   }
+  if v.xr != 0 && value != nil && value.ty == "num" && f.fdirect(value) {
+    x := f.xreg_of(value)
+    if x < 0 {
+      f.fexpr(value, 0)
+      x = 0
+    }
+    if x != v.xr { f.a.ssep(0x28, v.xr, x, 0x66) }  # movapd
+    return
+  }
   if value != nil && f.assign_direct(v, name, value, decl) { return }
   if value == nil {
     f.push_desc(v.t, n)
@@ -3695,6 +3843,16 @@ fn (f: *Fn) assign_direct(v: *Var, name: str, value: *ast.Node, decl: bool) -> b
   if r == 0 { return false }
   f.store_slot_r(v, r)
   return true
+}
+# fexpr computes n in an XMM register without going through RAX
+fn (f: *Fn) fdirect(n: *ast.Node) -> bool {
+  if f.is_fbin(n) || is_sqrt(n) || f.xreg_of(n) >= 0 || f.fslot_of(n) != 0 { return true }
+  if n.kind == "Paren" && n.ty == "num" && n.expr.ty == "num" { return f.fdirect(n.expr) }
+  if n.kind == "Call" && n.ty == "num" {
+    inl := f.try_inline(n)
+    return inl != nil && inl.ty == "num" && f.fdirect(inl)
+  }
+  return false
 }
 # stores RAX into an already prepared target (variable, index, field or *p)
 fn (f: *Fn) prep_target(t: *ast.Node) -> *Target {
@@ -4166,13 +4324,11 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
     }
     f.elem_addr(tg, true)
     A.push(RAX)
-    A.load(RAX, RAX, 0)
-    A.movq_x(0, RAX)                              # the current value
+    A.movsd_load(0, RAX, 0)                       # the current value
     f.fexpr(n.value, 1)
     f.fop(n.op, 0, 1, n)
     A.pop(RCX)
-    A.movq_r(RAX, 0)
-    A.store(RCX, 0, RAX)
+    A.movsd_store(RCX, 0, 0)
     return true
   }
   return false
@@ -4234,6 +4390,12 @@ fn (f: *Fn) stmt(n: *ast.Node) {
       fake.ik = n.ik
       fake.fk = n.fk
       fake.ty = v.t
+      if v.xr != 0 && f.is_fbin(fake) {
+        # x op= e: e computed (it cannot change x), then one instruction on x's register
+        f.fexpr(n.value, 0)
+        f.fop(n.op, v.xr, 0, n)
+        return
+      }
       f.expr(fake)
       f.store_v(v, false)
       return

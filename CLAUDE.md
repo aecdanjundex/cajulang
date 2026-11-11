@@ -69,8 +69,11 @@ procure o endereço no arquivo do `CAJU_SYMS`.
 - R15 guarda a profundidade de chamadas (limite de 10.000); `__depth`/`__set_depth` no runtime.
 - RBX, R12, R13, R14 guardam até 4 variáveis por função que nunca são ponteiro (`alloc_regs`);
   funções com `defer` guardam os 4 e os restauram no `recover`.
-- xmm0..14 seguram valores durante uma expressão `num` (`fexpr`); xmm15 é rascunho (`coerce`,
-  `float32`, divisão). Nada pode chamar função enquanto um XMM guarda valor.
+- xmm0..`xtop` seguram valores durante uma expressão `num` (`fexpr`); xmm15 é rascunho (`coerce`,
+  `float32`, divisão). Nada pode chamar função enquanto um XMM de expressão guarda valor.
+- Até 7 variáveis `num` por função vivem em xmm14, xmm13... (`alloc_regs`, `Var.xr`; `xtop` desce).
+  Toda chamada (`A.call`, `A.call_rax`) as grava no slot delas antes e relê depois; erros do
+  runtime que não voltam usam `A.call_noret`. Funções com `defer` não usam.
 - Variáveis do nível de cima que nenhuma função usa (nem `&x`) são locais do `u.top`.
 - Chamadas a funções `return E` pequenas viram a expressão (`try_inline`).
 

@@ -49,10 +49,14 @@ export struct X64 {
   fix_sym: []str
   fix_end: []int
   nlab: int
+  # num variables kept in XMM registers (caller-saved): each call stores them in their frame
+  # slot before and reloads them after
+  xs_reg: []int
+  xs_off: []int
 }
 
 export fn new_x64() -> *X64 {
-  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0}
+  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0, xs_reg: []int{}, xs_off: []int{}}
 }
 
 export fn (a: *X64) pos() -> int { return a.b.n }
@@ -156,10 +160,24 @@ export fn (a: *X64) jcc(cc: int, sym: str) {
   a.add_fix(at, sym, at + 4)
 }
 export fn (a: *X64) call(sym: str) {
+  for i, x := range a.xs_reg { a.movsd_store(RBP, a.xs_off[i], x) }
   a.b.byte(0xE8)
   at := a.b.n
   a.b.u32(0)
   a.add_fix(at, sym, at + 4)
+  for i, x := range a.xs_reg { a.movsd_load(x, RBP, a.xs_off[i]) }
+}
+# a call that never returns (a runtime error)
+export fn (a: *X64) call_noret(sym: str) {
+  a.b.byte(0xE8)
+  at := a.b.n
+  a.b.u32(0)
+  a.add_fix(at, sym, at + 4)
+}
+export fn (a: *X64) call_rax() {
+  for i, x := range a.xs_reg { a.movsd_store(RBP, a.xs_off[i], x) }
+  a.byte2(0xFF, 0xD0)
+  for i, x := range a.xs_reg { a.movsd_load(x, RBP, a.xs_off[i]) }
 }
 export fn (a: *X64) ret() { a.b.byte(0xC3) }
 export fn (a: *X64) mov_imm(r: int, x: int) {
@@ -258,6 +276,8 @@ export fn (a: *X64) movq_r(r: int, x: int) { a.rrx(0x0F7E, x, r, 1, 0x66) }     
 # addsd 58, mulsd 59, subsd 5C, divsd 5E, sqrtsd 51 (pre F2); cvtsd2ss 5A
 export fn (a: *X64) ssep(op: int, x: int, y: int, pre: int) { a.rrx(0x0F00 | op, x, y, 0, pre) }
 export fn (a: *X64) sse(op: int, x: int, y: int) { a.rrx(0x0F00 | op, x, y, 0, 0xF2) }
+export fn (a: *X64) movsd_load(x: int, base: int, disp: int) { a.rmx(0x0F10, x, base, disp, 0, 0xF2) }
+export fn (a: *X64) movsd_store(base: int, disp: int, x: int) { a.rmx(0x0F11, x, base, disp, 0, 0xF2) }
 export fn (a: *X64) ucomisd(x: int, y: int) { a.rrx(0x0F2E, x, y, 0, 0x66) }
 export fn (a: *X64) cvtsi2sd(x: int, r: int) { a.rrx(0x0F2A, x, r, 1, 0xF2) }
 export fn (a: *X64) cvttsd2si(r: int, x: int) { a.rrx(0x0F2C, r, x, 1, 0xF2) }
