@@ -111,6 +111,14 @@ export fn (a: *X64) rmx(op: int, reg: int, base: int, disp: int, w: int, pre: in
   a.b.u32(disp)
 }
 export fn (a: *X64) rm(op: int, reg: int, base: int, disp: int) { a.rmx(op, reg, base, disp, 1, 0) }
+# register with [base + index * (1 << scale)], no displacement (base: not rbp nor r13)
+export fn (a: *X64) rsib(op: int, reg: int, base: int, index: int, scale: int, w: int) {
+  v := 0x40 | (w << 3) | (((reg >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1)
+  if v != 0x40 { a.b.byte(v) }
+  a.op(op)
+  a.b.byte(0x04 | ((reg & 7) << 3))
+  a.b.byte((scale << 6) | ((index & 7) << 3) | (base & 7))
+}
 # register with [rip + symbol]
 export fn (a: *X64) ripx(op: int, reg: int, sym: str, w: int, pre: int, after: int) {
   a.pre(pre)

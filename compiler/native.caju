@@ -1633,12 +1633,24 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
     A.movq_x(d, RAX)
     return
   }
-  if n.kind == "Var" && n.ty == "num" && f.simple_to(n, RAX) {
+  if n.kind == "Var" && n.ty == "num" && !n.fn_ref {
+    v := f.lookup(n.name, n)
+    if v.reg != 0 && !v.celled && v.t == "num" {
+      A.movq_x(d, v.reg)
+      return
+    }
+    if !v.celled && v.cap < 0 && v.t == "num" {
+      # movsd xmm d, [slot]
+      if v.sym != "" { A.ripx(0x0F10, d, v.sym, 0, 0xF2, 0) } else { A.rmx(0x0F10, d, RBP, v.off, 0, 0xF2) }
+      return
+    }
+    f.simple_to(n, RAX)
     A.movq_x(d, RAX)
     return
   }
   if f.num_elem(n) {
-    f.elem_check(n, false)
+    ix := f.elem_check(n, false)
+    if ix != RCX { f.a.mov(RCX, ix) }
     f.movsd_elem(0x10, d)                         # movsd xmm d, [rax + rcx*8]
     return
   }
@@ -1779,6 +1791,173 @@ fn (f: *Fn) imm32(n: *ast.Node) -> (int, bool) {
   return 0, false
 }
 
+# ---- integer operations straight on register variables and variable slots ----
+# the register of n when n is an integer (or bool) variable kept in a register (alloc_regs), else 0
+fn (f: *Fn) reg_of(n: *ast.Node) -> int {
+  if n.kind != "Var" || n.fn_ref || n.name == "_" { return 0 }
+  v := f.lookup(n.name, n)
+  if v.reg == 0 || v.celled || f.g.cls(v.t, n) != "i" { return 0 }
+  return v.reg
+}
+# the variable of n when its value can be used straight from its slot ([rbp+off] or [rip+sym]):
+# an integer, bool or pointer-like variable that is neither in a register, celled nor captured
+fn (f: *Fn) slot_of(n: *ast.Node) -> *Var {
+  if n.kind != "Var" || n.fn_ref || n.name == "_" { return nil }
+  v := f.lookup(n.name, n)
+  if v.reg != 0 || v.celled || v.cap >= 0 { return nil }
+  c := f.g.cls(v.t, n)
+  if c != "i" && c != "p" { return nil }
+  return v
+}
+# reading a after evaluating b gives the value a had before b: b calls nothing, or a is a
+# literal, a register variable or a local slot (only &x, which cells it, or a closure, which
+# captures it, could change a local behind the code's back)
+fn (f: *Fn) stable_vs(a: *ast.Node, b: *ast.Node) -> bool {
+  if a.kind == "Number" || a.kind == "Bool" { return true }
+  if a.kind == "Var" && !a.fn_ref && a.name != "_" {
+    v := f.lookup(a.name, a)
+    if !v.celled && v.cap < 0 && v.sym == "" { return true }
+  }
+  return f.no_calls(b)
+}
+# x64 encoding of an integer operation: the "op reg, r/m" opcode and the /ext of its immediate
+# form (-1: none); (-1, -1) when op is not one of these
+fn alu_code(op: str) -> (int, int) {
+  switch op {
+  case "+": return 0x03, 0
+  case "-": return 0x2B, 5
+  case "&": return 0x23, 4
+  case "|": return 0x0B, 1
+  case "^": return 0x33, 6
+  case "*": return 0x0FAF, -1
+  case "cmp": return 0x3B, 7
+  }
+  return -1, -1
+}
+# the "op r/m, reg" opcode (memory destination) of + - & | ^; -1 for the others
+fn alu_code_mr(op: str) -> int {
+  switch op {
+  case "+": return 0x01
+  case "-": return 0x29
+  case "&": return 0x21
+  case "|": return 0x09
+  case "^": return 0x31
+  }
+  return -1
+}
+# integer kinds whose results wrap_kind cuts to a smaller size
+fn needs_wrap(k: int) -> bool { return k == 1 || k == 2 || k == 3 || k == 6 || k == 7 || k == 8 }
+# n is an operand alu_src takes without code of its own
+fn (f: *Fn) direct_operand(n: *ast.Node) -> bool {
+  _, is_imm := f.imm32(n)
+  return is_imm || f.reg_of(n) != 0 || f.slot_of(n) != nil
+}
+# dst = dst op n with a single instruction when n is an immediate, a register variable or a
+# variable in its slot (op: alu_code); false (and no code) otherwise
+fn (f: *Fn) alu_src(op: str, dst: int, n: *ast.Node) -> bool {
+  A := f.a
+  code, ext := alu_code(op)
+  if code < 0 { return false }
+  imm, is_imm := f.imm32(n)
+  if is_imm {
+    if ext >= 0 {
+      A.alu_imm(ext, dst, imm)
+    } else if imm >= -128 && imm <= 127 {
+      A.rr(0x6B, dst, dst)                         # imul dst, dst, imm8
+      A.byte(imm)
+    } else {
+      A.rr(0x69, dst, dst)                         # imul dst, dst, imm32
+      A.d32(imm)
+    }
+    return true
+  }
+  r := f.reg_of(n)
+  if r != 0 {
+    A.rr(code, dst, r)
+    return true
+  }
+  v := f.slot_of(n)
+  if v != nil {
+    if v.sym != "" { A.rip(code, dst, v.sym) } else { A.rm(code, dst, RBP, v.off) }
+    return true
+  }
+  return false
+}
+# [slot of v] op= reg (code: alu_code_mr)
+fn (f: *Fn) slot_alu(code: int, v: *Var, r: int) {
+  if v.sym != "" { f.a.rip(code, r, v.sym) } else { f.a.rm(code, r, RBP, v.off) }
+}
+# [slot of v] op= imm (ext: the /ext of the immediate form)
+fn (f: *Fn) slot_alu_imm(ext: int, v: *Var, imm: int) {
+  A := f.a
+  small := imm >= -128 && imm <= 127
+  op := 0x81
+  if small { op = 0x83 }
+  if v.sym != "" {
+    after := 4
+    if small { after = 1 }
+    A.ripx(op, ext, v.sym, 1, 0, after)
+  } else {
+    A.rm(op, ext, RBP, v.off)
+  }
+  if small { A.byte(imm) } else { A.d32(imm) }
+}
+# flags = left compared with right (integers, booleans, pointers): cmp left, right
+fn (f: *Fn) int_cmp(left: *ast.Node, right: *ast.Node) {
+  A := f.a
+  lr := f.reg_of(left)
+  if lr != 0 {
+    if !f.alu_src("cmp", lr, right) {
+      f.expr(right)                                # cannot change a register variable
+      A.alu("cmp", lr, RAX)
+    }
+    return
+  }
+  if f.direct_operand(right) {
+    f.expr(left)
+    f.alu_src("cmp", RAX, right)
+    return
+  }
+  lv := f.slot_of(left)
+  if lv != nil && f.stable_vs(left, right) {
+    f.expr(right)
+    f.slot_alu(0x39, lv, RAX)                      # cmp [slot], rax
+    return
+  }
+  f.operands(left, right)
+  A.alu("cmp", RAX, RCX)
+}
+# x op= value with x an integer variable in a register or in its slot, in place; false (and no
+# code) when that does not apply
+fn (f: *Fn) op_assign_in_place(v: *Var, tg: *ast.Node, op: str, ik: int, value: *ast.Node) -> bool {
+  A := f.a
+  if ik == ast.NONE || needs_wrap(ik) || needs_wrap(kind_code(v.t)) || v.celled || v.cap >= 0 || f.g.cls(v.t, tg) != "i" { return false }
+  code, _ := alu_code(op)
+  if code < 0 || op == "cmp" { return false }
+  if v.reg != 0 {
+    if !f.alu_src(op, v.reg, value) {
+      f.expr(value)                                # cannot change a register variable
+      A.rr(code, v.reg, RAX)
+    }
+    return true
+  }
+  mr := alu_code_mr(op)
+  if mr < 0 || !f.stable_vs(tg, value) { return false }
+  _, ext := alu_code(op)
+  imm, is_imm := f.imm32(value)
+  if is_imm {
+    f.slot_alu_imm(ext, v, imm)
+    return true
+  }
+  r := f.reg_of(value)
+  if r == 0 {
+    f.expr(value)
+    r = RAX
+  }
+  f.slot_alu(mr, v, r)
+  return true
+}
+
 # a number, a boolean or a variable: loading it has no effect and cannot fail
 fn is_simple(n: *ast.Node) -> bool {
   return n.kind == "Number" || n.kind == "Bool" || (n.kind == "Var" && !n.fn_ref)
@@ -1787,7 +1966,7 @@ fn is_simple(n: *ast.Node) -> bool {
 # RAX = left, RCX = right (left evaluated first; when left is simple and right calls nothing,
 # right is computed first: neither can change what the other sees)
 fn (f: *Fn) operands(left: *ast.Node, right: *ast.Node) {
-  if is_simple(left) && !is_simple(right) && f.no_calls(right) {
+  if is_simple(left) && !is_simple(right) && f.stable_vs(left, right) {
     f.expr(right)
     f.a.mov(RCX, RAX)
     f.simple_to(left, RAX)
@@ -1859,14 +2038,7 @@ fn (f: *Fn) jump_if(cond: *ast.Node, want: bool, dest: str) {
     return
   }
   if f.int_compare(cond) {
-    imm, is_imm := f.imm32(cond.right)
-    if is_imm {
-      f.expr(cond.left)
-      A.cmp_imm(RAX, imm)
-    } else {
-      f.operands(cond.left, cond.right)
-      A.alu("cmp", RAX, RCX)
-    }
+    f.int_cmp(cond.left, cond.right)
     cc := f.int_compare_cc(cond)
     if !want { cc = cc ^ 1 }               # the opposite condition
     A.jcc(cc, dest)
@@ -2119,8 +2291,7 @@ fn (f: *Fn) compare(n: *ast.Node) {
     if op == "!=" { A.byte4(0x48, 0x83, 0xF0, 0x01) }
     return
   }
-  f.operands(n.left, n.right)
-  A.alu("cmp", RAX, RCX)
+  f.int_cmp(n.left, n.right)
   if is_unsigned(lt) || is_unsigned(rtt) { A.setcc(cc_unsigned(op), RAX) } else { A.setcc(cc_signed(op), RAX) }
   A.movzxb(RAX, RAX)
 }
@@ -2153,19 +2324,43 @@ fn (f: *Fn) binary(n: *ast.Node) {
     return
   }
   if n.ik != ast.NONE && op != "**" {
+    code, _ := alu_code(op)
+    lr := f.reg_of(n.left)
     imm, is_imm := f.imm32(n.right)
-    if is_imm && (op == "+" || op == "-" || op == "&" || op == "|" || op == "^") {
-      f.expr(n.left)
-      ext := 0
-      switch op {
-      case "-": ext = 5
-      case "&": ext = 4
-      case "|": ext = 1
-      case "^": ext = 6
-      }
-      A.alu_imm(ext, RAX, imm)
+    if lr != 0 && is_imm && (op == "+" || op == "-") && imm > -2147483648 {
+      if op == "-" { imm = -imm }
+      A.rmx(0x8D, RAX, lr, imm, 1, 0)              # lea rax, [reg + imm]
       g.wrap_kind(n.ik)
       return
+    }
+    if (op == "<<" || op == ">>") && is_imm && imm >= 0 && imm < 64 {
+      # shift by a constant: no checks of the amount
+      f.expr(n.left)
+      ext := 4
+      if op == ">>" {
+        ext = 7
+        if n.ik >= 5 && n.ik <= 9 { ext = 5 }
+      }
+      if imm > 0 {
+        A.byte3(0x48, 0xC1, 0xC0 | (ext << 3))      # shl/shr/sar rax, imm8
+        A.byte(imm)
+      }
+      g.wrap_kind(n.ik)
+      return
+    }
+    if code >= 0 {
+      if f.direct_operand(n.right) {
+        f.expr(n.left)
+        f.alu_src(op, RAX, n.right)
+        g.wrap_kind(n.ik)
+        return
+      }
+      if op != "-" && f.direct_operand(n.left) && f.stable_vs(n.left, n.right) {
+        f.expr(n.right)                            # commutative: the right side first
+        f.alu_src(op, RAX, n.left)
+        g.wrap_kind(n.ik)
+        return
+      }
     }
     f.operands(n.left, n.right)
     f.int_op(op, n.ik, n)
@@ -2330,33 +2525,42 @@ fn (f: *Fn) counted_loop(n: *ast.Node, ls: *LoopScan) -> str {
 }
 
 fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
-  f.elem_check(n, write)
-  if f.g.byte_elems(n.obj.ty) { f.a.byte4(0x48, 0x8D, 0x04, 0x08) } else { f.a.byte4(0x48, 0x8D, 0x04, 0xC8) }   # lea rax, [rax + rcx(*8)]
+  idx := f.elem_check(n, write)
+  scale := 3
+  if f.g.byte_elems(n.obj.ty) { scale = 0 }
+  f.a.rsib(0x8D, RAX, RAX, idx, scale, 1)         # lea rax, [rax + idx(*8)]
 }
-# RAX = the elements (array object or the slice's data), RCX = the index, checked
-fn (f: *Fn) elem_check(n: *ast.Node, write: bool) {
+# RAX = the elements (array object or the slice's data), the index checked in the register
+# returned: RCX, or the register variable that is the index
+fn (f: *Fn) elem_check(n: *ast.Node, write: bool) -> int {
   A := f.a
   ot := strip_ptr(types.dflt(n.obj.ty))
   k := f.g.kind_of_t(ot)
   c := f.cached_list(n.obj)
   if c != nil && k == "slice" && types.dflt(n.obj.ty) == ot {
-    if n.index.ty != "int" || !f.simple_to(n.index, RCX) {
-      f.expr_to(n.index, "int")
-      A.mov(RCX, RAX)
+    idx := 0
+    if n.index.ty == "int" { idx = f.reg_of(n.index) }
+    if idx == 0 {
+      idx = RCX
+      if n.index.ty != "int" || !f.simple_to(n.index, RCX) {
+        f.expr_to(n.index, "int")
+        A.mov(RCX, RAX)
+      }
     }
     if n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name {
       f.load_slot(c.data)                         # always in range (counted_loop)
-      return
+      return idx
     }
     ok := A.label()
-    f.slot_op(0x3B, RCX, c.len)                   # cmp rcx, [length]
+    f.slot_op(0x3B, idx, c.len)                   # cmp idx, [length]
     A.jcc(CC_B, ok)
     # out of range: the list is the cached one, so the general checks always report the error
+    if idx != RCX { A.mov(RCX, idx) }
     f.simple_to(n.obj, RAX)
     f.elem_check_general(n, write, k, ot)
     A.bind(ok)
     f.load_slot(c.data)
-    return
+    return idx
   }
   if is_simple(n.obj) && n.index.ty == "int" && !is_simple(n.index) && f.no_calls(n.index) {
     f.expr(n.index)
@@ -2372,6 +2576,7 @@ fn (f: *Fn) elem_check(n: *ast.Node, write: bool) {
     }
   }
   f.elem_check_general(n, write, k, ot)
+  return RCX
 }
 # RAX = the list (or array), RCX = the index: checks them; RAX = the elements
 fn (f: *Fn) elem_check_general(n: *ast.Node, write: bool, k: str, ot: str) {
@@ -2454,8 +2659,8 @@ fn (f: *Fn) index(n: *ast.Node) {
     }
     return                                        # rax = value, rcx = found
   }
-  f.elem_check(n, false)
-  if f.g.byte_elems(n.obj.ty) { A.byte4(0x0F, 0xB6, 0x04, 0x08) } else { A.byte4(0x48, 0x8B, 0x04, 0xC8) }   # movzx eax, byte [rax+rcx] / mov rax, [rax+rcx*8]
+  idx := f.elem_check(n, false)
+  if f.g.byte_elems(n.obj.ty) { A.rsib(0x0FB6, RAX, RAX, idx, 0, 0) } else { A.rsib(0x8B, RAX, RAX, idx, 3, 1) }   # movzx eax, byte [rax+idx] / mov rax, [rax+idx*8]
 }
 # address of a target (&x, &s.f, &a[i]) in RAX
 fn (f: *Fn) address(a: *ast.Node, n: *ast.Node) {
@@ -3447,6 +3652,7 @@ fn (f: *Fn) assign_var(name: str, value: *ast.Node, n: *ast.Node, decl: bool) {
     f.rt("rt_copy_into", 3)
     return
   }
+  if value != nil && f.assign_direct(v, name, value, decl) { return }
   if value == nil {
     f.push_desc(v.t, n)
     f.rt("rt_zero", 1)
@@ -3454,6 +3660,41 @@ fn (f: *Fn) assign_var(name: str, value: *ast.Node, n: *ast.Node, decl: bool) {
     f.bind_value(value, v.t)
   }
   f.store_v(v, decl)
+}
+# x = value without going through RAX when x is a register variable or value a simple one;
+# false (and no code) otherwise
+fn (f: *Fn) assign_direct(v: *Var, name: str, value: *ast.Node, decl: bool) -> bool {
+  A := f.a
+  if v.celled || types.dflt(value.ty) != v.t { return false }
+  if v.reg != 0 {
+    if f.simple_to(value, v.reg) { return true }
+    if value.kind == "Binary" && f.g.cls(v.t, value) == "i" {
+      # x = x op e: in place
+      l := value.left
+      rn := value.right
+      same := !decl && l.kind == "Var" && !l.fn_ref && l.name == name
+      if same && f.op_assign_in_place(v, l, value.op, value.ik, rn) { return true }
+      # x = a op b with a simple and b an operand alu_src takes (and not x): computed in x
+      code, _ := alu_code(value.op)
+      x_right := rn.kind == "Var" && rn.name == name
+      if !same && code >= 0 && value.ik != ast.NONE && !needs_wrap(value.ik) && is_simple(l) && !x_right && f.direct_operand(rn) {
+        f.simple_to(l, v.reg)
+        f.alu_src(value.op, v.reg, rn)
+        return true
+      }
+    }
+    if f.is_fbin(value) {
+      f.fexpr(value, 0)
+      A.movq_r(v.reg, 0)
+      return true
+    }
+    return false
+  }
+  if v.cap >= 0 { return false }
+  r := f.reg_of(value)
+  if r == 0 { return false }
+  f.store_slot_r(v, r)
+  return true
 }
 # stores RAX into an already prepared target (variable, index, field or *p)
 fn (f: *Fn) prep_target(t: *ast.Node) -> *Target {
@@ -3622,6 +3863,40 @@ fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) 
   }
   if t.kind == "Index" && g.kind_of_t(types.dflt(t.obj.ty)) != "map" && !g.is_value_type(t.ty) && !g.is_value_type(v.ty) {
     # the index operands are evaluated before the value, as in multi
+    if is_simple(v) && types.dflt(v.ty) == types.dflt(t.ty) {
+      # a simple value goes straight to [elements + index]
+      idx := f.elem_check(t, true)
+      byte_e := g.byte_elems(t.obj.ty)
+      scale := 3
+      w := 1
+      if byte_e {
+        scale = 0
+        w = 0
+      }
+      imm, is_imm := f.imm32(v)
+      if v.kind == "Bool" {
+        is_imm = true
+        imm = 0
+        if v.bool_value { imm = 1 }
+      }
+      if is_imm {
+        if byte_e {
+          A.rsib(0xC6, 0, RAX, idx, 0, 0)            # mov byte [rax + idx], imm8
+          A.byte(imm)
+        } else {
+          A.rsib(0xC7, 0, RAX, idx, 3, 1)            # mov qword [rax + idx*8], imm32
+          A.d32(imm)
+        }
+        return true
+      }
+      r := f.reg_of(v)
+      if r == 0 {
+        f.simple_to(v, RDX)
+        r = RDX
+      }
+      if byte_e { A.rsib(0x88, r, RAX, idx, scale, w) } else { A.rsib(0x89, r, RAX, idx, scale, w) }
+      return true
+    }
     f.elem_addr(t, true)
     if v.ty == t.ty && f.simple_to(v, RCX) {
       f.store_at(t.ty, RAX, RCX)
@@ -3828,26 +4103,38 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
   tg := n.target
   if tg.kind != "Index" || g.kind_of_t(types.dflt(tg.obj.ty)) == "map" || types.dflt(tg.obj.ty) == "str" { return false }
   if g.is_value_type(tg.ty) || g.is_iface_t(tg.ty) || g.is_iface_t(n.value.ty) || types.dflt(tg.ty) == "bool" { return false }
-  if types.dflt(tg.ty) == "int" && (n.op == "+" || n.op == "-" || n.op == "&" || n.op == "|" || n.op == "^") && (is_simple(n.value) || f.no_calls(n.value)) {
-    # the value calls nothing (cannot change the element): op [address], value
-    f.elem_addr(tg, true)
-    if !f.simple_to(n.value, RCX) {
-      A.push(RAX)
-      f.expr(n.value)
-      A.mov(RCX, RAX)
-      A.pop(RAX)
-    }
-    op := 0x01                                    # add [rax], rcx
-    switch n.op {
-    case "-": op = 0x29
-    case "&": op = 0x21
-    case "|": op = 0x09
-    case "^": op = 0x31
-    }
-    A.rmx(op, RCX, RAX, 0, 1, 0)
-    return true
-  }
   if n.ik != ast.NONE && n.op != "**" && g.cls(tg.ty, n) == "i" {
+    mr := alu_code_mr(n.op)
+    if mr >= 0 && !needs_wrap(n.ik) && !needs_wrap(kind_code(tg.ty)) {
+      # a[i] op= v on the element in memory
+      if is_simple(n.value) {
+        idx := f.elem_check(tg, true)
+        imm, is_imm := f.imm32(n.value)
+        if is_imm {
+          _, ext := alu_code(n.op)
+          small := imm >= -128 && imm <= 127
+          if small { A.rsib(0x83, ext, RAX, idx, 3, 1) } else { A.rsib(0x81, ext, RAX, idx, 3, 1) }
+          if small { A.byte(imm) } else { A.d32(imm) }
+          return true
+        }
+        r := f.reg_of(n.value)
+        if r == 0 {
+          f.simple_to(n.value, RDX)
+          r = RDX
+        }
+        A.rsib(mr, r, RAX, idx, 3, 1)              # op [rax + idx*8], r
+        return true
+      }
+      if f.no_calls(n.value) {
+        # nothing in v can change the element: it is read after v
+        f.elem_addr(tg, true)
+        A.push(RAX)
+        f.expr(n.value)
+        A.pop(RCX)
+        A.rm(mr, RAX, RCX, 0)                       # op [rcx], rax
+        return true
+      }
+    }
     f.elem_addr(tg, true)
     A.push(RAX)                                   # the element's address
     A.load(RAX, RAX, 0)
@@ -3867,7 +4154,8 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
     if c != nil && f.num_elem(tg) && types.dflt(tg.obj.ty) == strip_ptr(types.dflt(tg.obj.ty)) && g.kind_of_t(types.dflt(tg.obj.ty)) == "slice" && is_simple(tg.index) && tg.index.ty == "int" {
       # cached list, simple index: neither changes while the value is computed (fpure), so the
       # address is computed again instead of being kept on the stack
-      f.elem_check(tg, true)
+      ix := f.elem_check(tg, true)
+      if ix != RCX { f.a.mov(RCX, ix) }
       f.movsd_elem(0x10, 0)                       # the current value
       f.fexpr(n.value, 1)
       f.fop(n.op, 0, 1, n)
@@ -3938,6 +4226,7 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     tg := n.target
     if tg.kind == "Var" {
       v := f.lookup(tg.name, n)
+      if f.op_assign_in_place(v, tg, n.op, n.ik, n.value) { return }
       fake := ast.new_node("Binary", n.line, n.col)
       fake.op = n.op
       fake.left = tg

@@ -1,0 +1,284 @@
+# The native compiler works straight on variables kept in registers (alloc_regs) and on variable
+# slots: comparisons (cmp reg, reg/imm/[slot]), x op= v in place, x = a op b computed in x,
+# a[i] with i in a register as the index of the address, a[i] = v and a[i] op= v on memory,
+# shifts by a constant and lea for x + k. The helpers below are named functions with at least
+# 4 uses of each variable, so that their variables really live in registers.
+import { describe, it, expect, run_source } from "std/testing"
+
+let g: int = 10
+let gf: num = 0.5
+let gu: uint = 3
+
+# changes g (a call between reading g and using it must not be skipped over)
+fn bump() -> int {
+  g = 100
+  return 1
+}
+fn twice(x: int) -> int { return x + x }
+
+fn compares(n: int, m: int) -> []int {
+  hits := []int{}
+  for i := 0; i < n; i++ {
+    if i > m { hits = append(hits, i) }
+    if i == twice(m) - 1 { hits = append(hits, 100 + i) }
+    if twice(m) - 1 == i { hits = append(hits, 300 + i) }
+    if i >= 9 { hits = append(hits, 200 + i) }
+    if i < g - 5 { hits = append(hits, 400 + i) }
+    if m != i { hits = append(hits, 0) }
+  }
+  return hits
+}
+
+fn global_vs_call() -> []bool {
+  g = 10
+  a := g < bump()             # g is read before bump runs: 10 < 1
+  g = 10
+  b := bump() < g             # 1 < 100
+  g = 10
+  c := false
+  if g == bump() + 9 { c = true }   # 10 == 10
+  return []bool{a, b, c}
+}
+
+fn unsigned_compares() -> []bool {
+  let big: uint = 1 << 63
+  let small: uint = 5
+  r := []bool{}
+  for k := 0; k < 2; k++ {
+    r = append(r, big > small)
+    r = append(r, small < big)
+    r = append(r, big > 7)
+    r = append(r, gu < big)
+  }
+  return r
+}
+
+fn op_assign_regs() -> []int {
+  a := 7
+  b := 3
+  for k := 0; k < 4; k++ {
+    a += b
+    a -= 1
+    a *= 2
+    a &= 1023
+    a |= 4
+    a ^= b
+    b += k * 2
+  }
+  x := 5
+  for k := 0; k < 3; k++ { x -= x }
+  y := 3
+  for k := 0; k < 3; k++ { y *= y }
+  z := 1
+  for k := 0; k < 5; k++ { z += twice(z) }
+  w := 1
+  for k := 0; k < 3; k++ {
+    w += 3000000000           # not an imm32
+    w *= -3
+    w += g
+    w -= -7
+  }
+  return []int{a, b, x, y, z, w}
+}
+
+# more variables than registers: some op= work on [rbp+off]
+fn op_assign_slots() -> []int {
+  a := 1
+  b := 2
+  c := 3
+  d := 4
+  e := 5
+  f := 6
+  for k := 0; k < 3; k++ {
+    a += 1
+    b += a
+    c -= b
+    d ^= c
+    e += 3000000000
+    f |= k
+    a &= 255
+    b -= 2
+    c += twice(k)
+    d += e
+    e -= f
+    f += d
+  }
+  return []int{a, b, c, d, e, f}
+}
+
+fn op_assign_global() -> []int {
+  g = 10
+  g += bump()                 # g is read before bump: 10 + 1
+  r1 := g
+  g = 10
+  g += 5
+  g -= 2
+  g ^= 1
+  return []int{r1, g}
+}
+
+fn small_ints() -> []int {
+  let u: uint8 = 250
+  let s: int8 = 120
+  let h: int16 = 32760
+  let w: uint32 = 4294967290
+  for k := 0; k < 10; k++ {
+    u += 1
+    s += 1
+    h += 1
+    w += 1
+  }
+  u = u * 3
+  s = s - 100
+  return []int{int(u), int(s), int(h), int(w)}
+}
+
+fn assigns() -> []int {
+  a := 1
+  b := 2
+  c := 0
+  d := 0
+  for k := 0; k < 5; k++ {
+    t := a
+    a = b
+    b = t
+    a = a
+    c = 42
+    d = b - d                 # x = a op x: not computed in d
+    d = d + 1
+    c = a + b
+    c = c * 3
+  }
+  e := 0
+  e = 7 - a
+  return []int{a, b, c, d, e}
+}
+
+fn floats() -> []num {
+  acc := 0.0
+  step := 0.25
+  for k := 0; k < 8; k++ {
+    acc = acc + step * gf
+    acc += step
+  }
+  w := 1.5
+  v := 2.0
+  u := 3.0
+  t := 4.0
+  q := 5.0
+  total := 0.0
+  for k := 0; k < 4; k++ { total = total + w * v + u * t - q + acc }
+  return []num{acc, total}
+}
+
+fn lists(n: int) -> []int {
+  a := make([]int, n)
+  bs := make([]bool, n)
+  fs := make([]num, n)
+  v := 5
+  for i := 0; i < n; i++ {
+    a[i] = 7
+    a[i] += i
+    a[i] -= 3000000000
+    a[i] += 3000000000
+    a[i] ^= v
+    a[i] |= g
+    a[i] &= 1023
+    a[i] -= -2
+    a[i] += a[0] + v
+    a[i] += twice(i)
+    bs[i] = true
+    if i % 2 == 0 { bs[i] = false }
+    fs[i] = 1.5
+  }
+  j := n - 1
+  s := 0
+  while j >= 0 {
+    if bs[j] { s += a[j] }
+    a[j] = v
+    a[j] = g
+    j--
+  }
+  return []int{s, a[0], int(fs[n - 1] * 2)}
+}
+
+fn shifts(x: int, y: uint, z: int8) -> []int {
+  r := []int{}
+  for k := 0; k < 1; k++ {
+    r = append(r, x << 3, x >> 2, x >> 63, x << 0, x << 63)
+    r = append(r, int(y >> 60), int(y << 1 >> 1))
+    r = append(r, int(z << 4), int(z >> 1))
+  }
+  return r
+}
+
+fn leas(x: int) -> []int {
+  r := []int{}
+  for k := 0; k < 1; k++ {
+    r = append(r, x + 5, x - 7, x + -5, x - 2147483647, x + 2147483647, x * 3, x * -1, x * 100000)
+    r = append(r, x * 3000000000)
+  }
+  return r
+}
+
+fn bools(n: int) -> []int {
+  on := false
+  flips := 0
+  same := 0
+  for i := 0; i < n; i++ {
+    on = !on
+    if on == true { flips++ }
+    if on != (i % 2 == 0) { same++ }
+  }
+  return []int{flips, same}
+}
+
+describe("register and slot operands", fn() {
+  it("compare against constants, other variables, slots and expressions", fn() {
+    expect(compares(10, 3)).to_equal([]int{400, 0, 401, 0, 402, 0, 403, 4, 404, 0, 5, 105, 305, 0, 6, 0, 7, 0, 8, 0, 9, 209, 0})
+  })
+  it("read a global before a call on the other side of a comparison", fn() {
+    expect(global_vs_call()).to_equal([]bool{false, true, true})
+  })
+  it("compare unsigned values as unsigned", fn() {
+    expect(unsigned_compares()).to_equal([]bool{true, true, true, true, true, true, true, true})
+  })
+  it("update register variables in place with every operator", fn() {
+    expect(op_assign_regs()).to_equal([]int{223, 15, 0, 6561, 243, -62999999278})
+  })
+  it("update variables in their slots in place", fn() {
+    expect(op_assign_slots()).to_equal([]int{4, 5, -7, 3000000004, -10, 9000000006})
+  })
+  it("read a global before the call of its op=", fn() {
+    expect(op_assign_global()).to_equal([]int{11, 12})
+  })
+  it("keep wrapping fixed-size integers", fn() {
+    expect(small_ints()).to_equal([]int{12, 30, -32766, 4})
+  })
+  it("assign simple values and operations to register variables", fn() {
+    expect(assigns()).to_equal([]int{2, 1, 9, 0, 5})
+  })
+  it("read floats from registers, the frame and globals", fn() {
+    expect(floats()).to_equal([]num{3, 52})
+  })
+  it("index, store and update list elements with the index in a register", fn() {
+    expect(lists(6)).to_equal([]int{191, 12, 3})
+  })
+  it("report an index out of range with the index in a register", fn() {
+    src := "fn f(a: []int) -> int {\n  s := 0\n  i := 0\n  while i < 9 {\n    s += a[i]\n    i++\n  }\n  return s + i + i\n}\nprint(f([]int{1, 2, 3}))\n"
+    r := run_source(src)
+    expect(r.output).to_equal("Runtime error in main.caju, line 5: Index 3 out of range (length 3).")
+    src2 := "fn f(a: []int) {\n  i := 0\n  while i < 9 {\n    a[i] = i\n    a[i] += 1\n    i++\n  }\n}\nf([]int{1, 2})\n"
+    r2 := run_source(src2)
+    expect(r2.output).to_equal("Runtime error in main.caju, line 4: Index 2 out of range (length 2).")
+  })
+  it("shift by constants", fn() {
+    expect(shifts(-12, 18446744073709551615, -3)).to_equal([]int{-96, -3, -1, -12, 0, 15, 9223372036854775807, -48, -2})
+  })
+  it("add and multiply by constants", fn() {
+    expect(leas(10)).to_equal([]int{15, 3, 5, -2147483637, 2147483657, 30, -10, 1000000, 30000000000})
+  })
+  it("compare and flip booleans in registers", fn() {
+    expect(bools(7)).to_equal([]int{4, 0})
+  })
+})
