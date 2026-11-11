@@ -567,7 +567,9 @@ fn rt_str_hash(k: int) -> int {
   if i < n or n == 0 {
     h = (h ^ __load64(p + n)) * -(70460 * 100000000000000 + 29254386353131)
   }
-  return rt_mix(h)
+  h = h ^ (h >> 33)
+  h = h * -(49064778 * 1000000000 + 989728563)
+  return h ^ (h >> 33)
 }
 # the tag of a hash in an index of size slots, in place
 fn rt_map_tag(h: int, size: int) -> int { return ((h >> 32) * size) & 2147483647 }
@@ -606,10 +608,35 @@ fn rt_map_fi(m: int, k: int) -> int {
   }
   return -1
 }
+# string keys: the same probe; a key with the same address is equal without reading its bytes
+fn rt_map_fs(m: int, k: int) -> int {
+  idx := __load64(m + 32)
+  size := __load64(m + 40)
+  mask := size - 1
+  e := __load64(m + 8) - 16
+  h := rt_str_hash(k)
+  t := ((h >> 32) * size) & 2147483647
+  p := h & mask
+  for {
+    s := __load32(idx + p * 4)
+    if s == 0 {
+      rt_map_lh = h
+      return -1
+    }
+    s = s ^ t
+    if s <= mask {
+      q := __load64(e + s * 16)
+      if q == k or rt_streq(__pstr(q), __pstr(k)) { return s - 1 }
+    }
+    p = (p + 1) & mask
+  }
+  return -1
+}
 fn rt_map_find(m: int, k: int) -> int {
   if m == 0 { return -1 }
   kk := __load64(m + 48)
   if kk == 0 { return rt_map_fi(m, k) }
+  if kk == 2 { return rt_map_fs(m, k) }
   idx := __load64(m + 32)
   size := __load64(m + 40)
   mask := size - 1

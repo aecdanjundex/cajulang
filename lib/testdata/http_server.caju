@@ -9,6 +9,11 @@ http.handle("/", fn(req: *http.Request, res: *http.Response) {
 })
 http.handle("/echo", fn(req: *http.Request, res: *http.Response) { res.write(req.body) })
 http.handle("/from", fn(req: *http.Request, res: *http.Response) { res.write(req.remote_addr) })
+http.handle("/api/", fn(req: *http.Request, res: *http.Response) { res.write("api " + req.path) })
+http.handle("/api/v2/", fn(req: *http.Request, res: *http.Response) { res.write("v2 " + req.path) })
+http.handle("/files/", fn(req: *http.Request, res: *http.Response) { res.write("files old") })
+http.handle("/files/", fn(req: *http.Request, res: *http.Response) { res.write("files " + req.path) })
+http.handle("/hdr", fn(req: *http.Request, res: *http.Response) { res.write(req.header("X-Custom") + "|" + req.header("x-custom") + "|" + req.header("HOST")) })
 port, _ := strconv.atoi(os.getenv("PORT"))
 idle, _ := strconv.atoi(os.getenv("IDLE_MS"))
 if idle > 0 { http.set_idle_timeout(idle) }

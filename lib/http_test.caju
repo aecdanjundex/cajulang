@@ -88,6 +88,27 @@ describe("http server", fn() {
     expect(body(r1)).to_start_with("GET /a q= body=0")
     expect(body(r2)).to_start_with("POST /b q=k=v body=3")
   })
+  it("routes to the exact path, else the longest prefix ending in /", fn() {
+    start("")
+    c := connect()
+    got := []str{}
+    for _, path := range []str{"/echo", "/api/x", "/api/v2/y", "/api/v2", "/api", "/files/a/b", "/echo/more", "/"} {
+      c.write("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n")
+      b := body(read_response(c))
+      if strings.has_prefix(b, "GET ") { b = "root " + path }
+      got = append(got, b)
+    }
+    stop()
+    expect(got).to_equal([]str{"", "api /api/x", "v2 /api/v2/y", "api /api/v2", "root /api", "files /files/a/b", "root /echo/more", "root /"})
+  })
+  it("finds request headers whatever the case of the name", fn() {
+    start("")
+    c := connect()
+    c.write("GET /hdr HTTP/1.1\r\nHost: h1\r\nX-CUSTOM: v\r\n\r\n")
+    r := read_response(c)
+    stop()
+    expect(body(r)).to_equal("v|v|h1")
+  })
   it("closes the connection when the client asks", fn() {
     start("")
     c := connect()
