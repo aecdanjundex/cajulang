@@ -1,0 +1,147 @@
+# Lists and arrays of bool keep 1 byte per element in the native compiler (rt_esize); every
+# operation must behave exactly as with 8-byte elements.
+import { describe, it, expect, run_source } from "std/testing"
+
+struct Flags { on: [3]bool, name: str }
+
+describe("lists of bool", fn() {
+  it("are created by make and by literals, false by default", fn() {
+    a := make([]bool, 4)
+    b := []bool{true, false, true}
+    c := make([]bool, 2, 10)
+    expect(a).to_equal([]bool{false, false, false, false})
+    expect(b).to_equal([]bool{true, false, true})
+    expect([]int{len(c), cap(c)}).to_equal([]int{2, 10})
+  })
+  it("read and write elements by index", fn() {
+    a := make([]bool, 10)
+    for i := 0; i < 10; i += 3 { a[i] = true }
+    a[1] = a[0] && a[3]
+    n := 0
+    for i := 0; i < len(a); i++ { if a[i] { n++ } }
+    expect(n).to_equal(5)
+    expect(a[9] && !a[8]).to_be_true()
+  })
+  it("give pointers to elements that read and write one element", fn() {
+    a := []bool{false, false, false}
+    p := &a[1]
+    *p = true
+    expect(a).to_equal([]bool{false, true, false})
+    expect(*p).to_be_true()
+    q := &a[2]
+    *q = !*p
+    expect(a[2]).to_be_false()
+    expect(str(p)).to_equal("&true")
+  })
+  it("grow with append, one value at a time and from other lists", fn() {
+    a := []bool{}
+    for i := 0; i < 1000; i++ { a = append(a, i % 3 == 0) }
+    b := append([]bool{true}, a[0:4]...)
+    c := append(a[:2], false, true)
+    expect(len(a)).to_equal(1000)
+    expect(a[999]).to_be_true()
+    expect(b).to_equal([]bool{true, true, false, false, true})
+    expect(c).to_equal([]bool{true, false, false, true})
+    expect(a[2:4]).to_equal([]bool{false, true})
+  })
+  it("copy element by element, also between overlapping parts", fn() {
+    a := []bool{true, false, false, false, false}
+    n := copy(a[1:], a)
+    b := []bool{false, false, true, true, true}
+    copy(b, b[2:])
+    expect(n).to_equal(4)
+    expect(a).to_equal([]bool{true, true, true, true, true})
+    expect(b).to_equal([]bool{true, true, true, true, true})
+  })
+  it("share memory with the parts sliced from them", fn() {
+    a := make([]bool, 6)
+    s := a[2:5]
+    s[0] = true
+    s = s[1:]
+    s[1] = true
+    expect(a).to_equal([]bool{false, false, true, false, true, false})
+    expect([]int{len(s), cap(s)}).to_equal([]int{2, 3})
+  })
+  it("are walked by range with index and value", fn() {
+    a := []bool{true, false, true, true}
+    idx := []int{}
+    for i, v := range a { if v { idx = append(idx, i) } }
+    expect(idx).to_equal([]int{0, 2, 3})
+  })
+  it("print, convert to text and box into any", fn() {
+    a := []bool{true, false}
+    let x: any = a
+    expect(str(a)).to_equal("[true false]")
+    expect(str(x)).to_equal("[true false]")
+    y, ok := x.([]bool)
+    expect(ok && y[0]).to_be_true()
+  })
+  it("report index errors with the line", fn() {
+    r := run_source("a := []bool{true}\ni := 3\nprint(a[i])\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 3: Index 3 out of range (length 1).")
+    r2 := run_source("let a: []bool = nil\na[0] = true\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 2: Assignment to a nil map or slice.")
+  })
+  it("count primes with a sieve", fn() {
+    n := 100000
+    composite := make([]bool, n + 1)
+    count := 0
+    for i := 2; i <= n; i++ {
+      if !composite[i] {
+        count++
+        for j := i * i; j <= n; j += i { composite[j] = true }
+      }
+    }
+    expect(count).to_equal(9592)
+  })
+})
+
+describe("arrays of bool", fn() {
+  it("start false and are copied on assignment", fn() {
+    let a: [4]bool
+    a[1] = true
+    b := a
+    b[2] = true
+    expect(a).to_equal([4]bool{false, true, false, false})
+    expect(b).to_equal([4]bool{false, true, true, false})
+  })
+  it("compare element by element", fn() {
+    a := [3]bool{true, false, true}
+    b := [3]bool{true, false, true}
+    c := [3]bool{true, true, true}
+    expect(a == b).to_be_true()
+    expect(a == c).to_be_false()
+  })
+  it("are slices' backing memory when sliced", fn() {
+    a := [5]bool{}
+    s := a[1:4]
+    s[0] = true
+    s[2] = true
+    expect(a).to_equal([5]bool{false, true, false, true, false})
+    p := &a[4]
+    *p = true
+    expect(a[4]).to_be_true()
+  })
+  it("live in struct fields, maps and range", fn() {
+    f := Flags{name: "x"}
+    f.on[2] = true
+    g := f
+    g.on[0] = true
+    m := map[str][2]bool{}
+    m["k"] = [2]bool{true, false}
+    v := m["k"]
+    v[1] = true
+    n := 0
+    for _, on := range g.on { if on { n++ } }
+    expect(str(f)).to_equal("Flags{on: [false false true], name: \"x\"}")
+    expect(n).to_equal(2)
+    expect(m["k"]).to_equal([2]bool{true, false})
+    expect(v).to_equal([2]bool{true, true})
+  })
+  it("are overwritten in place by assignment to an existing array", fn() {
+    a := [3]bool{true, false, false}
+    p := &a
+    a = [3]bool{false, false, true}
+    expect(p[2] && !p[0]).to_be_true()
+  })
+})

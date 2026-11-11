@@ -48,7 +48,7 @@ comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
 
-Resultado esperado hoje: **544 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+Resultado esperado hoje: **574 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
 receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
 confere a quantidade de argumentos).
@@ -100,6 +100,10 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   pilha e as globais).
 - Objetos de array/slice são alocados com 8 bytes a mais; textos e buffers de bytes com
   `rt_alloc_ns` (sem ponteiros).
+- Mudou o formato dos dados (tamanho de elemento, cabeçalho de lista...)? O compilador anterior
+  não compila o novo (gera o formato velho e liga o runtime novo: o estágio 2 cai). Comece a
+  cadeia pelo JS (`node bootstrap/caju.js build -o build/s1 ...`), que usa o runtime congelado.
+- Listas e arrays de `bool` têm 1 byte por elemento (`byte_elems`, `rt_esize`); todo o resto, 8.
 - Mexeu no coletor? Rode a suíte com coleta a cada 64 KB (troque `8 << 20` por `1 << 16` em
   `rt/gc.caju`, dois lugares) e desfaça depois.
 

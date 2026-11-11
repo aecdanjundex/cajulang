@@ -13,6 +13,40 @@ fn rt_cell(v: int) -> int {
   return p
 }
 fn rt_dk(d: int) -> int { return __load64(d) }
+# bytes per element of a list or array whose element descriptor is ed: bool takes 1, the rest 8
+fn rt_esize(ed: int) -> int {
+  if __load64(ed) == 4 { return 1 }
+  return 8
+}
+# element i of a list/array data block with es-byte elements
+fn rt_eload(p: int, i: int, es: int) -> int {
+  if es == 1 { return __load8(p + i) }
+  return __load64(p + 8 * i)
+}
+fn rt_estore(p: int, i: int, es: int, v: int) {
+  if es == 1 {
+    __store8(p + i, v)
+    return
+  }
+  __store64(p + 8 * i, v)
+}
+# copies n elements of es bytes one by one, from the first (like the element loops it replaces)
+fn rt_ecopy(d: int, s: int, n: int, es: int) {
+  if es == 8 {
+    rt_copy(d, s, 8 * n)
+    return
+  }
+  i := 0
+  while i < n {
+    __store8(d + i, __load8(s + i))
+    i++
+  }
+}
+# a data block for c elements (+8 bytes: an empty slice at the end points inside it); zeroed
+fn rt_edata(ed: int, c: int) -> int {
+  if rt_esize(ed) == 1 { return rt_alloc_ns(c + 8) }
+  return rt_alloc(8 * c + 8)
+}
 fn rt_is_value(d: int) -> bool {
   k := __load64(d)
   return k == 7 or k == 8
@@ -36,7 +70,8 @@ fn rt_zero(d: int) -> int {
   if k == 7 {
     n := __load64(d + 8)
     e := __load64(d + 16)
-    p := rt_alloc(8 * n + 8)
+    p := rt_edata(e, n)
+    if rt_esize(e) == 1 { return p }              # bool: false is 0, and the block is zeroed
     i := 0
     while i < n {
       __store64(p + 8 * i, rt_zero(e))
@@ -67,7 +102,11 @@ fn rt_copy_val(v: int, d: int) -> int {
   if k == 7 {
     n := __load64(d + 8)
     e := __load64(d + 16)
-    p := rt_alloc(8 * n + 8)
+    p := rt_edata(e, n)
+    if rt_esize(e) == 1 {
+      rt_ecopy(p, v, n, 1)
+      return p
+    }
     deep := rt_is_value(e)
     i := 0
     while i < n {
@@ -85,6 +124,10 @@ fn rt_copy_into(dst: int, src: int, d: int) {
   k := __load64(d)
   if dst == 0 or src == 0 { return }
   n := __load64(d + 8)
+  if k == 7 and rt_esize(__load64(d + 16)) == 1 {
+    rt_ecopy(dst, src, n, 1)
+    return
+  }
   i := 0
   while i < n {
     fd := __load64(d + 16)
@@ -119,6 +162,14 @@ fn rt_eq(a: int, b: int, d: int) -> bool {
   if k != 7 and k != 8 { return rt_eq_flat(a, b, d) }
   if a == 0 or b == 0 { return false }
   n := __load64(d + 8)
+  if k == 7 and rt_esize(__load64(d + 16)) == 1 {
+    j := 0
+    while j < n {
+      if __load8(a + j) != __load8(b + j) { return false }
+      j++
+    }
+    return true
+  }
   i := 0
   while i < n {
     fd := __load64(d + 16)
@@ -161,7 +212,8 @@ fn rt_sdata(s: int) -> int {
   return __load64(s)
 }
 fn rt_make_slice(ed: int, n: int, c: int) -> int {
-  data := rt_alloc(8 * c + 8)
+  data := rt_edata(ed, c)
+  if rt_esize(ed) == 1 { return rt_hdr(data, n, c) }
   i := 0
   while i < c {
     __store64(data + 8 * i, rt_zero(ed))
@@ -195,14 +247,16 @@ fn rt_append(s: int, src: int, n: int, ed: int) -> int {
     }
     src = cp2
   }
+  es := rt_esize(ed)
   if total <= cp {
-    rt_copy(data + 8 * ln, src, 8 * n)
+    rt_ecopy(data + es * ln, src, n, es)
     return rt_hdr(data, total, cp)
   }
   nc := rt_grow_cap(cp, total)
-  nd := rt_alloc(8 * nc + 8)
-  rt_copy(nd, data, 8 * ln)
-  rt_copy(nd + 8 * ln, src, 8 * n)
+  nd := rt_edata(ed, nc)
+  rt_ecopy(nd, data, ln, es)
+  rt_ecopy(nd + es * ln, src, n, es)
+  if es == 1 { return rt_hdr(nd, total, nc) }    # bool: the rest is already false
   z := rt_zero(ed)
   fresh := rt_is_value(ed)
   i := total
@@ -223,6 +277,10 @@ fn rt_copy_slice(d: int, s: int, ed: int) -> int {
   if m < n { n = m }
   dd := rt_sdata(d)
   sd := rt_sdata(s)
+  if rt_esize(ed) == 1 {
+    rt_ecopy(dd, sd, n, 1)
+    return n
+  }
   i := 0
   while i < n {
     __store64(dd + 8 * i, rt_copy_val(__load64(sd + 8 * i), ed))
@@ -263,18 +321,18 @@ fn rt_slice_fail(where: str, lo: int, hi: int, n: int, c: int, hascap: bool) {
   rt_fail(where, msg + ")")
 }
 # s[lo:hi] of a slice (hi = -1 when omitted)
-fn rt_sub_slice(where: str, s: int, lo: int, hi: int) -> int {
+fn rt_sub_slice(where: str, s: int, lo: int, hi: int, es: int) -> int {
   n := rt_slen(s)
   c := rt_scap(s)
   if hi == -1 { hi = n }
   if lo < 0 or hi < lo or hi > c { rt_slice_fail(where, lo, hi, n, c, s != 0) }
   if s == 0 { return 0 }
-  return rt_hdr(rt_sdata(s) + 8 * lo, hi - lo, c - lo)
+  return rt_hdr(rt_sdata(s) + es * lo, hi - lo, c - lo)
 }
-fn rt_sub_array(where: str, a: int, n: int, lo: int, hi: int) -> int {
+fn rt_sub_array(where: str, a: int, n: int, lo: int, hi: int, es: int) -> int {
   if hi == -1 { hi = n }
   if lo < 0 or hi < lo or hi > n { rt_slice_fail(where, lo, hi, n, n, false) }
-  return rt_hdr(a + 8 * lo, hi - lo, n - lo)
+  return rt_hdr(a + es * lo, hi - lo, n - lo)
 }
 fn rt_sub_str(where: str, s: str, lo: int, hi: int) -> str {
   p := __strp(s)
@@ -692,11 +750,12 @@ fn rt_fmt(v: int, d: int, nested: bool) {
       data = __load64(v)
     }
     e := __load64(d + 16)
+    es := rt_esize(e)
     rt_sb_str("[")
     i := 0
     while i < n {
       if i > 0 { rt_sb_str(" ") }
-      rt_fmt(__load64(data + 8 * i), e, true)
+      rt_fmt(rt_eload(data, i, es), e, true)
       i++
     }
     rt_sb_str("]")
@@ -720,7 +779,7 @@ fn rt_fmt(v: int, d: int, nested: bool) {
       rt_fmt(v, e, nested)
     } else {
       rt_sb_str("&")
-      rt_fmt(__load64(v), e, true)
+      if __load64(e) == 4 { rt_fmt(__load8(v), e, true) } else { rt_fmt(__load64(v), e, true) }
     }
   } else if k == 10 {
     kd := __load64(d + 24)

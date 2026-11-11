@@ -35,6 +35,7 @@ garantida pela suíte de testes e pela autocompilação.
 | 9 | inline de funções `return E` pequenas; `__sqrt` vira sqrtsd no registrador | 66 ms | 187 ms | 427 ms | 94 ms | 136 ms | 287 ms | 1.26 s |
 | 10 | mapas: caminho de chave inteira sem chamadas; leitura `m[k]` numa só chamada | 69 ms | 188 ms | 419 ms | 94 ms | 145 ms | 284 ms | 966 ms |
 | 11 | listas em laço: tamanho e dados lidos uma vez; `a[i]` sem verificação em `for i := 0; i < len(a); i++` | 64 ms | 144 ms | 425 ms | 90 ms | 108 ms | 234 ms | 833 ms |
+| 12 | `[]bool` e `[N]bool` com 1 byte por elemento | 64 ms | 70 ms | 396 ms | 90 ms | 107 ms | 229 ms | 852 ms |
 
 **Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
 matmul 1,8×, sort 2,2×, maps 2,1×.
@@ -58,29 +59,29 @@ para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuç�
 ## Todas as medições
 
 <!-- python3 bench/compare/rounds/table.py -->
-| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | round 11 | total gain |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.57× |
-| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.87× |
-| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 64 ms | 1.97× |
-| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2 ms | 3.01× |
-| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 11 ms | 3.71× |
-| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 144 ms | 3.01× |
-| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 5 ms | 1.63× |
-| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 44 ms | 1.72× |
-| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 425 ms | 1.73× |
-| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 2.53× |
-| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 24 ms | 2.63× |
-| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 90 ms | 2.70× |
-| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 5 ms | 2.25× |
-| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 33 ms | 2.36× |
-| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 108 ms | 2.37× |
-| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 11 ms | 2.57× |
-| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 56 ms | 2.71× |
-| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 234 ms | 2.73× |
-| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 10 ms | 3.62× |
-| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 176 ms | 3.18× |
-| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 833 ms | 2.41× |
+| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | round 11 | round 12 | total gain |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.46× |
+| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.89× |
+| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 64 ms | 64 ms | 1.98× |
+| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2 ms | 2 ms | 3.72× |
+| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 11 ms | 7 ms | 5.53× |
+| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 144 ms | 70 ms | 6.24× |
+| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 5 ms | 5 ms | 1.76× |
+| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 44 ms | 41 ms | 1.83× |
+| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 425 ms | 396 ms | 1.86× |
+| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 2.50× |
+| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 24 ms | 23 ms | 2.67× |
+| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 90 ms | 90 ms | 2.70× |
+| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 2.24× |
+| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 33 ms | 33 ms | 2.35× |
+| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 108 ms | 107 ms | 2.38× |
+| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 11 ms | 11 ms | 2.59× |
+| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 56 ms | 54 ms | 2.78× |
+| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 234 ms | 229 ms | 2.78× |
+| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 10 ms | 10 ms | 3.40× |
+| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 176 ms | 191 ms | 2.94× |
+| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 833 ms | 852 ms | 2.35× |
 
 A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
 código dela não foi salvo à parte).
@@ -323,12 +324,36 @@ instruções mais uma chamada a `rt_slen` por volta para 17 instruções.
 mas o código de `advance` é idêntico instrução por instrução: só o endereço da função mudou
 (o nbody usa listas globais, que a rodada não toca). É efeito de alinhamento do código.
 
+## Rodada 12: listas de bool com 1 byte por elemento
+
+**Hipótese:** todo elemento de lista ocupava 8 bytes; o crivo de 10 milhões varria 80 MB (o Go,
+10 MB). O custo é de memória e de cache, não de instruções.
+**Mudança:** listas e arrays de `bool` guardam 1 byte por elemento.
+- Gerador: `byte_elems(t)` diz se a lista é de bool; ler é `movzx eax, byte [rax+rcx]`, o
+  endereço é `lea rax, [rax+rcx]`; literais e `append` gravam bytes; `a[x:y]` passa o tamanho do
+  elemento ao runtime (`rt_sub_slice`/`rt_sub_array` ganharam um argumento).
+- Um `*bool` pode apontar para dentro de uma lista de bool (1 byte) ou para uma variável ou campo
+  (8 bytes, cujos bytes de cima são sempre 0 num bool): por isso todo bool lido ou gravado por
+  endereço usa 1 byte (`load_at`/`store_at`).
+- Runtime (`rt/values.caju`): `rt_esize`, `rt_eload`, `rt_estore`, `rt_ecopy`, `rt_edata`; o
+  bloco de dados de uma lista de bool vem de `rt_alloc_ns` (sem ponteiros, já zerado: tudo
+  `false`). `make`, `append`, `copy`, comparação, cópia de arrays, valores zero e a impressão
+  conhecem o tamanho.
+- `[]uint8` continua com 8 bytes (fica para depois: aparece em mais lugares da biblioteca).
+- **Bootstrap:** como o formato dos dados mudou, o compilador anterior não pode compilar este
+  (ele gera leituras de 8 bytes, e o runtime novo aloca 1). A cadeia tem que começar no JS:
+  `node bootstrap/caju.js build -o build/s1 ...`, depois s1 → s2 → s3.
+- Testes novos: `tests/lang/bool_lists_test.caju` (make, literais, índices, ponteiros para
+  elementos, append, copy com sobreposição, fatias que compartilham memória, arrays em structs,
+  comparação, impressão). A suíte também passou com coleta a cada 64 KB.
+
+**Resultado:** crivo −52% (146 → 70 ms) e memória de 79 para 11 MB no tamanho maior; o resto não
+mudou (o nbody voltou aos 396 ms: confirma que os 7% da rodada 11 eram alinhamento).
+
 ## O que ficou para depois
 
 Em ordem de ganho esperado:
-1. **`[]bool` e `[]uint8` com 1 byte por elemento** (hoje 8): o crivo de 10 milhões varre 80 MB
-   em vez de 10 MB; é o maior atraso que sobrou (6× o Go). Mexe em todas as operações de lista
-   do runtime.
+1. ~~`[]bool` com 1 byte por elemento~~ (rodada 12). Falta `[]uint8`.
 2. **Mais registradores para `num`** (XMM preservados não existem no Linux: precisaria guardar em
    volta das chamadas) e carregar `num` da memória direto para XMM (`movsd xmm, [rbp-x]`).
 3. ~~Tirar verificações repetidas de laço~~ (rodada 11, para listas locais). Falta: listas

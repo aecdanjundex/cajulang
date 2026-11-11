@@ -172,6 +172,26 @@ fn (g: *Gen) kind_of_t(t: str) -> str {
   if t != "" && !g.is_struct(t) { return types.tinfo(types.dflt(t)).k }
   return ""
 }
+# a list or array of bool: 1 byte per element (rt_esize); every other element takes 8
+fn (g: *Gen) byte_elems(t: str) -> bool {
+  tt := strip_ptr(types.dflt(t))
+  if tt == "" { return false }
+  k := g.kind_of_t(tt)
+  if k != "slice" && k != "array" { return false }
+  return types.dflt(types.tinfo(tt).elem) == "bool"
+}
+fn elem_size(byte_e: bool) -> int {
+  if byte_e { return 1 }
+  return 8
+}
+# bool values are read and written through addresses one byte at a time: a *bool may point into a
+# list of bools (1 byte each) or to a word (whose upper bytes are always 0 for a bool)
+fn (f: *Fn) load_at(t: str, r: int, base: int) {
+  if types.dflt(t) == "bool" { f.a.rmx(0x0FB6, r, base, 0, 0, 0) } else { f.a.load(r, base, 0) }   # movzx r32, byte [base]
+}
+fn (f: *Fn) store_at(t: str, base: int, r: int) {
+  if types.dflt(t) == "bool" { f.a.rmx(0x88, r, base, 0, 0, 0) } else { f.a.store(base, 0, r) }   # mov byte [base], r8
+}
 fn (g: *Gen) is_value_type(t: str) -> bool { return t != "" && (g.is_struct(t) || g.kind_of_t(t) == "array") }
 # "f" float, "i" integer or bool, "s" string, "v" void, "p" pointer-like
 fn (g: *Gen) cls(t: str, n: *ast.Node) -> str {
@@ -2270,7 +2290,7 @@ fn (f: *Fn) counted_loop(n: *ast.Node, ls: *LoopScan) -> str {
 
 fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
   f.elem_check(n, write)
-  f.a.byte4(0x48, 0x8D, 0x04, 0xC8)               # lea rax, [rax + rcx*8]
+  if f.g.byte_elems(n.obj.ty) { f.a.byte4(0x48, 0x8D, 0x04, 0x08) } else { f.a.byte4(0x48, 0x8D, 0x04, 0xC8) }   # lea rax, [rax + rcx(*8)]
 }
 # RAX = the elements (array object or the slice's data), RCX = the index, checked
 fn (f: *Fn) elem_check(n: *ast.Node, write: bool) {
@@ -2396,7 +2416,7 @@ fn (f: *Fn) index(n: *ast.Node) {
     return                                        # rax = value, rcx = found
   }
   f.elem_check(n, false)
-  A.byte4(0x48, 0x8B, 0x04, 0xC8)                 # mov rax, [rax + rcx*8]
+  if f.g.byte_elems(n.obj.ty) { A.byte4(0x0F, 0xB6, 0x04, 0x08) } else { A.byte4(0x48, 0x8B, 0x04, 0xC8) }   # movzx eax, byte [rax+rcx] / mov rax, [rax+rcx*8]
 }
 # address of a target (&x, &s.f, &a[i]) in RAX
 fn (f: *Fn) address(a: *ast.Node, n: *ast.Node) {
@@ -2451,7 +2471,7 @@ fn (f: *Fn) deref(n: *ast.Node) {
     return
   }
   f.nil_check(n, "Nil pointer: it points to nothing")
-  f.a.load(RAX, RAX, 0)
+  f.load_at(n.ty, RAX, RAX)
 }
 fn (f: *Fn) composite(n: *ast.Node) {
   A := f.a
@@ -2486,11 +2506,26 @@ fn (f: *Fn) composite(n: *ast.Node) {
   if ti.k == "slice" || ti.k == "array" {
     cnt := len(n.elems)
     if ti.k == "array" { cnt = ti.n }
-    A.mov_imm(RAX, 8 * cnt + 8)
-    A.push(RAX)
-    f.rt("rt_alloc", 1)
+    be := g.byte_elems(n.type)
+    if be {
+      A.mov_imm(RAX, cnt + 8)
+      A.push(RAX)
+      f.rt("rt_alloc_ns", 1)                       # zeroed: missing elements are false
+    } else {
+      A.mov_imm(RAX, 8 * cnt + 8)
+      A.push(RAX)
+      f.rt("rt_alloc", 1)
+    }
     A.push(RAX)
     for i := 0; i < cnt; i++ {
+      if be {
+        if i < len(n.elems) {
+          f.bind_value(n.elems[i].value, ti.elem)
+          A.load(RCX, RSP, 0)
+          A.rmx(0x88, RAX, RCX, i, 0, 0)           # mov byte [rcx + i], al
+        }
+        continue
+      }
       if i < len(n.elems) {
         f.bind_value(n.elems[i].value, ti.elem)
       } else {
@@ -2546,7 +2581,11 @@ fn (f: *Fn) slice_expr(n: *ast.Node) {
   A.push(RAX)
   if n.hi != nil { f.expr_to(n.hi, "int") } else { A.mov_imm(RAX, -1) }
   A.push(RAX)
-  if k == "str" { f.rt("rt_sub_str", 4) } else if k == "array" { f.rt("rt_sub_array", 5) } else { f.rt("rt_sub_slice", 4) }
+  if k != "str" {
+    A.mov_imm(RAX, elem_size(f.g.byte_elems(ot)))
+    A.push(RAX)
+  }
+  if k == "str" { f.rt("rt_sub_str", 4) } else if k == "array" { f.rt("rt_sub_array", 6) } else { f.rt("rt_sub_slice", 5) }
 }
 
 # ---- calls ----
@@ -2971,16 +3010,17 @@ fn (f: *Fn) builtin(n: *ast.Node) {
       return
     }
     na := len(args) - 1
+    be := types.dflt(ed) == "bool"
     f.expr(args[0])
     A.push(RAX)
-    A.mov_imm(RAX, 8 * na + 8)
+    if be { A.mov_imm(RAX, na + 8) } else { A.mov_imm(RAX, 8 * na + 8) }
     A.push(RAX)
     f.rt("rt_alloc", 1)
     A.push(RAX)
     for i := 1; i < len(args); i++ {
       f.bind_value(args[i], ed)
       A.load(RCX, RSP, 0)
-      A.store(RCX, 8 * (i - 1), RAX)
+      if be { A.rmx(0x88, RAX, RCX, i - 1, 0, 0) } else { A.store(RCX, 8 * (i - 1), RAX) }
     }
     A.mov_imm(RAX, na)
     A.push(RAX)
@@ -3460,7 +3500,7 @@ fn (f: *Fn) store_target(p: *Target, decl: bool, n: *ast.Node) {
     return
   }
   f.load_slot_r(p.addr, RCX)
-  A.store(RCX, 0, RAX)
+  f.store_at(t.ty, RCX, RAX)
 }
 # call with multiple results: the 1st comes in RAX, the others in g.ret; all go to hidden slots
 fn (f: *Fn) unpack_call(v: *ast.Node) -> []*Var {
@@ -3545,13 +3585,13 @@ fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) 
     # the index operands are evaluated before the value, as in multi
     f.elem_addr(t, true)
     if v.ty == t.ty && f.simple_to(v, RCX) {
-      A.store(RAX, 0, RCX)
+      f.store_at(t.ty, RAX, RCX)
       return true
     }
     A.push(RAX)
     f.bind_value(v, t.ty)
     A.pop(RCX)
-    A.store(RCX, 0, RAX)
+    f.store_at(t.ty, RCX, RAX)
     return true
   }
   return false
@@ -3748,7 +3788,7 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
   g := f.g
   tg := n.target
   if tg.kind != "Index" || g.kind_of_t(types.dflt(tg.obj.ty)) == "map" || types.dflt(tg.obj.ty) == "str" { return false }
-  if g.is_value_type(tg.ty) || g.is_iface_t(tg.ty) || g.is_iface_t(n.value.ty) { return false }
+  if g.is_value_type(tg.ty) || g.is_iface_t(tg.ty) || g.is_iface_t(n.value.ty) || types.dflt(tg.ty) == "bool" { return false }
   if n.ik != ast.NONE && n.op != "**" && g.cls(tg.ty, n) == "i" {
     f.elem_addr(tg, true)
     A.push(RAX)                                   # the element's address
@@ -3865,7 +3905,7 @@ fn (f: *Fn) stmt(n: *ast.Node) {
       A.bind(got)
     } else {
       f.load_slot(p.addr)
-      A.load(RAX, RAX, 0)
+      f.load_at(tg.ty, RAX, RAX)
     }
     f.store_slot(cur)
     f.tmp_load = cur
@@ -4340,7 +4380,7 @@ fn (f: *Fn) range_(n: *ast.Node) {
       if rk == "int" { nfail("range over a number only has an index", n) }
       if rk == "slice" { f.load_slot(rdata) } else { f.load_slot(obj) }
       f.load_slot_r(i, RCX)
-      A.byte4(0x48, 0x8B, 0x04, 0xC8)             # mov rax, [rax + rcx*8]
+      if g.byte_elems(st) { A.byte4(0x0F, 0xB6, 0x04, 0x08) } else { A.byte4(0x48, 0x8B, 0x04, 0xC8) }   # movzx eax, byte [rax+rcx] / mov rax, [rax+rcx*8]
       if g.is_value_type(vv.ty) {
         A.push(RAX)
         f.push_desc(vv.ty, n)
