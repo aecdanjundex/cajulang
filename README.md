@@ -69,3 +69,7 @@ describe("strings.split", fn() {
 - `docs/arquitetura-nativo.md`: como o compilador nativo funciona por dentro.
 - `docs/plano-compilador-nativo.md`: o plano das fases.
 - `docs/historico.md`: o que foi feito até aqui e por quê.
+
+## Licença
+
+MIT (ver `LICENSE`).
