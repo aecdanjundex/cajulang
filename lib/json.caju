@@ -557,6 +557,11 @@ struct Plan {
   emb: []bool
   fast_dec: bool       # the direct decoder handles it (no embedded fields, ASCII names that
                        # differ also without regard to case, at most 62 fields)
+  flat: bool           # only str, int and bool fields, none embedded (Enc.flat writes it)
+  kinds: []int         # the kind of each field
+  kbytes: int          # bytes of {, the keys with their commas and }
+  vkinds: []int        # for the decoder: 5 str, 1 int or int64, 4 bool, 0 anything else
+  prog: int            # flat plans: [name bytes, name length, vkind] per field, for vflat
 }
 
 let plans = map[int]*Plan{}
@@ -577,7 +582,7 @@ fn plan_of(d: int) -> *Plan {
     return pl
   }
   n := dcount(d)
-  pl := &Plan{n: n, names: []str{}, keys: []str{}, ckeys: []str{}, qnames: []str{}, descs: []int{}, emb: []bool{}, fast_dec: n <= 62}
+  pl := &Plan{n: n, names: []str{}, keys: []str{}, ckeys: []str{}, qnames: []str{}, descs: []int{}, emb: []bool{}, fast_dec: n <= 62, flat: n > 0, kinds: []int{}, kbytes: 2, vkinds: []int{}}
   lows := map[str]bool{}
   for i := 0; i < n; i++ {
     nm := field_name(d, i)
@@ -589,9 +594,28 @@ fn plan_of(d: int) -> *Plan {
     pl.descs = append(pl.descs, field_desc(d, i))
     em := embedded(d, i)
     pl.emb = append(pl.emb, em)
+    fk := dkind(field_desc(d, i))
+    pl.kinds = append(pl.kinds, fk)
+    if em || (fk != 1 && fk != 4 && fk != 5) { pl.flat = false }
+    if i == 0 { pl.kbytes += len(q) + 1 } else { pl.kbytes += len(q) + 2 }
+    vk := 0
+    if fk == 5 || fk == 4 { vk = fk }
+    if fk == 1 {
+      _, _, ranged := int_range_of(field_desc(d, i))
+      if !ranged { vk = 1 }
+    }
+    pl.vkinds = append(pl.vkinds, vk)
     low := strings.to_lower(nm)
     if em || !ascii(nm) || lows[low] { pl.fast_dec = false }
     lows[low] = true
+  }
+  if pl.flat {
+    pl.prog = __alloc(24 * n)
+    for i := 0; i < n; i++ {
+      __store64(pl.prog + 24 * i, __strp(pl.names[i]) + 8)
+      __store64(pl.prog + 24 * i + 8, len(pl.names[i]))
+      __store64(pl.prog + 24 * i + 16, pl.vkinds[i])
+    }
   }
   plans[d] = pl
   plan_last_d = d
@@ -736,6 +760,133 @@ fn (e: *Enc) put_run(s: str, a: int, b: int, high: bool) {
   if e.n + b - a > e.cap { e.grow(b - a) }
   copy_mem(e.mem + 8 + e.n, __strp(s) + 8 + a, b - a)
   e.n += b - a
+}
+
+# ---- leaf writers for the flat-struct path: they take and return the write position and call
+# nothing, so all their variables live in registers
+
+# n bytes from p to o; returns o + n
+fn wcopy(o0: int, p0: int, n: int) -> int {
+  o := o0
+  p := p0
+  e := o0 + n
+  while o + 8 <= e {
+    __store64(o, __load64(p))
+    o += 8
+    p += 8
+  }
+  while o < e {
+    __store8(o, __load8(p))
+    o++
+    p++
+  }
+  return e
+}
+
+# the string block s between quotes at o; returns the new position, or 0 when s has a byte that
+# needs an escape or is not ASCII (the caller then takes the general path). 8 bytes at a time:
+# a byte is bad when it has the high bit, is below 0x20, or equals 0x22 or 0x5c.
+fn wquote(o0: int, s: int) -> int {
+  o := o0
+  __store8(o, 34)
+  o++
+  if s == 0 {
+    __store8(o, 34)
+    return o + 1
+  }
+  p := s + 8
+  e := p + __load64(s)
+  lo := (16843009 << 32) | 16843009
+  while p + 8 <= e {
+    x := __load64(p)
+    q := x ^ (lo * 34)
+    b := x ^ (lo * 92)
+    bad := (x | ((x - (lo << 5)) & (x ^ -1)) | ((q - lo) & (q ^ -1)) | ((b - lo) & (b ^ -1))) & (lo << 7)
+    if bad != 0 { return 0 }
+    __store64(o, x)
+    o += 8
+    p += 8
+  }
+  while p < e {
+    c := __load8(p)
+    if c < 32 || c == 34 || c == 92 || c >= 128 { return 0 }
+    __store8(o, c)
+    o++
+    p++
+  }
+  __store8(o, 34)
+  return o + 1
+}
+
+# the decimal digits of x at o; returns the new position
+fn wint(o0: int, x0: int) -> int {
+  o := o0
+  x := x0
+  if x < 0 {
+    if x == (1 << 63) { return 0 }
+    __store8(o, 45)
+    o++
+    x = -x
+  }
+  nd := 1
+  t := x
+  while t >= 10 {
+    nd++
+    t = t / 10
+  }
+  q := o + nd - 1
+  while x >= 10 {
+    __store8(q, 48 + x % 10)
+    x = x / 10
+    q--
+  }
+  __store8(q, 48 + x)
+  return o + nd
+}
+
+# a struct with only str, int and bool fields, compact: room for the whole object is reserved
+# once, then the leaf writers fill it
+fn (e: *Enc) flat(w: int, pl: *Plan) {
+  n := pl.n
+  bound := pl.kbytes
+  for i := 0; i < n; i++ {
+    k := pl.kinds[i]
+    if k == 5 {
+      fw := __load64(w + 8 * i)
+      if fw != 0 { bound += 6 * __load64(fw) + 2 } else { bound += 2 }
+    } else { bound += 21 }
+  }
+  if e.n + bound > e.cap { e.grow(bound) }
+  base := e.mem + 8
+  o := base + e.n
+  __store8(o, 123)
+  o++
+  for i := 0; i < n; i++ {
+    key := pl.ckeys[i]
+    if i == 0 { key = pl.keys[i] }
+    o = wcopy(o, __strp(key) + 8, len(key))
+    fw := __load64(w + 8 * i)
+    k := pl.kinds[i]
+    if k == 5 {
+      q := wquote(o, fw)
+      if q == 0 {
+        e.n = o - base
+        e.put_quoted(__pstr(fw))
+        o = base + e.n
+      } else { o = q }
+    } else if k == 1 {
+      q := wint(o, fw)
+      if q == 0 {
+        e.n = o - base
+        e.put_int(fw)
+        o = base + e.n
+      } else { o = q }
+    } else if fw != 0 {
+      o = wcopy(o, __strp("true") + 8, 4)
+    } else { o = wcopy(o, __strp("false") + 8, 5) }
+  }
+  __store8(o, 125)
+  e.n = o + 1 - base
 }
 
 fn (e: *Enc) put_quoted(s: str) {
@@ -909,6 +1060,18 @@ fn (e: *Enc) word(w: int, d: int, depth: int) {
   case 7:
     e.list(w, dcount(d), delem(d), depth)
   case 8:
+    if !e.pretty {
+      pl := e.last_plan
+      if d != e.last_d {
+        pl = plan_of(d)
+        e.last_d = d
+        e.last_plan = pl
+      }
+      if pl.flat {
+        e.flat(w, pl)
+        return
+      }
+    }
     e.put_byte(123)
     if !e.fields(w, d, depth, true) { e.newline(depth) }
     e.put_byte(125)
@@ -1009,6 +1172,17 @@ fn (e: *Enc) fields(w: int, d: int, depth: int, first0: bool) -> bool {
 
 fn (e: *Enc) list(data: int, n: int, ed: int, depth: int) {
   e.put_byte(91)
+  if !e.pretty && dkind(ed) == 8 && depth < MAX_DEPTH {
+    pl := plan_of(ed)
+    if pl.flat {
+      for i := 0; i < n; i++ {
+        if i > 0 { e.put_byte(44) }
+        e.flat(__load64(data + 8 * i), pl)
+      }
+      e.put_byte(93)
+      return
+    }
+  }
   for i := 0; i < n; i++ {
     if i > 0 { e.put_byte(44) }
     if e.pretty { e.newline(depth + 1) }
@@ -1177,6 +1351,8 @@ export fn unmarshal(text: str, v: any) -> error {
       w := f.word(ed, __load64(p))
       if !f.bad { __store64(p, w) }
     }
+    if len(vs.keys) <= 65536 { spare_keys = vs.keys }
+    if len(vs.arrs) <= 65536 { spare_arrs = vs.arrs }
     if !f.bad { return nil }
   }
   tree, err := parse(text)
@@ -1426,8 +1602,14 @@ fn vscan(text: str) -> *VScan {
 # like vscan, and also: every value decodes into its place by type d the way the tree decoder
 # would, with nothing the direct decoder leaves to it (type mismatches, numbers out of range,
 # escaped keys, repeated fields, embedded structs...); nil when not
+# key and list tables kept between unmarshal calls (taken while a decoder uses them)
+let spare_keys: []int = nil
+let spare_arrs: []int = nil
+
 fn vtyped(text: str, d: int) -> *VScan {
-  v := &VScan{s: text, p: __strp(text) + 8, n: len(text), i: 0}
+  v := &VScan{s: text, p: __strp(text) + 8, n: len(text), i: 0, keys: spare_keys, arrs: spare_arrs}
+  spare_keys = nil
+  spare_arrs = nil
   v.ws()
   if !v.typed(d, 0) { return nil }
   v.ws()
@@ -1443,6 +1625,8 @@ struct VScan {
   arrs: []int          # [offset, count] of each list, in the order they start
   na: int              # used part of arrs
   keys: []int          # [field or -1, offset of the value] of each key of a struct object
+  kdata: int           # the data block of keys while its length is klen (for vflat)
+  klen: int
   nk: int              # used part of keys
   rd: int              # the integer type whose range is in rlo, rhi, rok
   rlo: int
@@ -1684,6 +1868,211 @@ fn (v: *VScan) typed(d: int, depth: int) -> bool {
 }
 
 # an object for a struct of type d: the same key matching as Fast.object
+# ---- leaf scanners for the decoders (no calls: their variables live in registers)
+
+# the index of the first byte from i that is ", \\, a control byte or not ASCII (n if none);
+# 8 bytes at a time while they all are plain
+fn plain_end(p: int, i0: int, n: int) -> int {
+  i := i0
+  lo := (16843009 << 32) | 16843009
+  while i + 8 <= n {
+    x := __load64(p + i)
+    q := x ^ (lo * 34)
+    b := x ^ (lo * 92)
+    bad := (x | ((x - (lo << 5)) & (x ^ -1)) | ((q - lo) & (q ^ -1)) | ((b - lo) & (b ^ -1))) & (lo << 7)
+    if bad != 0 { break }
+    i += 8
+  }
+  while i < n {
+    c := __load8(p + i)
+    if c < 32 || c == 34 || c == 92 || c >= 128 { return i }
+    i++
+  }
+  return n
+}
+
+# the end of a plain integer (-?digits, at most 18, no leading zero, not followed by . e E) at
+# i, or -1 for anything else (the general path decides)
+fn int_end(p: int, i0: int, n: int) -> int {
+  j := i0
+  if j < n && __load8(p + j) == 45 { j++ }
+  if j >= n { return -1 }
+  c := __load8(p + j)
+  if c == 48 {
+    j++
+    if j < n {
+      c2 := __load8(p + j)
+      if c2 >= 48 && c2 <= 57 { return -1 }
+    }
+  } else {
+    if c < 49 || c > 57 { return -1 }
+    st := j
+    while j < n {
+      c2 := __load8(p + j)
+      if c2 < 48 || c2 > 57 { break }
+      j++
+    }
+    if j - st > 18 { return -1 }
+  }
+  if j < n {
+    c3 := __load8(p + j)
+    if c3 == 46 || c3 == 101 || c3 == 69 { return -1 }
+  }
+  return j
+}
+
+# the value of a plain integer that int_end accepted at i
+fn int_at(p: int, i0: int) -> int {
+  j := i0
+  neg := false
+  if __load8(p + j) == 45 {
+    neg = true
+    j++
+  }
+  x := 0
+  while true {
+    c := __load8(p + j)
+    if c < 48 || c > 57 { break }
+    x = x * 10 + c - 48
+    j++
+  }
+  if neg { return -x }
+  return x
+}
+
+# the end of true or false at i (the byte decides which), or -1
+fn bool_end(p: int, i: int, n: int) -> int {
+  c := __load8(p + i)
+  if c == 116 && i + 4 <= n && __load8(p + i + 1) == 114 && __load8(p + i + 2) == 117 && __load8(p + i + 3) == 101 { return i + 4 }
+  if c == 102 && i + 5 <= n && __load8(p + i + 1) == 97 && __load8(p + i + 2) == 108 && __load8(p + i + 3) == 115 && __load8(p + i + 4) == 101 { return i + 5 }
+  return -1
+}
+
+# the object of a flat struct at i0 (its "{"), in one leaf pass: keys must match field names
+# exactly and each once, values must be plain (strings without escapes or non-ASCII bytes,
+# integers int_end accepts, true or false). Writes the [field, value offset] pairs at kout (room
+# for nf pairs) and returns the index after the object, with the number of pairs in vflat_pairs;
+# -1 leaves the object to the general path.
+let vflat_pairs: int = 0
+fn vflat(p: int, i0: int, n: int, prog: int, nf: int, kout: int) -> int {
+  i := i0 + 1
+  ko := kout
+  seen := 0
+  hint := 0
+  lo := (16843009 << 32) | 16843009
+  while true {
+    c := __load8(p + i)
+    while c == 32 || c == 10 || c == 13 || c == 9 {
+      i++
+      c = __load8(p + i)
+    }
+    if c != 34 { return -1 }
+    a := i + 1
+    j := a
+    while true {
+      b := __load8(p + j)
+      if b == 34 { break }
+      if b == 92 || b >= 128 || b < 32 { return -1 }
+      j++
+    }
+    m := j - a
+    fi := -1
+    k := hint
+    tries := 0
+    while tries < nf {
+      if k >= nf { k = 0 }
+      e := prog + 24 * k
+      if __load64(e + 8) == m {
+        q := __load64(e)
+        t := 0
+        while t < m && __load8(q + t) == __load8(p + a + t) { t++ }
+        if t == m {
+          fi = k
+          break
+        }
+      }
+      k++
+      tries++
+    }
+    if fi < 0 { return -1 }
+    bit := 1 << fi
+    if (seen & bit) != 0 { return -1 }
+    seen = seen | bit
+    hint = fi + 1
+    i = j + 1
+    c = __load8(p + i)
+    while c == 32 || c == 10 || c == 13 || c == 9 {
+      i++
+      c = __load8(p + i)
+    }
+    if c != 58 { return -1 }
+    i++
+    c = __load8(p + i)
+    while c == 32 || c == 10 || c == 13 || c == 9 {
+      i++
+      c = __load8(p + i)
+    }
+    __store64(ko, fi)
+    __store64(ko + 8, i)
+    ko += 16
+    vk := __load64(prog + 24 * fi + 16)
+    if vk == 5 {
+      if c != 34 { return -1 }
+      i++
+      while i + 8 <= n {
+        x := __load64(p + i)
+        qx := x ^ (lo * 34)
+        bx := x ^ (lo * 92)
+        bad := (x | ((x - (lo << 5)) & (x ^ -1)) | ((qx - lo) & (qx ^ -1)) | ((bx - lo) & (bx ^ -1))) & (lo << 7)
+        if bad != 0 { break }
+        i += 8
+      }
+      while true {
+        b := __load8(p + i)
+        if b == 34 { break }
+        if b == 92 || b >= 128 || b < 32 { return -1 }
+        i++
+      }
+      i++
+    } else if vk == 1 {
+      if c == 45 { i++ }
+      c = __load8(p + i)
+      if c == 48 {
+        i++
+        c = __load8(p + i)
+        if c >= 48 && c <= 57 { return -1 }
+      } else {
+        if c < 49 || c > 57 { return -1 }
+        st := i
+        while c >= 48 && c <= 57 {
+          i++
+          c = __load8(p + i)
+        }
+        if i - st > 18 { return -1 }
+      }
+      if c == 46 || c == 101 || c == 69 { return -1 }
+    } else if vk == 4 {
+      if c == 116 && i + 4 <= n && __load8(p + i + 1) == 114 && __load8(p + i + 2) == 117 && __load8(p + i + 3) == 101 {
+        i += 4
+      } else if c == 102 && i + 5 <= n && __load8(p + i + 1) == 97 && __load8(p + i + 2) == 108 && __load8(p + i + 3) == 115 && __load8(p + i + 4) == 101 {
+        i += 5
+      } else { return -1 }
+    } else { return -1 }
+    c = __load8(p + i)
+    while c == 32 || c == 10 || c == 13 || c == 9 {
+      i++
+      c = __load8(p + i)
+    }
+    i++
+    if c == 125 {
+      vflat_pairs = (ko - kout) / 16
+      return i
+    }
+    if c != 44 { return -1 }
+  }
+  return -1
+}
+
 fn (v: *VScan) object(d: int, depth: int) -> bool {
   pl := v.last_plan
   if d != v.last_d {
@@ -1693,6 +2082,24 @@ fn (v: *VScan) object(d: int, depth: int) -> bool {
   }
   if !pl.fast_dec { return false }
   p := v.p
+  if pl.flat {
+    nk0 := v.nk
+    if nk0 + 2 * pl.n > len(v.keys) {
+      bigger := make([]int, 2 * len(v.keys) + 2 * pl.n + 16)
+      copy(bigger, v.keys)
+      v.keys = bigger
+    }
+    if v.klen != len(v.keys) {
+      v.kdata = __load64(__load64(__anyp(v.keys) + 8))
+      v.klen = len(v.keys)
+    }
+    r := vflat(p, v.i, v.n, pl.prog, pl.n, v.kdata + 8 * nk0)
+    if r >= 0 {
+      v.i = r
+      v.nk = nk0 + 2 * vflat_pairs
+      return true
+    }
+  }
   v.i++
   v.skip_ws()
   if __load8(p + v.i) == 125 {
@@ -1769,8 +2176,19 @@ fn (v: *VScan) object(d: int, depth: int) -> bool {
     v.nk = nk + 2
     if take {
       hint = fi + 1
-      fd := pl.descs[fi]
-      if !v.typed(fd, depth + 1) { return false }
+      vk := pl.vkinds[fi]
+      e2 := -1
+      if vk == 5 {
+        if __load8(p + i) == 34 {
+          j2 := plain_end(p, i + 1, v.n)
+          if __load8(p + j2) == 34 { e2 = j2 + 1 }
+        }
+      } else if vk == 1 {
+        e2 = int_end(p, i, v.n)
+      } else if vk == 4 { e2 = bool_end(p, i, v.n) }
+      if e2 >= 0 {
+        v.i = e2
+      } else if !v.typed(pl.descs[fi], depth + 1) { return false }
       if v.last_d != d {
         v.last_d = d
         v.last_plan = pl
@@ -1962,7 +2380,7 @@ fn (f: *Fast) tree() -> *Value {
 fn (f: *Fast) str_word() -> int {
   p := f.p
   a := f.i + 1
-  j := a
+  j := plain_end(p, a, f.n)
   while true {
     c := __load8(p + j)
     if c == 34 { break }

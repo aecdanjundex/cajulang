@@ -71,3 +71,39 @@ inteiro, número quebrado, lista de textos, um User, 20 Users e um map[str]int.
 O resto é principalmente o código gerado (cada acesso a campo passa pela memória com teste de
 nil, chamadas pequenas não são expandidas no lugar): ver `tools/disasm.sh`. `parse` em árvore
 paga uma alocação por valor e um mapa por objeto, inerente ao formato `json.Value`.
+
+## Rodada 2: funções-folha e tabelas reaproveitadas (2026-11-11)
+
+Ponto de partida já inclui a rodada 26 de alocação (OPTIMIZATION.md), que baixou tudo um pouco.
+Melhor de 5 rodadas, ns por operação:
+
+| caso | Caju antes | Caju depois | Go | Caju ÷ Go |
+|---|--:|--:|--:|--:|
+| marshal de []User com 50 itens | 11.672 | **7.859** | 10.701 | 0,73 |
+| marshal de map[str]any pequeno | 549 | **549** | 896 | 0,61 |
+| unmarshal de um User | 648 | **473** | 490 | 0,97 |
+| unmarshal de []User com 50 itens | 27.301 | **18.653** | 22.320 | 0,84 |
+| parse de um documento médio | 31.579 | **31.613** | 34.197 | 0,92 |
+| unmarshal do documento médio | 14.278 | **10.498** | 11.685 | 0,90 |
+| marshal do documento médio | 6.348 | **4.801** | 5.757 | 0,83 |
+
+No servidor HTTP (bench/http, 1 CPU, `split.sh`), `GET /users` (50 itens): CPU de usuário por
+requisição 20,1 → 15,2 µs, 34,1 → 37,2–38,9 mil req/s; `POST /users`: 7,2 → 5,4 µs.
+
+Hipóteses:
+
+| | ideia | resultado |
+|---|---|---|
+| J1 | structs "planas" (só str, int e bool, sem embutidos) no marshal compacto: espaço do objeto inteiro reservado uma vez, escrita por funções-folha (`wcopy`, `wquote` com 8 bytes por vez/SWAR, `wint`) sem chamadas, logo com as variáveis em registradores (`Enc.flat`); a lista de structs planas chama `flat` direto | aceita: 11.672 → 7.859 |
+| J2a | conferência (VScan) dos valores de campos str/int/bool por funções-folha (`plain_end` SWAR, `int_end`, `bool_end`) no lugar de `typed()` | aceita: 27,3 → 24,2 mil |
+| J2b | o mesmo no lado que escreve (Fast: `int_at`, bool direto) | rejeitada (empate); fica só `plain_end` no `str_word` |
+| J2c | objeto de struct plana validado inteiro numa função-folha (`vflat`): chaves exatas pela dica e depois pela lista, cada campo uma vez, valores simples; grava os pares [campo, posição] direto no bloco de `keys`; qualquer outra coisa (null, chave desconhecida ou com outra caixa, escape, número que não é inteiro simples) volta ao caminho geral | aceita: 24,2 → 21,7 mil |
+| J2d | tabelas `keys` e `arrs` do VScan reaproveitadas entre chamadas (`spare_keys`, `spare_arrs`) | aceita: 21,7 → 18,7 mil; um User: 540 → 473 |
+| J3 | mudanças no gerador (expandir funções pequenas, menos testes de nil) | não feita: as funções-folha na biblioteca já passaram o Go sem mexer no compilador |
+| J4 | árvore do parse com menos alocações | não feita: o parse já está abaixo do Go (31,6 contra 34,2 mil) |
+
+Conferência: os 42 testes de lib/json_test.caju (5 novos para os caminhos planos) passam também
+com a biblioteca antiga; um teste diferencial de 26 mil linhas (structs planas aleatórias com
+escapes e UTF-8, 20 mil objetos JSON aleatórios com espaços, chaves fora de ordem, desconhecidas,
+com outra caixa, null, números inválidos e erros) sai idêntico ao da biblioteca antiga, também com
+coleta a cada 64 KB.
