@@ -26,8 +26,10 @@ tests/lang/          testes da linguagem (*_test.caju + testdata/)
 examples/            exemplos da linguagem; examples_test.caju roda cada um e confere a saída
 bench/               programs/*.caju + run.js; history.jsonl guarda a evolução da velocidade
 tools/compare-compilers.sh   JS × compilador em Caju: binários idênticos em todos os programas
+tools/release.sh     monta dist/caju-linux-x86_64.tar.gz (docs/releasing.md); install.sh na raiz instala
+.github/workflows/   ci.yml (cadeia + suíte a cada push) e release.yml (tag v* → GitHub Release)
 docs/                packages.md, testing.md, compiler-port.md, arquitetura-nativo.md, plano, histórico
-build/               gerado (não versionar)
+build/, dist/        gerados (não versionar)
 ```
 
 ## Como trabalhar

@@ -2,3 +2,4 @@ build/
 /caju-bin
 *.tmp
 /hello-server
+/dist/

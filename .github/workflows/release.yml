@@ -1,0 +1,33 @@
+name: Release
+
+# Push a tag to publish a release:  git tag v0.1.0 && git push origin v0.1.0
+# The tag must match VERSION in compiler/pkg.caju.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Bootstrap and package
+        run: TAG=${{ github.ref_name }} tools/release.sh
+      - name: Test suite
+        run: CAJU_ROOT=$PWD build/release/caju test
+      - name: Test the installer with the package
+        run: |
+          CAJU_PACKAGE=dist/caju-linux-x86_64.tar.gz CAJU_HOME=$RUNNER_TEMP/caju CAJU_BIN_DIR=$RUNNER_TEMP/bin sh install.sh
+          $RUNNER_TEMP/bin/caju run $RUNNER_TEMP/caju/examples/hello-world.caju
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/caju-linux-x86_64.tar.gz dist/caju-linux-x86_64.tar.gz.sha256 \
+            --title "Caju ${{ github.ref_name }}" --generate-notes

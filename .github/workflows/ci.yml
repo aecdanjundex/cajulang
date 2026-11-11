@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Bootstrap (JS -> stage 1 -> 2 -> 3, stage 2 == stage 3) and package
+        run: tools/release.sh
+      - name: Test suite
+        run: CAJU_ROOT=$PWD build/release/caju test

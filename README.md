@@ -12,7 +12,28 @@ fn greet(name: str) -> str {
 print(greet("world"))
 ```
 
-## Começando
+## Instalação
+
+Linux x86-64 (no Windows, use o WSL; o `caju` do Linux também gera `.exe` com `--target windows`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/master/install.sh | sh
+```
+
+O instalador baixa a última release, confere o SHA-256, instala em `~/.caju` e cria o comando
+`~/.local/bin/caju`. Variáveis: `CAJU_VERSION=0.1.0` (uma versão específica), `CAJU_HOME`,
+`CAJU_BIN_DIR`. Para instalar à mão, baixe `caju-linux-x86_64.tar.gz` em
+[Releases](https://github.com/aecdanjundex/caju/releases), extraia e ponha `caju-<versão>/bin` no
+`PATH`. Para desinstalar: `rm -rf ~/.caju ~/.local/bin/caju`.
+
+```sh
+caju run programa.caju              # compila em memória e roda
+caju build -o programa programa.caju
+caju test                           # roda os *_test.caju do diretório
+caju version
+```
+
+## Compilando do código-fonte
 
 Precisa de Node 22+ só para o primeiro estágio (o compilador original em JavaScript):
 
@@ -38,6 +59,8 @@ describe("strings.split", fn() {
 ```
 
 ## Documentos
+
+- `docs/releasing.md`: como publicar uma versão nova.
 
 - `CLAUDE.md`: mapa do projeto, como trabalhar, estado e cuidados.
 - `docs/packages.md`: o gerenciador de pacotes (caju.toml, caju.lock, hashes).
