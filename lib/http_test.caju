@@ -28,7 +28,9 @@ fn start(env: str) {
   p, err := os.run([]str{"sh", "-c", "PORT=" + str(port) + " " + env + " " + bin() + " >/dev/null 2>&1 & echo $!"}, nil, false)
   if err != nil { panic(err.Error()) }
   server_pid = strings.trim_space(p.output)
-  for i := 0; i < 100000; i++ {
+  # wait by time, not by attempts: under load the server can take a while to start
+  deadline := os.nanotime() + 20000000000
+  while os.nanotime() < deadline {
     c, err2 := net.dial("127.0.0.1", port)
     if err2 == nil {
       c.close()
