@@ -1,0 +1,102 @@
+# Microbenchmark of std/json: ns per operation for each case (see RESULTS.md, bench.go).
+#   caju run bench/json/bench.caju [scale]
+import "std/json"
+import "std/os"
+import "std/strconv"
+
+struct User {
+  id: int
+  name: str
+  email: str
+  active: bool
+}
+
+struct Doc {
+  title: str
+  version: int
+  score: num
+  tags: []str
+  owner: User
+  users: []User
+  meta: map[str]int
+}
+
+let sink: int = 0
+
+fn report(name: str, n: int, t0: int) {
+  ns := (os.nanotime() - t0) / n
+  print(name + " " + str(ns))
+}
+
+scale := 1
+if len(os.args()) > 1 {
+  x, _ := strconv.atoi(os.args()[1])
+  scale = x
+}
+
+users := []User{}
+for i := 0; i < 50; i++ { users = append(users, User{id: i, name: "user " + str(i), email: "u" + str(i) + "@x.com", active: i % 2 == 0}) }
+users_json, _ := json.marshal(users)
+one_json := "{\"id\":5,\"name\":\"Ana\",\"email\":\"ana@x.com\",\"active\":true}"
+doc := Doc{title: "report \"q3\"", version: 7, score: 98.5, tags: []str{"a", "b", "c"}, owner: users[1], users: users[0:20], meta: map[str]int{"x": 1, "y": 2, "z": 3}}
+doc_json, _ := json.marshal(doc)
+
+n := 20000 * scale
+t0 := os.nanotime()
+for i := 0; i < n; i++ {
+  s, _ := json.marshal(users)
+  sink += len(s)
+}
+report("marshal_users50", n, t0)
+
+n = 500000 * scale
+t0 = os.nanotime()
+for i := 0; i < n; i++ {
+  s, _ := json.marshal(map[str]any{"id": "7", "name": "user"})
+  sink += len(s)
+}
+report("marshal_map_small", n, t0)
+
+n = 500000 * scale
+t0 = os.nanotime()
+for i := 0; i < n; i++ {
+  let u: User
+  json.unmarshal(one_json, &u)
+  sink += u.id
+}
+report("unmarshal_user", n, t0)
+
+n = 20000 * scale
+t0 = os.nanotime()
+for i := 0; i < n; i++ {
+  let us: []User
+  json.unmarshal(users_json, &us)
+  sink += len(us)
+}
+report("unmarshal_users50", n, t0)
+
+n = 20000 * scale
+t0 = os.nanotime()
+for i := 0; i < n; i++ {
+  v, _ := json.parse(doc_json)
+  sink += len(v.keys)
+}
+report("parse_doc", n, t0)
+
+n = 20000 * scale
+t0 = os.nanotime()
+for i := 0; i < n; i++ {
+  let d: Doc
+  json.unmarshal(doc_json, &d)
+  sink += d.version
+}
+report("unmarshal_doc", n, t0)
+
+n = 20000 * scale
+t0 = os.nanotime()
+for i := 0; i < n; i++ {
+  s, _ := json.marshal(doc)
+  sink += len(s)
+}
+report("marshal_doc", n, t0)
+if sink == 1 { print("") }

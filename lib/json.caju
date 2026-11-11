@@ -26,6 +26,10 @@
 #
 # The reflection works on the runtime's type descriptors (see rt/values.caju): [0] kind, [8] count,
 # [16] element, [24] key, [32] name, [40] fields (name, descriptor, value?) and [48] integer kind.
+# Speed (bench/json/RESULTS.md): marshal keeps a plan per struct type and its own byte buffer;
+# unmarshal checks the text against the target type first (vtyped) and then decodes it straight
+# into memory (Fast), falling back to the tree (parse + Dec) for anything vtyped refuses, so the
+# errors and the values stay the same as through the tree.
 
 import "std/strings"
 import "std/strconv"
@@ -127,9 +131,9 @@ export fn (v: *Value) to_any() -> any {
 }
 # the value as JSON text
 export fn (v: *Value) string() -> str {
-  e := &Enc{indent: "", err: ""}
+  e := new_enc("")
   e.tree(v, 0)
-  return e.b.string()
+  return e.result()
 }
 
 # ---------------------------------------------------------------- parsing
@@ -147,22 +151,19 @@ export fn parse(text: str) -> (*Value, error) {
   p := &Parser{s: text, i: 0, depth: 0, err: ""}
   p.space()
   v := p.value()
-  if p.err == "" {
+  if len(p.err) == 0 {
     p.space()
     if p.i < len(p.s) { p.fail("invalid character " + p.show() + " after the value") }
   }
-  if p.err != "" { return nil, errors.New(p.err) }
+  if len(p.err) != 0 { return nil, errors.New(p.err) }
   return v, nil
 }
 
-export fn valid(text: str) -> bool {
-  _, err := parse(text)
-  return err == nil
-}
+export fn valid(text: str) -> bool { return vscan(text) != nil }
 
 # records the first error, with the line and column of the current position
 fn (p: *Parser) fail(msg: str) {
-  if p.err != "" { return }
+  if len(p.err) != 0 { return }
   line := 1
   col := 1
   for k := 0; k < p.i && k < len(p.s); k++ {
@@ -217,11 +218,12 @@ fn (p: *Parser) value() -> *Value {
 }
 
 fn (p: *Parser) word(w: str) -> bool {
-  if strings.has_prefix(p.s[p.i:], w) {
-    p.i += len(w)
-    return true
-  }
-  return false
+  m := len(w)
+  if p.i + m > len(p.s) { return false }
+  q := __strp(p.s) + 8 + p.i
+  for k := 0; k < m; k++ { if __load8(q + k) != int(w[k]) { return false } }
+  p.i += m
+  return true
 }
 
 fn (p: *Parser) object() -> *Value {
@@ -238,7 +240,7 @@ fn (p: *Parser) object() -> *Value {
     p.depth--
     return v
   }
-  while p.err == "" {
+  while len(p.err) == 0 {
     p.space()
     if p.i >= len(p.s) || p.s[p.i] != 34 {
       p.fail("invalid character " + p.show() + " looking for the beginning of an object key")
@@ -253,7 +255,7 @@ fn (p: *Parser) object() -> *Value {
     p.i++
     p.space()
     x := p.value()
-    if p.err != "" { return nil }
+    if len(p.err) != 0 { return nil }
     if _, seen := v.fields[k]; !seen { v.keys = append(v.keys, k) }
     v.fields[k] = x
     p.space()
@@ -285,10 +287,10 @@ fn (p: *Parser) array() -> *Value {
     p.depth--
     return v
   }
-  while p.err == "" {
+  while len(p.err) == 0 {
     p.space()
     x := p.value()
-    if p.err != "" { return nil }
+    if len(p.err) != 0 { return nil }
     v.items = append(v.items, x)
     p.space()
     if p.i < len(p.s) && p.s[p.i] == 44 {
@@ -351,7 +353,7 @@ fn (p: *Parser) number() -> *Value {
     while i < n && is_digit(int(s[i])) { i++ }
   }
   p.i = i
-  text := s[start:i]
+  text := sub_ascii(s, start, i)
   v := &Value{kind: "number", s: text}
   if integral {
     k, err := strconv.parse_int(text, 10)
@@ -400,14 +402,18 @@ fn (p: *Parser) string() -> str {
   start := p.i
   # fast path: no escapes
   i := p.i
+  high := false
+  q := __strp(s) + 8
   while i < n {
-    ch := s[i]
+    ch := __load8(q + i)
     if ch == 34 || ch == 92 || ch < 32 { break }
+    if ch >= 128 { high = true }
     i++
   }
-  if i < n && s[i] == 34 {
+  if i < n && __load8(q + i) == 34 {
     p.i = i + 1
-    return s[start:i]
+    if high { return s[start:i] }
+    return sub_ascii(s, start, i)
   }
   b := &strings.Builder{}
   b.write(s[start:i])
@@ -479,42 +485,37 @@ fn (p: *Parser) string() -> str {
   return ""
 }
 
+# ---------------------------------------------------------------- memory helpers
+
+# copies n bytes from src to dst, 8 at a time
+fn copy_mem(dst: int, src: int, n: int) {
+  i := 0
+  while i + 8 <= n {
+    __store64(dst + i, __load64(src + i))
+    i += 8
+  }
+  while i < n {
+    __store8(dst + i, __load8(src + i))
+    i++
+  }
+}
+
+# bytes [a, b) of s as a new string, for a part known to be ASCII (no UTF-8 check needed)
+fn sub_ascii(s: str, a: int, b: int) -> str {
+  m := __newstr(b - a)
+  copy_mem(m + 8, __strp(s) + 8 + a, b - a)
+  return __pstr(m)
+}
+
 # ---------------------------------------------------------------- quoting
 
 const HEX = "0123456789abcdef"
 
 # s as a JSON string, with quotes and escapes (UTF-8 text is kept as it is)
 export fn quote(s: str) -> str {
-  b := &strings.Builder{}
-  quote_to(b, s)
-  return b.string()
-}
-
-fn quote_to(b: *strings.Builder, s: str) {
-  b.write_byte(34)
-  n := len(s)
-  start := 0
-  for i := 0; i < n; i++ {
-    c := int(s[i])
-    if c >= 32 && c != 34 && c != 92 { continue }
-    if start < i { b.write(s[start:i]) }
-    start = i + 1
-    switch c {
-    case 34: b.write("\\\"")
-    case 92: b.write("\\\\")
-    case 10: b.write("\\n")
-    case 13: b.write("\\r")
-    case 9: b.write("\\t")
-    case 8: b.write("\\b")
-    case 12: b.write("\\f")
-    default:
-      b.write("\\u00")
-      b.write_byte(int(HEX[c >> 4]))
-      b.write_byte(int(HEX[c & 15]))
-    }
-  }
-  if start < n { b.write(s[start:n]) }
-  b.write_byte(34)
+  e := new_enc("")
+  e.put_quoted(s)
+  return e.result()
 }
 
 # ---------------------------------------------------------------- descriptors
@@ -545,6 +546,59 @@ fn embedded(d: int, i: int) -> bool {
   return nm == field_name(d, i)
 }
 
+# what marshal and unmarshal need to know about a struct type, computed once per type
+struct Plan {
+  n: int
+  names: []str
+  keys: []str          # "name": (compact output)
+  ckeys: []str         # ,"name": (compact output, after another field)
+  qnames: []str        # "name"
+  descs: []int
+  emb: []bool
+  fast_dec: bool       # the direct decoder handles it (no embedded fields, ASCII names that
+                       # differ also without regard to case, at most 62 fields)
+}
+
+let plans = map[int]*Plan{}
+
+fn ascii(s: str) -> bool {
+  for i := 0; i < len(s); i++ { if int(s[i]) >= 128 { return false } }
+  return true
+}
+
+let plan_last_d: int = 0
+let plan_last: *Plan = nil
+
+fn plan_of(d: int) -> *Plan {
+  if d == plan_last_d { return plan_last }
+  if pl, ok := plans[d]; ok {
+    plan_last_d = d
+    plan_last = pl
+    return pl
+  }
+  n := dcount(d)
+  pl := &Plan{n: n, names: []str{}, keys: []str{}, ckeys: []str{}, qnames: []str{}, descs: []int{}, emb: []bool{}, fast_dec: n <= 62}
+  lows := map[str]bool{}
+  for i := 0; i < n; i++ {
+    nm := field_name(d, i)
+    q := quote(nm)
+    pl.names = append(pl.names, nm)
+    pl.qnames = append(pl.qnames, q)
+    pl.keys = append(pl.keys, q + ":")
+    pl.ckeys = append(pl.ckeys, "," + q + ":")
+    pl.descs = append(pl.descs, field_desc(d, i))
+    em := embedded(d, i)
+    pl.emb = append(pl.emb, em)
+    low := strings.to_lower(nm)
+    if em || !ascii(nm) || lows[low] { pl.fast_dec = false }
+    lows[low] = true
+  }
+  plans[d] = pl
+  plan_last_d = d
+  plan_last = pl
+  return pl
+}
+
 # a word of type d as an any (a new box)
 fn word_any(w: int, d: int) -> any {
   b := __alloc(16)
@@ -568,10 +622,183 @@ fn estore(data: int, i: int, ed: int, w: int) {
 
 # ---------------------------------------------------------------- marshal
 
+# the encoder writes into its own string block (mem: [length][bytes][0], see __newstr)
 struct Enc {
-  b: strings.Builder
+  mem: int
+  n: int
+  cap: int
   indent: str
+  pretty: bool         # indent != ""
   err: str
+  last_d: int          # the struct type encoded last and its plan (lists of the same struct)
+  last_plan: *Plan
+}
+
+# a buffer kept between calls (taken while an encoder uses it: a nested marshal, from an
+# Error method, gets its own)
+let spare_mem: int = 0
+let spare_cap: int = 0
+
+fn new_enc(indent: str) -> *Enc {
+  e := &Enc{indent: indent, pretty: indent != "", err: ""}
+  if spare_mem != 0 {
+    e.mem = spare_mem
+    e.cap = spare_cap
+    spare_mem = 0
+  }
+  return e
+}
+
+fn (e: *Enc) grow(extra: int) {
+  if e.n + extra <= e.cap { return }
+  c := e.cap * 2
+  if c < 256 { c = 256 }
+  while c < e.n + extra { c = c * 2 }
+  m := __newstr(c)
+  if e.n > 0 { copy_mem(m + 8, e.mem + 8, e.n) }
+  e.mem = m
+  e.cap = c
+}
+
+fn (e: *Enc) put(s: str) {
+  n := len(s)
+  if e.n + n > e.cap { e.grow(n) }
+  dst := e.mem + 8 + e.n
+  src := __strp(s) + 8
+  i := 0
+  while i + 8 <= n {
+    __store64(dst + i, __load64(src + i))
+    i += 8
+  }
+  while i < n {
+    __store8(dst + i, __load8(src + i))
+    i++
+  }
+  e.n += n
+}
+
+fn (e: *Enc) put_byte(c: int) {
+  if e.n >= e.cap { e.grow(1) }
+  __store8(e.mem + 8 + e.n, c)
+  e.n++
+}
+
+# the text written, as a new string; the buffer goes back for the next encoder
+fn (e: *Enc) result() -> str {
+  m := __newstr(e.n)
+  if e.n > 0 { copy_mem(m + 8, e.mem + 8, e.n) }
+  if e.cap > 0 && e.cap <= 1048576 {
+    spare_mem = e.mem
+    spare_cap = e.cap
+  }
+  e.mem = 0
+  e.cap = 0
+  return __pstr(m)
+}
+
+fn (e: *Enc) put_int(x0: int) {
+  x := x0
+  if x < 0 {
+    if x == (1 << 63) {
+      e.put(str(x))
+      return
+    }
+    e.put_byte(45)
+    x = -x
+  }
+  if x < 10 {
+    e.put_byte(48 + x)
+    return
+  }
+  nd := 0
+  t := x
+  while t > 0 {
+    nd++
+    t = t / 10
+  }
+  if e.n + nd > e.cap { e.grow(nd) }
+  q := e.mem + 8 + e.n + nd - 1
+  while x > 0 {
+    __store8(q, 48 + x % 10)
+    x = x / 10
+    q--
+  }
+  e.n += nd
+}
+
+# bytes [a, b) of s; a part with non-ASCII bytes goes through s[a:b], which checks the UTF-8
+fn (e: *Enc) put_run(s: str, a: int, b: int, high: bool) {
+  if a >= b { return }
+  if high {
+    e.put(s[a:b])
+    return
+  }
+  if e.n + b - a > e.cap { e.grow(b - a) }
+  copy_mem(e.mem + 8 + e.n, __strp(s) + 8 + a, b - a)
+  e.n += b - a
+}
+
+fn (e: *Enc) put_quoted(s: str) {
+  n := len(s)
+  if e.n + n + 2 > e.cap { e.grow(n + 2) }
+  p := __strp(s) + 8
+  j := 0
+  while j < n {
+    c := __load8(p + j)
+    if c < 32 || c == 34 || c == 92 || c >= 128 { break }
+    j++
+  }
+  if j == n {
+    o := e.mem + 8 + e.n
+    __store8(o, 34)
+    i0 := 0
+    while i0 + 8 <= n {
+      __store64(o + 1 + i0, __load64(p + i0))
+      i0 += 8
+    }
+    while i0 < n {
+      __store8(o + 1 + i0, __load8(p + i0))
+      i0++
+    }
+    __store8(o + 1 + n, 34)
+    e.n += n + 2
+    return
+  }
+  e.put_byte(34)
+  start := 0
+  high := false
+  i := 0
+  while i < n {
+    c := __load8(p + i)
+    if c >= 128 {
+      high = true
+      i++
+      continue
+    }
+    if c >= 32 && c != 34 && c != 92 {
+      i++
+      continue
+    }
+    e.put_run(s, start, i, high)
+    high = false
+    switch c {
+    case 34: e.put("\\\"")
+    case 92: e.put("\\\\")
+    case 10: e.put("\\n")
+    case 13: e.put("\\r")
+    case 9: e.put("\\t")
+    case 8: e.put("\\b")
+    case 12: e.put("\\f")
+    default:
+      e.put("\\u00")
+      e.put_byte(int(HEX[c >> 4]))
+      e.put_byte(int(HEX[c & 15]))
+    }
+    i++
+    start = i
+  }
+  e.put_run(s, start, n, high)
+  e.put_byte(34)
 }
 
 export fn marshal(v: any) -> (str, error) { return encode(v, "") }
@@ -579,21 +806,22 @@ export fn marshal(v: any) -> (str, error) { return encode(v, "") }
 export fn marshal_indent(v: any, indent: str) -> (str, error) { return encode(v, indent) }
 
 fn encode(v: any, indent: str) -> (str, error) {
-  e := &Enc{indent: indent, err: ""}
+  e := new_enc(indent)
   box := __anyp(v)
-  if box == 0 { e.b.write("null") } else { e.word(__load64(box + 8), __load64(box), 0) }
-  if e.err != "" { return "", errors.New(e.err) }
-  return e.b.string(), nil
+  if box == 0 { e.put("null") } else { e.word(__load64(box + 8), __load64(box), 0) }
+  out := e.result()
+  if len(e.err) != 0 { return "", errors.New(e.err) }
+  return out, nil
 }
 
 fn (e: *Enc) newline(depth: int) {
-  if e.indent == "" { return }
-  e.b.write_byte(10)
-  for k := 0; k < depth; k++ { e.b.write(e.indent) }
+  if !e.pretty { return }
+  e.put_byte(10)
+  for k := 0; k < depth; k++ { e.put(e.indent) }
 }
 
 fn (e: *Enc) colon() {
-  if e.indent == "" { e.b.write_byte(58) } else { e.b.write(": ") }
+  if !e.pretty { e.put_byte(58) } else { e.put(": ") }
 }
 
 # a number as JSON: the shortest text that reads back the same, without ".0" for integers
@@ -602,20 +830,53 @@ fn format_num(x: num) -> str {
   if x == math.trunc(x) && x < 1e21 && x > -1e21 {
     if x < 9.2e18 && x > -9.2e18 { return str(int(x)) }
   }
+  q := short_fixed(x)
+  if q != "" { return q }
   t := toml.format_float(x)
   if strings.has_suffix(t, ".0") { t = t[0:len(t) - 2] }
   return t
 }
 
+let POW10 = []num{1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0}
+
+# x with the fewest decimal places (up to 8) that reads back as x, for 0.0001 <= |x| < 1e15 (the
+# range toml.format_float writes without an exponent); "" when that does not settle it
+fn short_fixed(x0: num) -> str {
+  x := x0
+  neg := x < 0.0
+  if neg { x = -x }
+  if x < 0.0001 || x >= 1e15 { return "" }
+  for k := 1; k <= 8; k++ {
+    m := x * POW10[k]
+    if m >= 9e15 { return "" }
+    r := int(math.floor(m + 0.5))
+    ip := r
+    fp := 0
+    pw := 1
+    for j := 0; j < k; j++ { pw = pw * 10 }
+    ip = r / pw
+    fp = r % pw
+    if fp == 0 { continue }
+    fs := str(fp)
+    while len(fs) < k { fs = "0" + fs }
+    while fs[len(fs) - 1] == 48 { fs = fs[0:len(fs) - 1] }
+    t := str(ip) + "." + fs
+    if neg { t = "-" + t }
+    back, err := strconv.parse_float(t)
+    if err == nil && back == x0 { return t }
+  }
+  return ""
+}
+
 fn (e: *Enc) word(w: int, d: int, depth: int) {
-  if e.err != "" { return }
+  if len(e.err) != 0 { return }
   if depth > MAX_DEPTH {
     e.err = "json: unsupported value: nesting deeper than " + str(MAX_DEPTH) + " levels (a cycle?)"
     return
   }
   if d == value_ptr_desc() {
     if w == 0 {
-      e.b.write("null")
+      e.put("null")
       return
     }
     t := word_any(w, d).(*Value)
@@ -625,50 +886,48 @@ fn (e: *Enc) word(w: int, d: int, depth: int) {
   k := dkind(d)
   switch k {
   case 1:
-    e.b.write(str(w))
+    e.put_int(w)
   case 2:
-    e.b.write(str(uint64(w)))
+    if w >= 0 { e.put_int(w) } else { e.put(str(uint64(w))) }
   case 3:
     x := __bitsf(w)
     if math.is_nan(x) || math.is_inf(x) {
       e.err = "json: unsupported value: " + str(x)
       return
     }
-    e.b.write(format_num(x))
+    if x == math.trunc(x) && x < 9.2e18 && x > -9.2e18 { e.put_int(int(x)) } else { e.put(format_num(x)) }
   case 4:
-    if w != 0 { e.b.write("true") } else { e.b.write("false") }
+    if w != 0 { e.put("true") } else { e.put("false") }
   case 5:
-    quote_to(&e.b, __pstr(w))
+    e.put_quoted(__pstr(w))
   case 6:
     if w == 0 {
-      e.b.write("null")
+      e.put("null")
       return
     }
     e.list(__load64(w), __load64(w + 8), delem(d), depth)
   case 7:
     e.list(w, dcount(d), delem(d), depth)
   case 8:
-    e.b.write_byte(123)
-    first := true
-    e.fields(w, d, depth, &first)
-    if !first { e.newline(depth) }
-    e.b.write_byte(125)
+    e.put_byte(123)
+    if !e.fields(w, d, depth, true) { e.newline(depth) }
+    e.put_byte(125)
   case 9:
     if w == 0 {
-      e.b.write("null")
+      e.put("null")
       return
     }
     ed := delem(d)
     if dkind(ed) == 7 || dkind(ed) == 8 { e.word(w, ed, depth) } else { e.word(__load64(w), ed, depth) }
   case 10:
     if w == 0 {
-      e.b.write("null")
+      e.put("null")
       return
     }
     e.map_obj(w, d, depth)
   case 11, 12, 13:
     if w == 0 {
-      e.b.write("null")
+      e.put("null")
       return
     }
     bd := d
@@ -680,7 +939,7 @@ fn (e: *Enc) word(w: int, d: int, depth: int) {
     if dkind(bd) == 13 || (k == 12 && dname(d) == "error") {
       a := word_any(bw, bd)
       if er, ok := a.(error); ok {
-        quote_to(&e.b, er.Error())
+        e.put_quoted(er.Error())
         return
       }
     }
@@ -691,39 +950,73 @@ fn (e: *Enc) word(w: int, d: int, depth: int) {
 }
 
 # the fields of a struct object (embedded structs promoted), after "{" or a previous field
-fn (e: *Enc) fields(w: int, d: int, depth: int, first: *bool) {
-  n := dcount(d)
+# (first: nothing written yet); returns whether still nothing was written
+fn (e: *Enc) fields(w: int, d: int, depth: int, first0: bool) -> bool {
+  first := first0
+  pl := e.last_plan
+  if d != e.last_d {
+    pl = plan_of(d)
+    e.last_d = d
+    e.last_plan = pl
+  }
+  n := pl.n
   for i := 0; i < n; i++ {
-    fd := field_desc(d, i)
+    fd := pl.descs[i]
     fw := __load64(w + 8 * i)
-    if embedded(d, i) {
+    if pl.emb[i] {
       if dkind(fd) == 9 {
         if fw == 0 { continue }
         fd = delem(fd)
       }
-      e.fields(fw, fd, depth, first)
+      first = e.fields(fw, fd, depth, first)
+      if len(e.err) != 0 { return first }
+      e.last_d = d
+      e.last_plan = pl
       continue
     }
-    if !*first { e.b.write_byte(44) }
-    *first = false
-    e.newline(depth + 1)
-    quote_to(&e.b, field_name(d, i))
-    e.colon()
+    if !e.pretty {
+      if first { e.put(pl.keys[i]) } else { e.put(pl.ckeys[i]) }
+      first = false
+    } else {
+      if !first { e.put_byte(44) }
+      first = false
+      e.newline(depth + 1)
+      e.put(pl.qnames[i])
+      e.put(": ")
+    }
+    k := dkind(fd)
+    if k == 5 {
+      e.put_quoted(__pstr(fw))
+      continue
+    }
+    if k == 1 {
+      e.put_int(fw)
+      continue
+    }
+    if k == 4 {
+      if fw != 0 { e.put("true") } else { e.put("false") }
+      continue
+    }
     e.word(fw, fd, depth + 1)
-    if e.err != "" { return }
+    if len(e.err) != 0 { return first }
+    if e.last_d != d {
+      e.last_d = d
+      e.last_plan = pl
+    }
   }
+  return first
 }
 
 fn (e: *Enc) list(data: int, n: int, ed: int, depth: int) {
-  e.b.write_byte(91)
+  e.put_byte(91)
   for i := 0; i < n; i++ {
-    if i > 0 { e.b.write_byte(44) }
-    e.newline(depth + 1)
+    if i > 0 { e.put_byte(44) }
+    if e.pretty { e.newline(depth + 1) }
     e.word(eload(data, i, ed), ed, depth + 1)
-    if e.err != "" { return }
+    if len(e.err) != 0 { return }
   }
   if n > 0 { e.newline(depth) }
-  e.b.write_byte(93)
+  e.put_byte(93)
 }
 
 fn (e: *Enc) map_obj(m: int, d: int, depth: int) {
@@ -737,108 +1030,123 @@ fn (e: *Enc) map_obj(m: int, d: int, depth: int) {
   used := __load64(m + 16)
   entries := __load64(m + 8)
   dead := __load64(m + 56)
-  keys := []str{}
-  vals := map[str]int{}
+  keys := make([]str, used)
+  vals := make([]int, used)
+  cnt := 0
   for i := 0; i < used; i++ {
     if dead != 0 && __load8(dead + i) != 0 { continue }
     kw := __load64(entries + 16 * i)
     ks := ""
     if kk == 5 { ks = __pstr(kw) } else if kk == 2 { ks = str(uint64(kw)) } else { ks = str(kw) }
-    keys = append(keys, ks)
-    vals[ks] = __load64(entries + 16 * i + 8)
+    keys[cnt] = ks
+    vals[cnt] = __load64(entries + 16 * i + 8)
+    cnt++
   }
-  sort_strs(keys)
-  e.b.write_byte(123)
-  for i, ks := range keys {
-    if i > 0 { e.b.write_byte(44) }
+  keys = keys[0:cnt]
+  vals = vals[0:cnt]
+  sort_pairs(keys, vals)
+  e.put_byte(123)
+  for i := 0; i < len(keys); i++ {
+    if i > 0 { e.put_byte(44) }
     e.newline(depth + 1)
-    quote_to(&e.b, ks)
+    e.put_quoted(keys[i])
     e.colon()
-    e.word(vals[ks], vd, depth + 1)
-    if e.err != "" { return }
+    e.word(vals[i], vd, depth + 1)
+    if len(e.err) != 0 { return }
   }
   if len(keys) > 0 { e.newline(depth) }
-  e.b.write_byte(125)
+  e.put_byte(125)
 }
 
 fn (e: *Enc) tree(v: *Value, depth: int) {
   if v == nil {
-    e.b.write("null")
+    e.put("null")
     return
   }
   switch v.kind {
   case "object":
-    e.b.write_byte(123)
+    e.put_byte(123)
     for i, k := range v.keys {
-      if i > 0 { e.b.write_byte(44) }
+      if i > 0 { e.put_byte(44) }
       e.newline(depth + 1)
-      quote_to(&e.b, k)
+      e.put_quoted(k)
       e.colon()
       e.tree(v.fields[k], depth + 1)
     }
     if len(v.keys) > 0 { e.newline(depth) }
-    e.b.write_byte(125)
+    e.put_byte(125)
   case "array":
-    e.b.write_byte(91)
+    e.put_byte(91)
     for i, x := range v.items {
-      if i > 0 { e.b.write_byte(44) }
+      if i > 0 { e.put_byte(44) }
       e.newline(depth + 1)
       e.tree(x, depth + 1)
     }
     if len(v.items) > 0 { e.newline(depth) }
-    e.b.write_byte(93)
-  case "string": quote_to(&e.b, v.s)
+    e.put_byte(93)
+  case "string": e.put_quoted(v.s)
   case "number":
-    if v.s != "" { e.b.write(v.s) } else if v.is_int { e.b.write(str(v.i)) } else { e.b.write(format_num(v.n)) }
+    if v.s != "" { e.put(v.s) } else if v.is_int { e.put(str(v.i)) } else { e.put(format_num(v.n)) }
   case "bool":
-    if v.b { e.b.write("true") } else { e.b.write("false") }
-  default: e.b.write("null")
+    if v.b { e.put("true") } else { e.put("false") }
+  default: e.put("null")
   }
 }
 
-# sorts in place (merge sort: maps can be large)
-fn sort_strs(a: []str) {
+# sorts the keys in place, moving each value with its key (merge sort: maps can be large)
+fn sort_pairs(a: []str, v: []int) {
   n := len(a)
   if n < 2 { return }
   if n <= 12 {
     for i := 1; i < n; i++ {
       x := a[i]
+      y := v[i]
       j := i - 1
       while j >= 0 && a[j] > x {
         a[j + 1] = a[j]
+        v[j + 1] = v[j]
         j--
       }
       a[j + 1] = x
+      v[j + 1] = y
     }
     return
   }
   mid := n / 2
-  left := make([]str, mid)
-  right := make([]str, n - mid)
-  copy(left, a[0:mid])
-  copy(right, a[mid:n])
-  sort_strs(left)
-  sort_strs(right)
+  la := make([]str, mid)
+  lv := make([]int, mid)
+  ra := make([]str, n - mid)
+  rv := make([]int, n - mid)
+  copy(la, a[0:mid])
+  copy(lv, v[0:mid])
+  copy(ra, a[mid:n])
+  copy(rv, v[mid:n])
+  sort_pairs(la, lv)
+  sort_pairs(ra, rv)
   i := 0
   j := 0
   k := 0
-  while i < len(left) && j < len(right) {
-    if right[j] < left[i] {
-      a[k] = right[j]
+  while i < mid && j < n - mid {
+    if ra[j] < la[i] {
+      a[k] = ra[j]
+      v[k] = rv[j]
       j++
     } else {
-      a[k] = left[i]
+      a[k] = la[i]
+      v[k] = lv[i]
       i++
     }
     k++
   }
-  while i < len(left) {
-    a[k] = left[i]
+  while i < mid {
+    a[k] = la[i]
+    v[k] = lv[i]
     i++
     k++
   }
-  while j < len(right) {
-    a[k] = right[j]
+  while j < n - mid {
+    a[k] = ra[j]
+    v[k] = rv[j]
     j++
     k++
   }
@@ -857,17 +1165,30 @@ export fn unmarshal(text: str, v: any) -> error {
   if dkind(d) != 9 { return errors.New("json: unmarshal needs a non-nil pointer (got " + dname(d) + ")") }
   p := __load64(box + 8)
   if p == 0 { return errors.New("json: unmarshal needs a non-nil pointer (got a nil " + dname(d) + ")") }
+  ed := delem(d)
+  # the direct decoder runs only when a first pass (vtyped) found the text valid and every value
+  # fit for its place, so it never stops halfway; otherwise the tree decoder gives the errors
+  vs := vtyped(text, ed)
+  if vs != nil {
+    f := &Fast{s: text, p: __strp(text) + 8, n: len(text), i: 0, bad: false, arrs: vs.arrs, na: vs.na, ac: 0, keys: vs.keys, kc: 0}
+    if dkind(ed) == 7 || dkind(ed) == 8 {
+      f.word(ed, p)
+    } else {
+      w := f.word(ed, __load64(p))
+      if !f.bad { __store64(p, w) }
+    }
+    if !f.bad { return nil }
+  }
   tree, err := parse(text)
   if err != nil { return err }
   dec := &Dec{err: ""}
-  ed := delem(d)
   if dkind(ed) == 7 || dkind(ed) == 8 {
     dec.word(tree, ed, p, "")
   } else {
     w := dec.word(tree, ed, __load64(p), "")
-    if dec.err == "" { __store64(p, w) }
+    if len(dec.err) == 0 { __store64(p, w) }
   }
-  if dec.err != "" { return errors.New(dec.err) }
+  if len(dec.err) != 0 { return errors.New(dec.err) }
   return nil
 }
 
@@ -877,10 +1198,24 @@ fn json_kind(v: *Value) -> str {
 }
 
 fn (dec: *Dec) mismatch(v: *Value, d: int, ctx: str) {
-  if dec.err != "" { return }
+  if len(dec.err) != 0 { return }
   where := "value"
   if ctx != "" { where = "field " + ctx }
   dec.err = "json: cannot unmarshal " + json_kind(v) + " into " + where + " of type " + dname(d)
+}
+
+# the range of an integer type by its descriptor's integer kind ([48], types.KIND_CODE: 1 int8,
+# 2 int16, 3 int32, 6 uint8, 7 uint16, 8 uint32), or ok false for int/int64/uint64/uint
+fn int_range_of(d: int) -> (int, int, bool) {
+  switch __load64(d + 48) {
+  case 1: return -128, 127, true
+  case 2: return -32768, 32767, true
+  case 3: return -2147483648, 2147483647, true
+  case 6: return 0, 255, true
+  case 7: return 0, 65535, true
+  case 8: return 0, 4294967295, true
+  }
+  return 0, 0, false
 }
 
 # the range of an integer type by its name, or ok false for int/int64/uint64/uint
@@ -899,7 +1234,7 @@ fn int_range(name: str) -> (int, int, bool) {
 # the word for v decoded as type d; old is the current word (structs and arrays are filled in
 # place, and null keeps it for the types that cannot be nil)
 fn (dec: *Dec) word(v: *Value, d: int, old: int, ctx: str) -> int {
-  if dec.err != "" { return old }
+  if len(dec.err) != 0 { return old }
   if d == value_ptr_desc() { return __load64(__anyp(v) + 8) }
   k := dkind(d)
   if v.kind == "null" {
@@ -949,7 +1284,7 @@ fn (dec: *Dec) word(v: *Value, d: int, old: int, ctx: str) -> int {
     data := __load64(s)
     for i := 0; i < n; i++ {
       estore(data, i, ed, dec.word(v.items[i], ed, eload(data, i, ed), ctx))
-      if dec.err != "" { return old }
+      if len(dec.err) != 0 { return old }
     }
     return s
   case 7:
@@ -967,7 +1302,7 @@ fn (dec: *Dec) word(v: *Value, d: int, old: int, ctx: str) -> int {
       } else {
         estore(data, i, ed, __zero(ed))
       }
-      if dec.err != "" { return old }
+      if len(dec.err) != 0 { return old }
     }
     return data
   case 8:
@@ -1023,7 +1358,7 @@ fn (dec: *Dec) word(v: *Value, d: int, old: int, ctx: str) -> int {
         kw = x
       }
       w := dec.word(v.fields[key], vd, __zero(vd), ctx)
-      if dec.err != "" { return old }
+      if len(dec.err) != 0 { return old }
       __map_set(m, kw, w)
     }
     return m
@@ -1052,7 +1387,7 @@ fn (dec: *Dec) fields(v: *Value, d: int, obj: int, ctx: str) {
         fd = delem(fd)
       }
       dec.fields(v, fd, inner, ctx)
-      if dec.err != "" { return }
+      if len(dec.err) != 0 { return }
       continue
     }
     name := field_name(d, i)
@@ -1070,7 +1405,880 @@ fn (dec: *Dec) fields(v: *Value, d: int, obj: int, ctx: str) {
     c2 := sname + "." + name
     if ctx != "" { c2 = ctx + "." + name }
     w := dec.word(x, fd, __load64(obj + 8 * i), c2)
-    if dec.err != "" { return }
+    if len(dec.err) != 0 { return }
     __store64(obj + 8 * i, w)
   }
+}
+
+# ---------------------------------------------------------------- validation without a tree
+
+# does text parse (the same grammar and limits as parse), without building anything; nil when
+# it does not, else the item counts of its lists (see VScan.arrs)
+fn vscan(text: str) -> *VScan {
+  v := &VScan{s: text, p: __strp(text) + 8, n: len(text), i: 0}
+  v.ws()
+  if !v.value(0) { return nil }
+  v.ws()
+  if v.i != v.n { return nil }
+  return v
+}
+
+# like vscan, and also: every value decodes into its place by type d the way the tree decoder
+# would, with nothing the direct decoder leaves to it (type mismatches, numbers out of range,
+# escaped keys, repeated fields, embedded structs...); nil when not
+fn vtyped(text: str, d: int) -> *VScan {
+  v := &VScan{s: text, p: __strp(text) + 8, n: len(text), i: 0}
+  v.ws()
+  if !v.typed(d, 0) { return nil }
+  v.ws()
+  if v.i != v.n { return nil }
+  return v
+}
+
+struct VScan {
+  s: str
+  p: int
+  n: int
+  i: int
+  arrs: []int          # [offset, count] of each list, in the order they start
+  na: int              # used part of arrs
+  keys: []int          # [field or -1, offset of the value] of each key of a struct object
+  nk: int              # used part of keys
+  rd: int              # the integer type whose range is in rlo, rhi, rok
+  rlo: int
+  rhi: int
+  rok: bool
+  last_d: int          # the struct type checked last and its plan
+  last_plan: *Plan
+}
+
+fn (v: *VScan) ws() {
+  p := v.p
+  n := v.n
+  i := v.i
+  while i < n {
+    c := __load8(p + i)
+    if c != 32 && c != 10 && c != 13 && c != 9 { break }
+    i++
+  }
+  v.i = i
+}
+
+fn (v: *VScan) lit(w: str) -> bool {
+  m := len(w)
+  if v.i + m > v.n { return false }
+  for k := 0; k < m; k++ { if __load8(v.p + v.i + k) != int(w[k]) { return false } }
+  v.i += m
+  return true
+}
+
+fn (v: *VScan) value(depth: int) -> bool {
+  p := v.p
+  i := v.i
+  c := __load8(p + i)
+  if c == 123 || c == 91 {
+    if depth + 1 > MAX_DEPTH { return false }
+    close := 93
+    if c == 123 { close = 125 }
+    slot := -1
+    if c == 91 {
+      # the number of items, read by the direct decoder: [offset after "[", count]
+      slot = v.add_arr(i + 1)
+    }
+    i++
+    while true {
+      b := __load8(p + i)
+      if b != 32 && b != 10 && b != 13 && b != 9 { break }
+      i++
+    }
+    if __load8(p + i) == close {
+      v.i = i + 1
+      return true
+    }
+    count := 0
+    while true {
+      while true {
+        b := __load8(p + i)
+        if b != 32 && b != 10 && b != 13 && b != 9 { break }
+        i++
+      }
+      if c == 123 {
+        if __load8(p + i) != 34 { return false }
+        v.i = i
+        if !v.string() { return false }
+        i = v.i
+        while true {
+          b := __load8(p + i)
+          if b != 32 && b != 10 && b != 13 && b != 9 { break }
+          i++
+        }
+        if __load8(p + i) != 58 { return false }
+        i++
+        while true {
+          b := __load8(p + i)
+          if b != 32 && b != 10 && b != 13 && b != 9 { break }
+          i++
+        }
+      }
+      v.i = i
+      if !v.value(depth + 1) { return false }
+      count++
+      i = v.i
+      while true {
+        b := __load8(p + i)
+        if b != 32 && b != 10 && b != 13 && b != 9 { break }
+        i++
+      }
+      c2 := __load8(p + i)
+      if c2 == 44 {
+        i++
+        continue
+      }
+      if c2 == close {
+        v.i = i + 1
+        if slot >= 0 { v.arrs[slot + 1] = count }
+        return true
+      }
+      return false
+    }
+  }
+  if i >= v.n { return false }
+  if c == 34 { return v.string() }
+  if c == 45 || (c >= 48 && c <= 57) { return v.number() }
+  if c == 116 { return v.lit("true") }
+  if c == 102 { return v.lit("false") }
+  if c == 110 { return v.lit("null") }
+  return false
+}
+
+# a new [offset, count] entry in arrs (count 0 for now); returns its position
+fn (v: *VScan) add_arr(off: int) -> int {
+  na := v.na
+  if na + 2 > len(v.arrs) {
+    bigger := make([]int, 2 * len(v.arrs) + 16)
+    copy(bigger, v.arrs)
+    v.arrs = bigger
+  }
+  v.arrs[na] = off
+  v.arrs[na + 1] = 0
+  v.na = na + 2
+  return na
+}
+
+fn (v: *VScan) skip_ws() {
+  p := v.p
+  i := v.i
+  while true {
+    b := __load8(p + i)
+    if b != 32 && b != 10 && b != 13 && b != 9 { break }
+    i++
+  }
+  v.i = i
+}
+
+# the value at v.i, valid and fit for type d (see vtyped)
+fn (v: *VScan) typed(d: int, depth: int) -> bool {
+  if v.i >= v.n { return false }
+  if d == value_ptr_desc() { return v.value(depth) }
+  p := v.p
+  c := __load8(p + v.i)
+  if c == 110 { return v.lit("null") }
+  k := dkind(d)
+  switch k {
+  case 1, 2:
+    start := v.i
+    if !v.number() { return false }
+    i := start
+    neg := false
+    if __load8(p + i) == 45 {
+      neg = true
+      i++
+    }
+    x := 0
+    nd := 0
+    while i < v.i {
+      b := __load8(p + i)
+      if b < 48 || b > 57 { return false }
+      x = x * 10 + (b - 48)
+      nd++
+      i++
+    }
+    if nd > 18 { return false }
+    if neg { x = -x }
+    if d != v.rd {
+      v.rd = d
+      v.rlo, v.rhi, v.rok = int_range_of(d)
+    }
+    if (v.rok && (x < v.rlo || x > v.rhi)) || (k == 2 && x < 0) { return false }
+    return true
+  case 3:
+    if c != 45 && (c < 48 || c > 57) { return false }
+    return v.number()
+  case 4:
+    if c == 116 { return v.lit("true") }
+    if c == 102 { return v.lit("false") }
+    return false
+  case 5:
+    if c != 34 { return false }
+    return v.string()
+  case 6, 7:
+    if c != 91 || depth + 1 > MAX_DEPTH { return false }
+    ed := delem(d)
+    lim := -1
+    if k == 7 { lim = dcount(d) }
+    slot := v.add_arr(v.i + 1)
+    v.i++
+    if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+    if __load8(p + v.i) == 93 {
+      v.i++
+      return true
+    }
+    count := 0
+    while true {
+      if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+      if lim < 0 || count < lim {
+        if !v.typed(ed, depth + 1) { return false }
+      } else if !v.value(depth + 1) { return false }
+      count++
+      if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+      c2 := __load8(p + v.i)
+      v.i++
+      if c2 == 93 {
+        v.arrs[slot + 1] = count
+        return true
+      }
+      if c2 != 44 { return false }
+    }
+  case 8:
+    if c != 123 || depth + 1 > MAX_DEPTH { return false }
+    return v.object(d, depth)
+  case 9:
+    return v.typed(delem(d), depth)
+  case 10:
+    if c != 123 || depth + 1 > MAX_DEPTH || dkind(dkey(d)) != 5 { return false }
+    vd := delem(d)
+    v.i++
+    if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+    if __load8(p + v.i) == 125 {
+      v.i++
+      return true
+    }
+    while true {
+      if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+      if __load8(p + v.i) != 34 || !v.string() { return false }
+      if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+      if __load8(p + v.i) != 58 { return false }
+      v.i++
+      if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+      if !v.typed(vd, depth + 1) { return false }
+      if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+      c2 := __load8(p + v.i)
+      v.i++
+      if c2 == 125 { return true }
+      if c2 != 44 { return false }
+    }
+  case 11:
+    return v.value(depth)
+  }
+  return false
+}
+
+# an object for a struct of type d: the same key matching as Fast.object
+fn (v: *VScan) object(d: int, depth: int) -> bool {
+  pl := v.last_plan
+  if d != v.last_d {
+    pl = plan_of(d)
+    v.last_d = d
+    v.last_plan = pl
+  }
+  if !pl.fast_dec { return false }
+  p := v.p
+  v.i++
+  v.skip_ws()
+  if __load8(p + v.i) == 125 {
+    v.i++
+    return true
+  }
+  exact := 0
+  loose := 0
+  hint := 0
+  while true {
+    if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+    if __load8(p + v.i) != 34 { return false }
+    a := v.i + 1
+    j := a
+    while true {
+      b := __load8(p + j)
+      if b == 34 { break }
+      if b == 92 || b >= 128 || b < 32 { return false }
+      j++
+    }
+    i := j + 1
+    if __load8(p + i) <= 32 {
+      v.i = i
+      v.skip_ws()
+      i = v.i
+    }
+    if __load8(p + i) != 58 { return false }
+    i++
+    if __load8(p + i) <= 32 {
+      v.i = i
+      v.skip_ws()
+      i = v.i
+    }
+    v.i = i
+    fi := -1
+    if hint < pl.n {
+      nm := pl.names[hint]
+      m := j - a
+      if len(nm) == m {
+        q := __strp(nm) + 8
+        k := 0
+        while k + 8 <= m && __load64(q + k) == __load64(p + a + k) { k += 8 }
+        while k < m && __load8(q + k) == __load8(p + a + k) { k++ }
+        if k == m { fi = hint }
+      }
+    }
+    if fi < 0 { fi = find_field(pl, p, a, j, false, pl.n) }
+    take := false
+    if fi >= 0 {
+      bit := 1 << fi
+      if ((exact | loose) & bit) != 0 { return false }
+      exact = exact | bit
+      take = true
+    } else {
+      fi = find_field(pl, p, a, j, true, 0)
+      if fi >= 0 {
+        bit := 1 << fi
+        if (loose & bit) != 0 { return false }
+        if (exact & bit) == 0 {
+          loose = loose | bit
+          take = true
+        }
+      }
+    }
+    if !take { fi = -1 }
+    nk := v.nk
+    if nk + 2 > len(v.keys) {
+      bigger := make([]int, 2 * len(v.keys) + 16)
+      copy(bigger, v.keys)
+      v.keys = bigger
+    }
+    v.keys[nk] = fi
+    v.keys[nk + 1] = v.i
+    v.nk = nk + 2
+    if take {
+      hint = fi + 1
+      fd := pl.descs[fi]
+      if !v.typed(fd, depth + 1) { return false }
+      if v.last_d != d {
+        v.last_d = d
+        v.last_plan = pl
+      }
+    } else if !v.value(depth + 1) { return false }
+    if __load8(v.p + v.i) <= 32 { v.skip_ws() }
+    c2 := __load8(p + v.i)
+    v.i++
+    if c2 == 125 { return true }
+    if c2 != 44 { return false }
+  }
+  return false
+}
+
+fn (v: *VScan) string() -> bool {
+  p := v.p
+  n := v.n
+  i := v.i + 1
+  while i < n {
+    c := __load8(p + i)
+    if c == 34 {
+      v.i = i + 1
+      return true
+    }
+    if c < 32 { return false }
+    if c == 92 {
+      if i + 1 >= n { return false }
+      e := __load8(p + i + 1)
+      if e == 117 {
+        if i + 6 > n { return false }
+        for k := 2; k < 6; k++ { if hex_val(__load8(p + i + k)) < 0 { return false } }
+        i += 6
+        continue
+      }
+      if e != 34 && e != 92 && e != 47 && e != 98 && e != 102 && e != 110 && e != 114 && e != 116 { return false }
+      i += 2
+      continue
+    }
+    i++
+  }
+  return false
+}
+
+fn (v: *VScan) digits() -> int {
+  k := 0
+  while v.i < v.n {
+    c := __load8(v.p + v.i)
+    if c < 48 || c > 57 { break }
+    v.i++
+    k++
+  }
+  return k
+}
+
+fn (v: *VScan) number() -> bool {
+  start := v.i
+  if __load8(v.p + v.i) == 45 { v.i++ }
+  if v.i >= v.n { return false }
+  nd := 0
+  if __load8(v.p + v.i) == 48 {
+    v.i++
+    nd = 1
+    if v.i < v.n && __load8(v.p + v.i) >= 48 && __load8(v.p + v.i) <= 57 { return false }
+  } else {
+    nd = v.digits()
+    if nd == 0 { return false }
+  }
+  simple := nd <= 18
+  if __load8(v.p + v.i) == 46 {
+    simple = false
+    v.i++
+    if v.digits() == 0 { return false }
+  }
+  if __load8(v.p + v.i) == 101 || __load8(v.p + v.i) == 69 {
+    simple = false
+    v.i++
+    if __load8(v.p + v.i) == 43 || __load8(v.p + v.i) == 45 { v.i++ }
+    if v.digits() == 0 { return false }
+  }
+  if !simple {
+    # the tree parser turns the text into a num and fails when it is out of range
+    _, err := strconv.parse_float(v.s[start:v.i])
+    if err != nil { return false }
+  }
+  return true
+}
+
+# ---------------------------------------------------------------- direct decoder
+
+# decodes valid JSON text straight into memory, following the type descriptors; bad means it met
+# something it leaves to the tree decoder (unmarshal then runs that one from the start)
+struct Fast {
+  s: str
+  p: int
+  n: int
+  i: int
+  bad: bool
+  arrs: []int          # item counts of the lists (VScan.arrs, na used) and the next one to look at
+  na: int
+  ac: int
+  keys: []int          # the field and value offset of each struct key (VScan.keys), the next one
+  kc: int
+  last_d: int          # the struct type decoded last and its plan
+  last_plan: *Plan
+  rd: int              # the integer type whose range is in rlo, rhi, rok
+  rlo: int
+  rhi: int
+  rok: bool
+}
+
+fn (f: *Fast) ws() {
+  p := f.p
+  n := f.n
+  i := f.i
+  while i < n {
+    c := __load8(p + i)
+    if c != 32 && c != 10 && c != 13 && c != 9 { break }
+    i++
+  }
+  f.i = i
+}
+
+
+# the number of items of the list that starts at f.i (after "["), from the validation
+fn (f: *Fast) count_items() -> int {
+  arrs := f.arrs
+  k := f.ac
+  while k < f.na && arrs[k] < f.i { k += 2 }
+  f.ac = k + 2
+  return arrs[k + 1]
+}
+
+# skips one value (the text is valid)
+fn (f: *Fast) skip() {
+  p := f.p
+  i := f.i
+  c := __load8(p + i)
+  if c == 34 {
+    i++
+    while true {
+      c2 := __load8(p + i)
+      if c2 == 92 {
+        i += 2
+        continue
+      }
+      i++
+      if c2 == 34 { break }
+    }
+    f.i = i
+    return
+  }
+  if c == 123 || c == 91 {
+    depth := 0
+    while true {
+      c2 := __load8(p + i)
+      if c2 == 34 {
+        f.i = i
+        f.skip()
+        i = f.i
+        continue
+      }
+      i++
+      if c2 == 123 || c2 == 91 { depth++ } else if c2 == 125 || c2 == 93 {
+        depth--
+        if depth == 0 { break }
+      }
+    }
+    f.i = i
+    return
+  }
+  n := f.n
+  while i < n {
+    c2 := __load8(p + i)
+    if c2 == 44 || c2 == 125 || c2 == 93 || c2 == 32 || c2 == 10 || c2 == 13 || c2 == 9 { break }
+    i++
+  }
+  f.i = i
+}
+
+# a subtree, through the tree parser
+fn (f: *Fast) tree() -> *Value {
+  pr := &Parser{s: f.s, i: f.i, depth: 0, err: ""}
+  v := pr.value()
+  f.i = pr.i
+  return v
+}
+
+# a string value at f.i (the opening quote), as a string word
+fn (f: *Fast) str_word() -> int {
+  p := f.p
+  a := f.i + 1
+  j := a
+  while true {
+    c := __load8(p + j)
+    if c == 34 { break }
+    if c == 92 || c >= 128 {
+      # escapes or UTF-8: the tree parser's string reader (same result as parse)
+      pr := &Parser{s: f.s, i: f.i, depth: 0, err: ""}
+      t := pr.string()
+      f.i = pr.i
+      return __strp(t)
+    }
+    j++
+  }
+  m := __newstr(j - a)
+  copy_mem(m + 8, p + a, j - a)
+  f.i = j + 1
+  return m
+}
+
+# an integer at f.i; ok false when it is not a plain integer of up to 18 digits
+fn (f: *Fast) int_text() -> (int, bool) {
+  p := f.p
+  n := f.n
+  i := f.i
+  neg := false
+  if __load8(p + i) == 45 {
+    neg = true
+    i++
+  }
+  x := 0
+  nd := 0
+  while i < n {
+    c := __load8(p + i)
+    if c < 48 || c > 57 { break }
+    x = x * 10 + (c - 48)
+    nd++
+    i++
+  }
+  if nd == 0 || nd > 18 { return 0, false }
+  if i < n {
+    c := __load8(p + i)
+    if c == 46 || c == 101 || c == 69 { return 0, false }
+  }
+  f.i = i
+  if neg { return -x, true }
+  return x, true
+}
+
+fn (f: *Fast) word(d: int, old: int) -> int {
+  if f.bad { return old }
+  if __load8(f.p + f.i) <= 32 { f.ws() }
+  if d == value_ptr_desc() { return __load64(__anyp(f.tree()) + 8) }
+  k := dkind(d)
+  c := __load8(f.p + f.i)
+  if c == 110 {
+    f.i += 4
+    if k == 6 || k == 9 || k == 10 || k == 11 || k == 12 { return 0 }
+    return old
+  }
+  switch k {
+  case 1, 2:
+    if c != 45 && (c < 48 || c > 57) {
+      f.bad = true
+      return old
+    }
+    x, ok := f.int_text()
+    if !ok {
+      f.bad = true
+      return old
+    }
+    if d != f.rd {
+      f.rd = d
+      f.rlo, f.rhi, f.rok = int_range_of(d)
+    }
+    if (f.rok && (x < f.rlo || x > f.rhi)) || (k == 2 && x < 0) {
+      f.bad = true
+      return old
+    }
+    return x
+  case 3:
+    if c != 45 && (c < 48 || c > 57) {
+      f.bad = true
+      return old
+    }
+    start := f.i
+    fx := 0.0
+    k2, ok2 := f.int_text()
+    if ok2 {
+      fx = num(k2)
+    } else {
+      f.skip()
+      y, err := strconv.parse_float(f.s[start:f.i])
+      if err != nil {
+        f.bad = true
+        return old
+      }
+      fx = y
+    }
+    if dname(d) == "float32" { return __fbits(num(float32(fx))) }
+    return __fbits(fx)
+  case 4:
+    if c == 116 {
+      f.i += 4
+      return 1
+    }
+    if c == 102 {
+      f.i += 5
+      return 0
+    }
+    f.bad = true
+    return old
+  case 5:
+    if c != 34 {
+      f.bad = true
+      return old
+    }
+    return f.str_word()
+  case 6:
+    if c != 91 {
+      f.bad = true
+      return old
+    }
+    ed := delem(d)
+    f.i++
+    count := f.count_items()
+    s := __make_slice(ed, count, count)
+    data := __load64(s)
+    for idx := 0; idx < count; idx++ {
+      w := f.word(ed, eload(data, idx, ed))
+      if f.bad { return old }
+      estore(data, idx, ed, w)
+      if __load8(f.p + f.i) <= 32 { f.ws() }
+      f.i++
+    }
+    if count == 0 {
+      if __load8(f.p + f.i) <= 32 { f.ws() }
+      f.i++
+    }
+    return s
+  case 7:
+    if c != 91 {
+      f.bad = true
+      return old
+    }
+    ed := delem(d)
+    data := old
+    if data == 0 { data = __zero(d) }
+    n := dcount(d)
+    f.i++
+    if __load8(f.p + f.i) <= 32 { f.ws() }
+    idx := 0
+    if __load8(f.p + f.i) == 93 {
+      f.i++
+    } else {
+      while true {
+        if __load8(f.p + f.i) <= 32 { f.ws() }
+        if idx < n {
+          w := f.word(ed, eload(data, idx, ed))
+          if f.bad { return old }
+          estore(data, idx, ed, w)
+        } else { f.skip() }
+        idx++
+        if __load8(f.p + f.i) <= 32 { f.ws() }
+        c2 := __load8(f.p + f.i)
+        f.i++
+        if c2 != 44 { break }
+      }
+    }
+    while idx < n {
+      estore(data, idx, ed, __zero(ed))
+      idx++
+    }
+    return data
+  case 8:
+    if c != 123 {
+      f.bad = true
+      return old
+    }
+    return f.object(d, old)
+  case 9:
+    ed := delem(d)
+    if dkind(ed) == 7 || dkind(ed) == 8 {
+      obj := old
+      if obj == 0 { obj = __zero(ed) }
+      return f.word(ed, obj)
+    }
+    cell := old
+    if cell == 0 {
+      cell = __alloc(8)
+      __store64(cell, __zero(ed))
+    }
+    w := f.word(ed, __load64(cell))
+    __store64(cell, w)
+    return cell
+  case 10:
+    if c != 123 || dkind(dkey(d)) != 5 {
+      f.bad = true
+      return old
+    }
+    return f.map_obj(d, old)
+  case 11:
+    return __anyp(f.tree().to_any())
+  }
+  f.bad = true
+  return old
+}
+
+fn lower(c: int) -> int {
+  if c >= 65 && c <= 90 { return c + 32 }
+  return c
+}
+
+# do the m bytes at q equal the m bytes at r?
+fn same_bytes(q: int, r: int, m: int) -> bool {
+  k := 0
+  while k + 8 <= m {
+    if __load64(q + k) != __load64(r + k) { return false }
+    k += 8
+  }
+  while k < m {
+    if __load8(q + k) != __load8(r + k) { return false }
+    k++
+  }
+  return true
+}
+
+# the field whose name is the key (bytes [a, b) at p), exactly (ci false) or without regard to
+# case (ci true), or -1; the field at hint is tried first (keys usually come in field order)
+fn find_field(pl: *Plan, p: int, a: int, b: int, ci: bool, hint: int) -> int {
+  m := b - a
+  if !ci && hint < pl.n {
+    nm := pl.names[hint]
+    if len(nm) == m && same_bytes(__strp(nm) + 8, p + a, m) { return hint }
+  }
+  for i := 0; i < pl.n; i++ {
+    nm := pl.names[i]
+    if len(nm) != m { continue }
+    q := __strp(nm) + 8
+    if !ci {
+      if same_bytes(q, p + a, m) { return i }
+      continue
+    }
+    k := 0
+    while k < m && lower(__load8(q + k)) == lower(__load8(p + a + k)) { k++ }
+    if k == m { return i }
+  }
+  return -1
+}
+
+# a JSON object into a struct of type d (filled in place); vtyped already matched each key to its
+# field (Fast.keys), with the same rules as the tree decoder
+fn (f: *Fast) object(d: int, old: int) -> int {
+  pl := f.last_plan
+  if d != f.last_d {
+    pl = plan_of(d)
+    f.last_d = d
+    f.last_plan = pl
+  }
+  obj := old
+  if obj == 0 { obj = __zero(d) }
+  f.i++
+  if __load8(f.p + f.i) <= 32 { f.ws() }
+  if __load8(f.p + f.i) == 125 {
+    f.i++
+    return obj
+  }
+  keys := f.keys
+  while true {
+    kc := f.kc
+    fi := keys[kc]
+    f.i = keys[kc + 1]
+    f.kc = kc + 2
+    if fi >= 0 {
+      fd := pl.descs[fi]
+      if __load8(f.p + f.i) == 34 && dkind(fd) == 5 {
+        __store64(obj + 8 * fi, f.str_word())
+      } else {
+        w := f.word(fd, __load64(obj + 8 * fi))
+        if f.bad { return obj }
+        __store64(obj + 8 * fi, w)
+        if f.last_d != d {
+          f.last_d = d
+          f.last_plan = pl
+        }
+      }
+    } else { f.skip() }
+    if __load8(f.p + f.i) <= 32 { f.ws() }
+    c := __load8(f.p + f.i)
+    f.i++
+    if c != 44 { break }
+  }
+  return obj
+}
+
+# a JSON object into a map with string keys
+fn (f: *Fast) map_obj(d: int, old: int) -> int {
+  vd := delem(d)
+  m := old
+  if m == 0 { m = __map_new(2) }
+  f.i++
+  if __load8(f.p + f.i) <= 32 { f.ws() }
+  if __load8(f.p + f.i) == 125 {
+    f.i++
+    return m
+  }
+  while true {
+    if __load8(f.p + f.i) <= 32 { f.ws() }
+    key := __pstr(f.str_word())
+    if __load8(f.p + f.i) <= 32 { f.ws() }
+    f.i++
+    w := f.word(vd, __zero(vd))
+    if f.bad { return m }
+    __map_set(m, __strp(key), w)
+    if __load8(f.p + f.i) <= 32 { f.ws() }
+    c := __load8(f.p + f.i)
+    f.i++
+    if c != 44 { break }
+  }
+  return m
 }
