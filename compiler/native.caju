@@ -3339,6 +3339,14 @@ fn (f: *Fn) compare(n: *ast.Node) {
     A.push(RAX)
     f.expr(n.right)
     A.push(RAX)
+    if op == "==" || op == "!=" {
+      # equality only needs rt_streq (lengths first, 8 bytes at a time)
+      f.rt("rt_streq", 2)
+      A.cmp_imm(RAX, 0)
+      if op == "==" { A.setcc(CC_NE, RAX) } else { A.setcc(CC_E, RAX) }
+      A.movzxb(RAX, RAX)
+      return
+    }
     f.rt("rt_strcmp", 2)
     A.cmp_imm(RAX, 0)
     A.setcc(cc_signed(op), RAX)

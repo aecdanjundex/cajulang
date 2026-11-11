@@ -61,15 +61,17 @@ fn rt_concat(a: str, b: str) -> str {
   rt_copy(p + 8 + na, pb + 8, nb)
   return __pstr(p)
 }
-# compares by UTF-8 bytes (same order as the code points)
+# compares by UTF-8 bytes (same order as the code points); skips equal 8-byte words first
 fn rt_strcmp(a: str, b: str) -> int {
   pa := __strp(a)
   pb := __strp(b)
+  if pa == pb { return 0 }
   na := __load64(pa)
   nb := __load64(pb)
   n := na
   if nb < n { n = nb }
   i := 0
+  while i + 8 <= n and __load64(pa + 8 + i) == __load64(pb + 8 + i) { i += 8 }
   while i < n {
     x := __load8(pa + 8 + i)
     y := __load8(pb + 8 + i)
@@ -83,7 +85,21 @@ fn rt_strcmp(a: str, b: str) -> int {
   if na < nb { return -1 }
   return 1
 }
-fn rt_streq(a: str, b: str) -> bool { return rt_strcmp(a, b) == 0 }
+# a == b: the same length and bytes, 8 at a time; the last word is the 8 bytes ending at the last
+# byte (it overlaps bytes already compared, or the equal lengths in front of short strings)
+fn rt_streq(a: str, b: str) -> bool {
+  pa := __strp(a)
+  pb := __strp(b)
+  if pa == pb { return true }
+  n := __load64(pa)
+  if n != __load64(pb) { return false }
+  i := 0
+  while i + 8 < n {
+    if __load64(pa + 8 + i) != __load64(pb + 8 + i) { return false }
+    i += 8
+  }
+  return __load64(pa + n) == __load64(pb + n)
+}
 fn rt_bool_str(b: bool) -> str {
   if b { return "true" }
   return "false"
