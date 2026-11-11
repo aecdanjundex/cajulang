@@ -39,21 +39,24 @@ garantida pela suíte de testes e pela autocompilação.
 | 13–16 | mapas com etiqueta; listas globais em laços; operações direto em registradores; `num` em XMM; RSI/RDI/R8–R11 | 62 ms | 29 ms | 175 ms | 37 ms | 35 ms | 184 ms | 605 ms |
 | 17–18 | laços com teste no fim, código frio, desvios curtos; divisão e resto por constante sem `idiv` | 57 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
 | 19 | guarda antes do prólogo; `leave`; profundidade contando para baixo | 41 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
+| 20–25 | recursão com acumulador; limites fora de laços constantes; argumentos em registradores; laços versionados e vetorizados; índices já conferidos; mapas com `op=` numa sondagem | 26 ms | 22 ms | 65 ms | 40 ms | 14 ms | 140 ms | 632 ms |
 
 **Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
 matmul 1,8×, sort 2,2×, maps 2,1×.
 
-**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho, depois da rodada 18):
+**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho, depois da rodada 25;
+maps 3M remedido intercalado, porque a rodada do RESULTS.md pegou uma variação da máquina):
 
-| desafio | Caju antes | Caju depois | Go | Rust | Python | Caju ÷ Go antes → depois |
-|---|--:|--:|--:|--:|--:|--:|
-| fib 35 | 126 ms | 57 ms | 36 ms | 20 ms | 1.17 s | 3.2× → 1.6× |
-| sieve 10M | 435 ms | 20 ms | 19 ms | 19 ms | 1.99 s | 13× → 1.1× |
-| nbody 1M | 737 ms | 174 ms | 166 ms | 64 ms | 8.69 s | 4.3× → 1.1× |
-| mandelbrot 1k | 243 ms | 37 ms | 35 ms | 35 ms | 6.54 s | 6.4× → 1.1× |
-| matmul 300 | 256 ms | 33 ms | 31 ms | 11 ms | 5.67 s | 8.0× → 1.1× |
-| sort 2M | 637 ms | 165 ms | 135 ms | 129 ms | 6.37 s | 4.5× → 1.2× |
-| maps 3M | 2.00 s | 605 ms | 503 ms | 299 ms | 1.79 s | 3.3× → 1.2× |
+| desafio | Caju antes | Caju depois | Go | Rust | Python | Caju ÷ Go | Caju ÷ Rust |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| fib 35 | 126 ms | 26 ms | 40 ms | 21 ms | 1.22 s | 0.7× | 1.3× |
+| sieve 10M | 435 ms | 22 ms | 20 ms | 21 ms | 2.12 s | 1.1× | 1.0× |
+| nbody 1M | 737 ms | 65 ms | 173 ms | 66 ms | 9.78 s | 0.4× | 1.0× |
+| mandelbrot 1k | 243 ms | 40 ms | 38 ms | 38 ms | 6.30 s | 1.1× | 1.1× |
+| matmul 300 | 256 ms | 14 ms | 32 ms | 11 ms | 6.10 s | 0.4× | 1.2× |
+| sort 2M | 637 ms | 140 ms | 140 ms | 135 ms | 7.34 s | 1.0× | 1.0× |
+| maps 1M | — | 111 ms | 182 ms | 104 ms | 607 ms | 0.6× | 1.1× |
+| maps 3M | 2.00 s | 632 ms | 607 ms | 334 ms | 1.91 s | 1.0× | 1.9× |
 
 Contra Python, a Caju passou de 3 a 25 vezes mais rápida para 2 a 70 vezes (e nos mapas, de empate
 para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuções (o matmul variou de
@@ -445,6 +448,32 @@ novo no fim de cada volta (o laço vai direto para o segundo comando). O laço d
 (resultados, volta dos 64 bits, ordem dos efeitos, structs por valor, exatamente 10.000 chamadas
 em seis formas, profundidade das chamadas nos argumentos, recursão infinita, divisão por zero na
 mesma linha, panic recuperado); passam também no compilador anterior.
+
+## Rodadas 20 a 25: atrás do Rust
+
+Com o Go alcançado, o alvo passou a ser o Rust, que executava 1,5× a 3× menos instruções em
+fib, nbody, matmul, sort e maps (`perf stat` nos três binários; `objdump` do Rust e `go tool
+objdump` mostraram o porquê). Seis agentes, um por hipótese, cada um num worktree; integrados um
+por um (cadeia desde o JS, suíte normal e com coleta a cada 64 KB, saídas iguais às do Go).
+Nenhum programa do benchmark foi alterado.
+
+| rodada | mudança | commit | efeito (instruções) |
+|---|---|---|---|
+| 20 | recursão como laço com acumulador: `return f(a) + f(b)` vira laço numa das chamadas (como o LLVM), com a profundidade contada por volta e devolvida no retorno | 3db2a83 | fib −31% |
+| 21 | laços `for v := E; v < C` com C constante: listas conferidas uma vez antes do laço; cópia sem verificações e o laço original quando falha; operandos `num` direto da memória | 719f14e | nbody −56% |
+| 22 | argumentos não-ponteiro em registradores (RSI, RDI, R8–R11) nas chamadas diretas; duas entradas por função (`u.r.` e `u.f.`); `early_guard` nos registradores | 3fcce14 | fib −12% |
+| 23 | laços contados versionados (limites conferidos antes, cópia sem verificações desenrolada ×4) e vetorizados com SSE2 quando o resultado é idêntico (aliasing conferido) | ca7cec0 | matmul −80% |
+| 24 | fatos de índice (`a[i]` já conferido não é conferido de novo até `a` ou `i` mudarem); `make` sem zerar de novo; páginas novas sem zerar (`rt_fresh`); condição repetida antes do corpo | 6529562 | sort −29%, sieve −5% |
+| 25 | mapas: `m[k] op= v` numa sondagem só (`rt_map_slot`); índice de 32 bits; vetores velhos liberados na hora e memória livre devolvida ao sistema | b2f68a7 | maps −36%; memória do maps 3M 132 → 50 MB |
+
+Resultados negativos registrados pelos agentes: sondagem em grupos estilo SwissTable com SSE2
+(menos desvios errados, mas mais instruções e mais ciclos); multiplicação vetorial de inteiros
+de 64 bits com `pmuludq` (o próprio Rust gasta mais instruções por elemento do que o escalar
+desenrolado).
+
+**Onde o Rust ainda ganha:** fib (1,3×: o laço do acumulador tem 10 instruções contra 7, pelo
+limite de profundidade e o `push` de volta), matmul (1,2×), mandelbrot (1,1×) e o maps grande
+(1,9×: a tabela do Rust é mais compacta e o hash mais barato).
 
 ## O que ficou para depois
 
