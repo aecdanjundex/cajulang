@@ -1,0 +1,1917 @@
+# Integer division and remainder by a constant: the native compiler replaces the check and the
+# idiv by shifts or a multiplication by a magic number (const_div). Every result must match the
+# same operation with the divisor in a variable (the general path), for every integer kind.
+# Generated; the divisors cover 1, -1, powers of two, magic numbers with and without the extra add.
+import { describe, it, expect, run_source } from "std/testing"
+
+# test values: small numbers, powers of two and their neighbours, the extremes, pseudo-random
+fn values() -> []int {
+  v := []int{}
+  for i := -300; i <= 300; i++ { v = append(v, i) }
+  for k := 1; k < 64; k++ {
+    p := 1 << k
+    v = append(v, p - 1, p, p + 1, -p + 1, -p, -p - 1)
+  }
+  m := 1 << 63
+  v = append(v, m, m + 1, m + 2, m - 1, m - 2, 1000000007, -1000000007, 999999999999, -999999999999)
+  x := 88172645463325252
+  for i := 0; i < 3000; i++ {
+    x = x ^ (x << 13)
+    x = x ^ ((x >> 7) & ((1 << 57) - 1))
+    x = x ^ (x << 17)
+    v = append(v, x, x >> (i % 64))
+  }
+  return v
+}
+
+fn q_int_0(x: int) -> int { return x / 1 }
+fn r_int_0(x: int) -> int { return x % 1 }
+fn qa_int_0(x: int) -> int {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_int_0(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_int_1(x: int) -> int { return x / -1 }
+fn r_int_1(x: int) -> int { return x % -1 }
+fn qa_int_1(x: int) -> int {
+  y := x
+  y /= -1
+  return y
+}
+fn ra_int_1(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -1
+  a[0] /= -1
+  return a[0] * 3 + a[1]
+}
+fn q_int_2(x: int) -> int { return x / 2 }
+fn r_int_2(x: int) -> int { return x % 2 }
+fn qa_int_2(x: int) -> int {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_int_2(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_int_3(x: int) -> int { return x / -2 }
+fn r_int_3(x: int) -> int { return x % -2 }
+fn qa_int_3(x: int) -> int {
+  y := x
+  y /= -2
+  return y
+}
+fn ra_int_3(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -2
+  a[0] /= -2
+  return a[0] * 3 + a[1]
+}
+fn q_int_4(x: int) -> int { return x / 3 }
+fn r_int_4(x: int) -> int { return x % 3 }
+fn qa_int_4(x: int) -> int {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_int_4(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_int_5(x: int) -> int { return x / -3 }
+fn r_int_5(x: int) -> int { return x % -3 }
+fn qa_int_5(x: int) -> int {
+  y := x
+  y /= -3
+  return y
+}
+fn ra_int_5(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -3
+  a[0] /= -3
+  return a[0] * 3 + a[1]
+}
+fn q_int_6(x: int) -> int { return x / 5 }
+fn r_int_6(x: int) -> int { return x % 5 }
+fn qa_int_6(x: int) -> int {
+  y := x
+  y /= 5
+  return y
+}
+fn ra_int_6(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 5
+  a[0] /= 5
+  return a[0] * 3 + a[1]
+}
+fn q_int_7(x: int) -> int { return x / -5 }
+fn r_int_7(x: int) -> int { return x % -5 }
+fn qa_int_7(x: int) -> int {
+  y := x
+  y /= -5
+  return y
+}
+fn ra_int_7(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -5
+  a[0] /= -5
+  return a[0] * 3 + a[1]
+}
+fn q_int_8(x: int) -> int { return x / 6 }
+fn r_int_8(x: int) -> int { return x % 6 }
+fn qa_int_8(x: int) -> int {
+  y := x
+  y /= 6
+  return y
+}
+fn ra_int_8(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 6
+  a[0] /= 6
+  return a[0] * 3 + a[1]
+}
+fn q_int_9(x: int) -> int { return x / 7 }
+fn r_int_9(x: int) -> int { return x % 7 }
+fn qa_int_9(x: int) -> int {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_int_9(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_int_10(x: int) -> int { return x / -7 }
+fn r_int_10(x: int) -> int { return x % -7 }
+fn qa_int_10(x: int) -> int {
+  y := x
+  y /= -7
+  return y
+}
+fn ra_int_10(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -7
+  a[0] /= -7
+  return a[0] * 3 + a[1]
+}
+fn q_int_11(x: int) -> int { return x / 10 }
+fn r_int_11(x: int) -> int { return x % 10 }
+fn qa_int_11(x: int) -> int {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_int_11(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_int_12(x: int) -> int { return x / -10 }
+fn r_int_12(x: int) -> int { return x % -10 }
+fn qa_int_12(x: int) -> int {
+  y := x
+  y /= -10
+  return y
+}
+fn ra_int_12(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -10
+  a[0] /= -10
+  return a[0] * 3 + a[1]
+}
+fn q_int_13(x: int) -> int { return x / 16 }
+fn r_int_13(x: int) -> int { return x % 16 }
+fn qa_int_13(x: int) -> int {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_int_13(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_int_14(x: int) -> int { return x / -16 }
+fn r_int_14(x: int) -> int { return x % -16 }
+fn qa_int_14(x: int) -> int {
+  y := x
+  y /= -16
+  return y
+}
+fn ra_int_14(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -16
+  a[0] /= -16
+  return a[0] * 3 + a[1]
+}
+fn q_int_15(x: int) -> int { return x / 25 }
+fn r_int_15(x: int) -> int { return x % 25 }
+fn qa_int_15(x: int) -> int {
+  y := x
+  y /= 25
+  return y
+}
+fn ra_int_15(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 25
+  a[0] /= 25
+  return a[0] * 3 + a[1]
+}
+fn q_int_16(x: int) -> int { return x / 60 }
+fn r_int_16(x: int) -> int { return x % 60 }
+fn qa_int_16(x: int) -> int {
+  y := x
+  y /= 60
+  return y
+}
+fn ra_int_16(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 60
+  a[0] /= 60
+  return a[0] * 3 + a[1]
+}
+fn q_int_17(x: int) -> int { return x / 100 }
+fn r_int_17(x: int) -> int { return x % 100 }
+fn qa_int_17(x: int) -> int {
+  y := x
+  y /= 100
+  return y
+}
+fn ra_int_17(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 100
+  a[0] /= 100
+  return a[0] * 3 + a[1]
+}
+fn q_int_18(x: int) -> int { return x / 125 }
+fn r_int_18(x: int) -> int { return x % 125 }
+fn qa_int_18(x: int) -> int {
+  y := x
+  y /= 125
+  return y
+}
+fn ra_int_18(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 125
+  a[0] /= 125
+  return a[0] * 3 + a[1]
+}
+fn q_int_19(x: int) -> int { return x / 641 }
+fn r_int_19(x: int) -> int { return x % 641 }
+fn qa_int_19(x: int) -> int {
+  y := x
+  y /= 641
+  return y
+}
+fn ra_int_19(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 641
+  a[0] /= 641
+  return a[0] * 3 + a[1]
+}
+fn q_int_20(x: int) -> int { return x / 1000 }
+fn r_int_20(x: int) -> int { return x % 1000 }
+fn qa_int_20(x: int) -> int {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_int_20(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_int_21(x: int) -> int { return x / -1000 }
+fn r_int_21(x: int) -> int { return x % -1000 }
+fn qa_int_21(x: int) -> int {
+  y := x
+  y /= -1000
+  return y
+}
+fn ra_int_21(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -1000
+  a[0] /= -1000
+  return a[0] * 3 + a[1]
+}
+fn q_int_22(x: int) -> int { return x / 1000000007 }
+fn r_int_22(x: int) -> int { return x % 1000000007 }
+fn qa_int_22(x: int) -> int {
+  y := x
+  y /= 1000000007
+  return y
+}
+fn ra_int_22(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 1000000007
+  a[0] /= 1000000007
+  return a[0] * 3 + a[1]
+}
+fn q_int_23(x: int) -> int { return x / 2147483647 }
+fn r_int_23(x: int) -> int { return x % 2147483647 }
+fn qa_int_23(x: int) -> int {
+  y := x
+  y /= 2147483647
+  return y
+}
+fn ra_int_23(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 2147483647
+  a[0] /= 2147483647
+  return a[0] * 3 + a[1]
+}
+fn q_int_24(x: int) -> int { return x / 2147483648 }
+fn r_int_24(x: int) -> int { return x % 2147483648 }
+fn qa_int_24(x: int) -> int {
+  y := x
+  y /= 2147483648
+  return y
+}
+fn ra_int_24(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 2147483648
+  a[0] /= 2147483648
+  return a[0] * 3 + a[1]
+}
+fn q_int_25(x: int) -> int { return x / -2147483648 }
+fn r_int_25(x: int) -> int { return x % -2147483648 }
+fn qa_int_25(x: int) -> int {
+  y := x
+  y /= -2147483648
+  return y
+}
+fn ra_int_25(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -2147483648
+  a[0] /= -2147483648
+  return a[0] * 3 + a[1]
+}
+fn q_int_26(x: int) -> int { return x / 4294967296 }
+fn r_int_26(x: int) -> int { return x % 4294967296 }
+fn qa_int_26(x: int) -> int {
+  y := x
+  y /= 4294967296
+  return y
+}
+fn ra_int_26(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 4294967296
+  a[0] /= 4294967296
+  return a[0] * 3 + a[1]
+}
+fn q_int_27(x: int) -> int { return x / 1099511627775 }
+fn r_int_27(x: int) -> int { return x % 1099511627775 }
+fn qa_int_27(x: int) -> int {
+  y := x
+  y /= 1099511627775
+  return y
+}
+fn ra_int_27(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 1099511627775
+  a[0] /= 1099511627775
+  return a[0] * 3 + a[1]
+}
+fn q_int_28(x: int) -> int { return x / 1099511627776 }
+fn r_int_28(x: int) -> int { return x % 1099511627776 }
+fn qa_int_28(x: int) -> int {
+  y := x
+  y /= 1099511627776
+  return y
+}
+fn ra_int_28(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 1099511627776
+  a[0] /= 1099511627776
+  return a[0] * 3 + a[1]
+}
+fn q_int_29(x: int) -> int { return x / -1099511627776 }
+fn r_int_29(x: int) -> int { return x % -1099511627776 }
+fn qa_int_29(x: int) -> int {
+  y := x
+  y /= -1099511627776
+  return y
+}
+fn ra_int_29(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= -1099511627776
+  a[0] /= -1099511627776
+  return a[0] * 3 + a[1]
+}
+fn q_int_30(x: int) -> int { return x / 6700417 }
+fn r_int_30(x: int) -> int { return x % 6700417 }
+fn qa_int_30(x: int) -> int {
+  y := x
+  y /= 6700417
+  return y
+}
+fn ra_int_30(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 6700417
+  a[0] /= 6700417
+  return a[0] * 3 + a[1]
+}
+fn q_int_31(x: int) -> int { return x / 9007199254740991 }
+fn r_int_31(x: int) -> int { return x % 9007199254740991 }
+fn qa_int_31(x: int) -> int {
+  y := x
+  y /= 9007199254740991
+  return y
+}
+fn ra_int_31(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 9007199254740991
+  a[0] /= 9007199254740991
+  return a[0] * 3 + a[1]
+}
+fn q_int_32(x: int) -> int { return x / 4503599627370496 }
+fn r_int_32(x: int) -> int { return x % 4503599627370496 }
+fn qa_int_32(x: int) -> int {
+  y := x
+  y /= 4503599627370496
+  return y
+}
+fn ra_int_32(x: int) -> int {
+  a := []int{x, x}
+  a[1] %= 4503599627370496
+  a[0] /= 4503599627370496
+  return a[0] * 3 + a[1]
+}
+fn check_int() -> []str {
+  ds := []int{1, -1, 2, -2, 3, -3, 5, -5, 6, 7, -7, 10, -10, 16, -16, 25, 60, 100, 125, 641, 1000, -1000, 1000000007, 2147483647, 2147483648, -2147483648, 4294967296, 1099511627775, 1099511627776, -1099511627776, 6700417, 9007199254740991, 4503599627370496}
+  bad := []str{}
+  for _, v := range values() {
+    x := int(v)
+    if q_int_0(x) != x / ds[0] || r_int_0(x) != x % ds[0] || qa_int_0(x) != x / ds[0] || ra_int_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_int_1(x) != x / ds[1] || r_int_1(x) != x % ds[1] || qa_int_1(x) != x / ds[1] || ra_int_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_int_2(x) != x / ds[2] || r_int_2(x) != x % ds[2] || qa_int_2(x) != x / ds[2] || ra_int_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_int_3(x) != x / ds[3] || r_int_3(x) != x % ds[3] || qa_int_3(x) != x / ds[3] || ra_int_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_int_4(x) != x / ds[4] || r_int_4(x) != x % ds[4] || qa_int_4(x) != x / ds[4] || ra_int_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_int_5(x) != x / ds[5] || r_int_5(x) != x % ds[5] || qa_int_5(x) != x / ds[5] || ra_int_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_int_6(x) != x / ds[6] || r_int_6(x) != x % ds[6] || qa_int_6(x) != x / ds[6] || ra_int_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_int_7(x) != x / ds[7] || r_int_7(x) != x % ds[7] || qa_int_7(x) != x / ds[7] || ra_int_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_int_8(x) != x / ds[8] || r_int_8(x) != x % ds[8] || qa_int_8(x) != x / ds[8] || ra_int_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_int_9(x) != x / ds[9] || r_int_9(x) != x % ds[9] || qa_int_9(x) != x / ds[9] || ra_int_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+    if q_int_10(x) != x / ds[10] || r_int_10(x) != x % ds[10] || qa_int_10(x) != x / ds[10] || ra_int_10(x) != (x / ds[10]) * 3 + x % ds[10] { bad = append(bad, str(x) + " by " + str(ds[10])) }
+    if q_int_11(x) != x / ds[11] || r_int_11(x) != x % ds[11] || qa_int_11(x) != x / ds[11] || ra_int_11(x) != (x / ds[11]) * 3 + x % ds[11] { bad = append(bad, str(x) + " by " + str(ds[11])) }
+    if q_int_12(x) != x / ds[12] || r_int_12(x) != x % ds[12] || qa_int_12(x) != x / ds[12] || ra_int_12(x) != (x / ds[12]) * 3 + x % ds[12] { bad = append(bad, str(x) + " by " + str(ds[12])) }
+    if q_int_13(x) != x / ds[13] || r_int_13(x) != x % ds[13] || qa_int_13(x) != x / ds[13] || ra_int_13(x) != (x / ds[13]) * 3 + x % ds[13] { bad = append(bad, str(x) + " by " + str(ds[13])) }
+    if q_int_14(x) != x / ds[14] || r_int_14(x) != x % ds[14] || qa_int_14(x) != x / ds[14] || ra_int_14(x) != (x / ds[14]) * 3 + x % ds[14] { bad = append(bad, str(x) + " by " + str(ds[14])) }
+    if q_int_15(x) != x / ds[15] || r_int_15(x) != x % ds[15] || qa_int_15(x) != x / ds[15] || ra_int_15(x) != (x / ds[15]) * 3 + x % ds[15] { bad = append(bad, str(x) + " by " + str(ds[15])) }
+    if q_int_16(x) != x / ds[16] || r_int_16(x) != x % ds[16] || qa_int_16(x) != x / ds[16] || ra_int_16(x) != (x / ds[16]) * 3 + x % ds[16] { bad = append(bad, str(x) + " by " + str(ds[16])) }
+    if q_int_17(x) != x / ds[17] || r_int_17(x) != x % ds[17] || qa_int_17(x) != x / ds[17] || ra_int_17(x) != (x / ds[17]) * 3 + x % ds[17] { bad = append(bad, str(x) + " by " + str(ds[17])) }
+    if q_int_18(x) != x / ds[18] || r_int_18(x) != x % ds[18] || qa_int_18(x) != x / ds[18] || ra_int_18(x) != (x / ds[18]) * 3 + x % ds[18] { bad = append(bad, str(x) + " by " + str(ds[18])) }
+    if q_int_19(x) != x / ds[19] || r_int_19(x) != x % ds[19] || qa_int_19(x) != x / ds[19] || ra_int_19(x) != (x / ds[19]) * 3 + x % ds[19] { bad = append(bad, str(x) + " by " + str(ds[19])) }
+    if q_int_20(x) != x / ds[20] || r_int_20(x) != x % ds[20] || qa_int_20(x) != x / ds[20] || ra_int_20(x) != (x / ds[20]) * 3 + x % ds[20] { bad = append(bad, str(x) + " by " + str(ds[20])) }
+    if q_int_21(x) != x / ds[21] || r_int_21(x) != x % ds[21] || qa_int_21(x) != x / ds[21] || ra_int_21(x) != (x / ds[21]) * 3 + x % ds[21] { bad = append(bad, str(x) + " by " + str(ds[21])) }
+    if q_int_22(x) != x / ds[22] || r_int_22(x) != x % ds[22] || qa_int_22(x) != x / ds[22] || ra_int_22(x) != (x / ds[22]) * 3 + x % ds[22] { bad = append(bad, str(x) + " by " + str(ds[22])) }
+    if q_int_23(x) != x / ds[23] || r_int_23(x) != x % ds[23] || qa_int_23(x) != x / ds[23] || ra_int_23(x) != (x / ds[23]) * 3 + x % ds[23] { bad = append(bad, str(x) + " by " + str(ds[23])) }
+    if q_int_24(x) != x / ds[24] || r_int_24(x) != x % ds[24] || qa_int_24(x) != x / ds[24] || ra_int_24(x) != (x / ds[24]) * 3 + x % ds[24] { bad = append(bad, str(x) + " by " + str(ds[24])) }
+    if q_int_25(x) != x / ds[25] || r_int_25(x) != x % ds[25] || qa_int_25(x) != x / ds[25] || ra_int_25(x) != (x / ds[25]) * 3 + x % ds[25] { bad = append(bad, str(x) + " by " + str(ds[25])) }
+    if q_int_26(x) != x / ds[26] || r_int_26(x) != x % ds[26] || qa_int_26(x) != x / ds[26] || ra_int_26(x) != (x / ds[26]) * 3 + x % ds[26] { bad = append(bad, str(x) + " by " + str(ds[26])) }
+    if q_int_27(x) != x / ds[27] || r_int_27(x) != x % ds[27] || qa_int_27(x) != x / ds[27] || ra_int_27(x) != (x / ds[27]) * 3 + x % ds[27] { bad = append(bad, str(x) + " by " + str(ds[27])) }
+    if q_int_28(x) != x / ds[28] || r_int_28(x) != x % ds[28] || qa_int_28(x) != x / ds[28] || ra_int_28(x) != (x / ds[28]) * 3 + x % ds[28] { bad = append(bad, str(x) + " by " + str(ds[28])) }
+    if q_int_29(x) != x / ds[29] || r_int_29(x) != x % ds[29] || qa_int_29(x) != x / ds[29] || ra_int_29(x) != (x / ds[29]) * 3 + x % ds[29] { bad = append(bad, str(x) + " by " + str(ds[29])) }
+    if q_int_30(x) != x / ds[30] || r_int_30(x) != x % ds[30] || qa_int_30(x) != x / ds[30] || ra_int_30(x) != (x / ds[30]) * 3 + x % ds[30] { bad = append(bad, str(x) + " by " + str(ds[30])) }
+    if q_int_31(x) != x / ds[31] || r_int_31(x) != x % ds[31] || qa_int_31(x) != x / ds[31] || ra_int_31(x) != (x / ds[31]) * 3 + x % ds[31] { bad = append(bad, str(x) + " by " + str(ds[31])) }
+    if q_int_32(x) != x / ds[32] || r_int_32(x) != x % ds[32] || qa_int_32(x) != x / ds[32] || ra_int_32(x) != (x / ds[32]) * 3 + x % ds[32] { bad = append(bad, str(x) + " by " + str(ds[32])) }
+  }
+  return bad
+}
+
+fn q_int64_0(x: int64) -> int64 { return x / 1 }
+fn r_int64_0(x: int64) -> int64 { return x % 1 }
+fn qa_int64_0(x: int64) -> int64 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_int64_0(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_int64_1(x: int64) -> int64 { return x / -1 }
+fn r_int64_1(x: int64) -> int64 { return x % -1 }
+fn qa_int64_1(x: int64) -> int64 {
+  y := x
+  y /= -1
+  return y
+}
+fn ra_int64_1(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= -1
+  a[0] /= -1
+  return a[0] * 3 + a[1]
+}
+fn q_int64_2(x: int64) -> int64 { return x / 2 }
+fn r_int64_2(x: int64) -> int64 { return x % 2 }
+fn qa_int64_2(x: int64) -> int64 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_int64_2(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_int64_3(x: int64) -> int64 { return x / 3 }
+fn r_int64_3(x: int64) -> int64 { return x % 3 }
+fn qa_int64_3(x: int64) -> int64 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_int64_3(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_int64_4(x: int64) -> int64 { return x / -3 }
+fn r_int64_4(x: int64) -> int64 { return x % -3 }
+fn qa_int64_4(x: int64) -> int64 {
+  y := x
+  y /= -3
+  return y
+}
+fn ra_int64_4(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= -3
+  a[0] /= -3
+  return a[0] * 3 + a[1]
+}
+fn q_int64_5(x: int64) -> int64 { return x / 7 }
+fn r_int64_5(x: int64) -> int64 { return x % 7 }
+fn qa_int64_5(x: int64) -> int64 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_int64_5(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_int64_6(x: int64) -> int64 { return x / 10 }
+fn r_int64_6(x: int64) -> int64 { return x % 10 }
+fn qa_int64_6(x: int64) -> int64 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_int64_6(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_int64_7(x: int64) -> int64 { return x / -10 }
+fn r_int64_7(x: int64) -> int64 { return x % -10 }
+fn qa_int64_7(x: int64) -> int64 {
+  y := x
+  y /= -10
+  return y
+}
+fn ra_int64_7(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= -10
+  a[0] /= -10
+  return a[0] * 3 + a[1]
+}
+fn q_int64_8(x: int64) -> int64 { return x / 64 }
+fn r_int64_8(x: int64) -> int64 { return x % 64 }
+fn qa_int64_8(x: int64) -> int64 {
+  y := x
+  y /= 64
+  return y
+}
+fn ra_int64_8(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 64
+  a[0] /= 64
+  return a[0] * 3 + a[1]
+}
+fn q_int64_9(x: int64) -> int64 { return x / 1000000007 }
+fn r_int64_9(x: int64) -> int64 { return x % 1000000007 }
+fn qa_int64_9(x: int64) -> int64 {
+  y := x
+  y /= 1000000007
+  return y
+}
+fn ra_int64_9(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 1000000007
+  a[0] /= 1000000007
+  return a[0] * 3 + a[1]
+}
+fn q_int64_10(x: int64) -> int64 { return x / 2147483648 }
+fn r_int64_10(x: int64) -> int64 { return x % 2147483648 }
+fn qa_int64_10(x: int64) -> int64 {
+  y := x
+  y /= 2147483648
+  return y
+}
+fn ra_int64_10(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 2147483648
+  a[0] /= 2147483648
+  return a[0] * 3 + a[1]
+}
+fn q_int64_11(x: int64) -> int64 { return x / 9007199254740991 }
+fn r_int64_11(x: int64) -> int64 { return x % 9007199254740991 }
+fn qa_int64_11(x: int64) -> int64 {
+  y := x
+  y /= 9007199254740991
+  return y
+}
+fn ra_int64_11(x: int64) -> int64 {
+  a := []int64{x, x}
+  a[1] %= 9007199254740991
+  a[0] /= 9007199254740991
+  return a[0] * 3 + a[1]
+}
+fn check_int64() -> []str {
+  ds := []int64{1, -1, 2, 3, -3, 7, 10, -10, 64, 1000000007, 2147483648, 9007199254740991}
+  bad := []str{}
+  for _, v := range values() {
+    x := int64(v)
+    if q_int64_0(x) != x / ds[0] || r_int64_0(x) != x % ds[0] || qa_int64_0(x) != x / ds[0] || ra_int64_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_int64_1(x) != x / ds[1] || r_int64_1(x) != x % ds[1] || qa_int64_1(x) != x / ds[1] || ra_int64_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_int64_2(x) != x / ds[2] || r_int64_2(x) != x % ds[2] || qa_int64_2(x) != x / ds[2] || ra_int64_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_int64_3(x) != x / ds[3] || r_int64_3(x) != x % ds[3] || qa_int64_3(x) != x / ds[3] || ra_int64_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_int64_4(x) != x / ds[4] || r_int64_4(x) != x % ds[4] || qa_int64_4(x) != x / ds[4] || ra_int64_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_int64_5(x) != x / ds[5] || r_int64_5(x) != x % ds[5] || qa_int64_5(x) != x / ds[5] || ra_int64_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_int64_6(x) != x / ds[6] || r_int64_6(x) != x % ds[6] || qa_int64_6(x) != x / ds[6] || ra_int64_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_int64_7(x) != x / ds[7] || r_int64_7(x) != x % ds[7] || qa_int64_7(x) != x / ds[7] || ra_int64_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_int64_8(x) != x / ds[8] || r_int64_8(x) != x % ds[8] || qa_int64_8(x) != x / ds[8] || ra_int64_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_int64_9(x) != x / ds[9] || r_int64_9(x) != x % ds[9] || qa_int64_9(x) != x / ds[9] || ra_int64_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+    if q_int64_10(x) != x / ds[10] || r_int64_10(x) != x % ds[10] || qa_int64_10(x) != x / ds[10] || ra_int64_10(x) != (x / ds[10]) * 3 + x % ds[10] { bad = append(bad, str(x) + " by " + str(ds[10])) }
+    if q_int64_11(x) != x / ds[11] || r_int64_11(x) != x % ds[11] || qa_int64_11(x) != x / ds[11] || ra_int64_11(x) != (x / ds[11]) * 3 + x % ds[11] { bad = append(bad, str(x) + " by " + str(ds[11])) }
+  }
+  return bad
+}
+
+fn q_int32_0(x: int32) -> int32 { return x / 1 }
+fn r_int32_0(x: int32) -> int32 { return x % 1 }
+fn qa_int32_0(x: int32) -> int32 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_int32_0(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_int32_1(x: int32) -> int32 { return x / 2 }
+fn r_int32_1(x: int32) -> int32 { return x % 2 }
+fn qa_int32_1(x: int32) -> int32 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_int32_1(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_int32_2(x: int32) -> int32 { return x / 3 }
+fn r_int32_2(x: int32) -> int32 { return x % 3 }
+fn qa_int32_2(x: int32) -> int32 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_int32_2(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_int32_3(x: int32) -> int32 { return x / 7 }
+fn r_int32_3(x: int32) -> int32 { return x % 7 }
+fn qa_int32_3(x: int32) -> int32 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_int32_3(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_int32_4(x: int32) -> int32 { return x / 10 }
+fn r_int32_4(x: int32) -> int32 { return x % 10 }
+fn qa_int32_4(x: int32) -> int32 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_int32_4(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_int32_5(x: int32) -> int32 { return x / 16 }
+fn r_int32_5(x: int32) -> int32 { return x % 16 }
+fn qa_int32_5(x: int32) -> int32 {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_int32_5(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_int32_6(x: int32) -> int32 { return x / 100 }
+fn r_int32_6(x: int32) -> int32 { return x % 100 }
+fn qa_int32_6(x: int32) -> int32 {
+  y := x
+  y /= 100
+  return y
+}
+fn ra_int32_6(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 100
+  a[0] /= 100
+  return a[0] * 3 + a[1]
+}
+fn q_int32_7(x: int32) -> int32 { return x / 1000 }
+fn r_int32_7(x: int32) -> int32 { return x % 1000 }
+fn qa_int32_7(x: int32) -> int32 {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_int32_7(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_int32_8(x: int32) -> int32 { return x / 65536 }
+fn r_int32_8(x: int32) -> int32 { return x % 65536 }
+fn qa_int32_8(x: int32) -> int32 {
+  y := x
+  y /= 65536
+  return y
+}
+fn ra_int32_8(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 65536
+  a[0] /= 65536
+  return a[0] * 3 + a[1]
+}
+fn q_int32_9(x: int32) -> int32 { return x / 1000000007 }
+fn r_int32_9(x: int32) -> int32 { return x % 1000000007 }
+fn qa_int32_9(x: int32) -> int32 {
+  y := x
+  y /= 1000000007
+  return y
+}
+fn ra_int32_9(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 1000000007
+  a[0] /= 1000000007
+  return a[0] * 3 + a[1]
+}
+fn q_int32_10(x: int32) -> int32 { return x / 2147483647 }
+fn r_int32_10(x: int32) -> int32 { return x % 2147483647 }
+fn qa_int32_10(x: int32) -> int32 {
+  y := x
+  y /= 2147483647
+  return y
+}
+fn ra_int32_10(x: int32) -> int32 {
+  a := []int32{x, x}
+  a[1] %= 2147483647
+  a[0] /= 2147483647
+  return a[0] * 3 + a[1]
+}
+fn check_int32() -> []str {
+  ds := []int32{1, 2, 3, 7, 10, 16, 100, 1000, 65536, 1000000007, 2147483647}
+  bad := []str{}
+  for _, v := range values() {
+    x := int32(v)
+    if q_int32_0(x) != x / ds[0] || r_int32_0(x) != x % ds[0] || qa_int32_0(x) != x / ds[0] || ra_int32_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_int32_1(x) != x / ds[1] || r_int32_1(x) != x % ds[1] || qa_int32_1(x) != x / ds[1] || ra_int32_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_int32_2(x) != x / ds[2] || r_int32_2(x) != x % ds[2] || qa_int32_2(x) != x / ds[2] || ra_int32_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_int32_3(x) != x / ds[3] || r_int32_3(x) != x % ds[3] || qa_int32_3(x) != x / ds[3] || ra_int32_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_int32_4(x) != x / ds[4] || r_int32_4(x) != x % ds[4] || qa_int32_4(x) != x / ds[4] || ra_int32_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_int32_5(x) != x / ds[5] || r_int32_5(x) != x % ds[5] || qa_int32_5(x) != x / ds[5] || ra_int32_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_int32_6(x) != x / ds[6] || r_int32_6(x) != x % ds[6] || qa_int32_6(x) != x / ds[6] || ra_int32_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_int32_7(x) != x / ds[7] || r_int32_7(x) != x % ds[7] || qa_int32_7(x) != x / ds[7] || ra_int32_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_int32_8(x) != x / ds[8] || r_int32_8(x) != x % ds[8] || qa_int32_8(x) != x / ds[8] || ra_int32_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_int32_9(x) != x / ds[9] || r_int32_9(x) != x % ds[9] || qa_int32_9(x) != x / ds[9] || ra_int32_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+    if q_int32_10(x) != x / ds[10] || r_int32_10(x) != x % ds[10] || qa_int32_10(x) != x / ds[10] || ra_int32_10(x) != (x / ds[10]) * 3 + x % ds[10] { bad = append(bad, str(x) + " by " + str(ds[10])) }
+  }
+  return bad
+}
+
+fn q_int16_0(x: int16) -> int16 { return x / 1 }
+fn r_int16_0(x: int16) -> int16 { return x % 1 }
+fn qa_int16_0(x: int16) -> int16 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_int16_0(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_int16_1(x: int16) -> int16 { return x / 2 }
+fn r_int16_1(x: int16) -> int16 { return x % 2 }
+fn qa_int16_1(x: int16) -> int16 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_int16_1(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_int16_2(x: int16) -> int16 { return x / 3 }
+fn r_int16_2(x: int16) -> int16 { return x % 3 }
+fn qa_int16_2(x: int16) -> int16 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_int16_2(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_int16_3(x: int16) -> int16 { return x / 7 }
+fn r_int16_3(x: int16) -> int16 { return x % 7 }
+fn qa_int16_3(x: int16) -> int16 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_int16_3(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_int16_4(x: int16) -> int16 { return x / 10 }
+fn r_int16_4(x: int16) -> int16 { return x % 10 }
+fn qa_int16_4(x: int16) -> int16 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_int16_4(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_int16_5(x: int16) -> int16 { return x / 16 }
+fn r_int16_5(x: int16) -> int16 { return x % 16 }
+fn qa_int16_5(x: int16) -> int16 {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_int16_5(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_int16_6(x: int16) -> int16 { return x / 100 }
+fn r_int16_6(x: int16) -> int16 { return x % 100 }
+fn qa_int16_6(x: int16) -> int16 {
+  y := x
+  y /= 100
+  return y
+}
+fn ra_int16_6(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 100
+  a[0] /= 100
+  return a[0] * 3 + a[1]
+}
+fn q_int16_7(x: int16) -> int16 { return x / 255 }
+fn r_int16_7(x: int16) -> int16 { return x % 255 }
+fn qa_int16_7(x: int16) -> int16 {
+  y := x
+  y /= 255
+  return y
+}
+fn ra_int16_7(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 255
+  a[0] /= 255
+  return a[0] * 3 + a[1]
+}
+fn q_int16_8(x: int16) -> int16 { return x / 1000 }
+fn r_int16_8(x: int16) -> int16 { return x % 1000 }
+fn qa_int16_8(x: int16) -> int16 {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_int16_8(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_int16_9(x: int16) -> int16 { return x / 32767 }
+fn r_int16_9(x: int16) -> int16 { return x % 32767 }
+fn qa_int16_9(x: int16) -> int16 {
+  y := x
+  y /= 32767
+  return y
+}
+fn ra_int16_9(x: int16) -> int16 {
+  a := []int16{x, x}
+  a[1] %= 32767
+  a[0] /= 32767
+  return a[0] * 3 + a[1]
+}
+fn check_int16() -> []str {
+  ds := []int16{1, 2, 3, 7, 10, 16, 100, 255, 1000, 32767}
+  bad := []str{}
+  for _, v := range values() {
+    x := int16(v)
+    if q_int16_0(x) != x / ds[0] || r_int16_0(x) != x % ds[0] || qa_int16_0(x) != x / ds[0] || ra_int16_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_int16_1(x) != x / ds[1] || r_int16_1(x) != x % ds[1] || qa_int16_1(x) != x / ds[1] || ra_int16_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_int16_2(x) != x / ds[2] || r_int16_2(x) != x % ds[2] || qa_int16_2(x) != x / ds[2] || ra_int16_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_int16_3(x) != x / ds[3] || r_int16_3(x) != x % ds[3] || qa_int16_3(x) != x / ds[3] || ra_int16_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_int16_4(x) != x / ds[4] || r_int16_4(x) != x % ds[4] || qa_int16_4(x) != x / ds[4] || ra_int16_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_int16_5(x) != x / ds[5] || r_int16_5(x) != x % ds[5] || qa_int16_5(x) != x / ds[5] || ra_int16_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_int16_6(x) != x / ds[6] || r_int16_6(x) != x % ds[6] || qa_int16_6(x) != x / ds[6] || ra_int16_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_int16_7(x) != x / ds[7] || r_int16_7(x) != x % ds[7] || qa_int16_7(x) != x / ds[7] || ra_int16_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_int16_8(x) != x / ds[8] || r_int16_8(x) != x % ds[8] || qa_int16_8(x) != x / ds[8] || ra_int16_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_int16_9(x) != x / ds[9] || r_int16_9(x) != x % ds[9] || qa_int16_9(x) != x / ds[9] || ra_int16_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+  }
+  return bad
+}
+
+fn q_int8_0(x: int8) -> int8 { return x / 1 }
+fn r_int8_0(x: int8) -> int8 { return x % 1 }
+fn qa_int8_0(x: int8) -> int8 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_int8_0(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_int8_1(x: int8) -> int8 { return x / 2 }
+fn r_int8_1(x: int8) -> int8 { return x % 2 }
+fn qa_int8_1(x: int8) -> int8 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_int8_1(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_int8_2(x: int8) -> int8 { return x / 3 }
+fn r_int8_2(x: int8) -> int8 { return x % 3 }
+fn qa_int8_2(x: int8) -> int8 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_int8_2(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_int8_3(x: int8) -> int8 { return x / 5 }
+fn r_int8_3(x: int8) -> int8 { return x % 5 }
+fn qa_int8_3(x: int8) -> int8 {
+  y := x
+  y /= 5
+  return y
+}
+fn ra_int8_3(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 5
+  a[0] /= 5
+  return a[0] * 3 + a[1]
+}
+fn q_int8_4(x: int8) -> int8 { return x / 7 }
+fn r_int8_4(x: int8) -> int8 { return x % 7 }
+fn qa_int8_4(x: int8) -> int8 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_int8_4(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_int8_5(x: int8) -> int8 { return x / 10 }
+fn r_int8_5(x: int8) -> int8 { return x % 10 }
+fn qa_int8_5(x: int8) -> int8 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_int8_5(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_int8_6(x: int8) -> int8 { return x / 16 }
+fn r_int8_6(x: int8) -> int8 { return x % 16 }
+fn qa_int8_6(x: int8) -> int8 {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_int8_6(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_int8_7(x: int8) -> int8 { return x / 64 }
+fn r_int8_7(x: int8) -> int8 { return x % 64 }
+fn qa_int8_7(x: int8) -> int8 {
+  y := x
+  y /= 64
+  return y
+}
+fn ra_int8_7(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 64
+  a[0] /= 64
+  return a[0] * 3 + a[1]
+}
+fn q_int8_8(x: int8) -> int8 { return x / 100 }
+fn r_int8_8(x: int8) -> int8 { return x % 100 }
+fn qa_int8_8(x: int8) -> int8 {
+  y := x
+  y /= 100
+  return y
+}
+fn ra_int8_8(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 100
+  a[0] /= 100
+  return a[0] * 3 + a[1]
+}
+fn q_int8_9(x: int8) -> int8 { return x / 127 }
+fn r_int8_9(x: int8) -> int8 { return x % 127 }
+fn qa_int8_9(x: int8) -> int8 {
+  y := x
+  y /= 127
+  return y
+}
+fn ra_int8_9(x: int8) -> int8 {
+  a := []int8{x, x}
+  a[1] %= 127
+  a[0] /= 127
+  return a[0] * 3 + a[1]
+}
+fn check_int8() -> []str {
+  ds := []int8{1, 2, 3, 5, 7, 10, 16, 64, 100, 127}
+  bad := []str{}
+  for _, v := range values() {
+    x := int8(v)
+    if q_int8_0(x) != x / ds[0] || r_int8_0(x) != x % ds[0] || qa_int8_0(x) != x / ds[0] || ra_int8_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_int8_1(x) != x / ds[1] || r_int8_1(x) != x % ds[1] || qa_int8_1(x) != x / ds[1] || ra_int8_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_int8_2(x) != x / ds[2] || r_int8_2(x) != x % ds[2] || qa_int8_2(x) != x / ds[2] || ra_int8_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_int8_3(x) != x / ds[3] || r_int8_3(x) != x % ds[3] || qa_int8_3(x) != x / ds[3] || ra_int8_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_int8_4(x) != x / ds[4] || r_int8_4(x) != x % ds[4] || qa_int8_4(x) != x / ds[4] || ra_int8_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_int8_5(x) != x / ds[5] || r_int8_5(x) != x % ds[5] || qa_int8_5(x) != x / ds[5] || ra_int8_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_int8_6(x) != x / ds[6] || r_int8_6(x) != x % ds[6] || qa_int8_6(x) != x / ds[6] || ra_int8_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_int8_7(x) != x / ds[7] || r_int8_7(x) != x % ds[7] || qa_int8_7(x) != x / ds[7] || ra_int8_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_int8_8(x) != x / ds[8] || r_int8_8(x) != x % ds[8] || qa_int8_8(x) != x / ds[8] || ra_int8_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_int8_9(x) != x / ds[9] || r_int8_9(x) != x % ds[9] || qa_int8_9(x) != x / ds[9] || ra_int8_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+  }
+  return bad
+}
+
+fn q_uint_0(x: uint) -> uint { return x / 1 }
+fn r_uint_0(x: uint) -> uint { return x % 1 }
+fn qa_uint_0(x: uint) -> uint {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_uint_0(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_uint_1(x: uint) -> uint { return x / 2 }
+fn r_uint_1(x: uint) -> uint { return x % 2 }
+fn qa_uint_1(x: uint) -> uint {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_uint_1(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_uint_2(x: uint) -> uint { return x / 3 }
+fn r_uint_2(x: uint) -> uint { return x % 3 }
+fn qa_uint_2(x: uint) -> uint {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_uint_2(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_uint_3(x: uint) -> uint { return x / 5 }
+fn r_uint_3(x: uint) -> uint { return x % 5 }
+fn qa_uint_3(x: uint) -> uint {
+  y := x
+  y /= 5
+  return y
+}
+fn ra_uint_3(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 5
+  a[0] /= 5
+  return a[0] * 3 + a[1]
+}
+fn q_uint_4(x: uint) -> uint { return x / 7 }
+fn r_uint_4(x: uint) -> uint { return x % 7 }
+fn qa_uint_4(x: uint) -> uint {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_uint_4(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_uint_5(x: uint) -> uint { return x / 10 }
+fn r_uint_5(x: uint) -> uint { return x % 10 }
+fn qa_uint_5(x: uint) -> uint {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_uint_5(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_uint_6(x: uint) -> uint { return x / 16 }
+fn r_uint_6(x: uint) -> uint { return x % 16 }
+fn qa_uint_6(x: uint) -> uint {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_uint_6(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_uint_7(x: uint) -> uint { return x / 641 }
+fn r_uint_7(x: uint) -> uint { return x % 641 }
+fn qa_uint_7(x: uint) -> uint {
+  y := x
+  y /= 641
+  return y
+}
+fn ra_uint_7(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 641
+  a[0] /= 641
+  return a[0] * 3 + a[1]
+}
+fn q_uint_8(x: uint) -> uint { return x / 1000 }
+fn r_uint_8(x: uint) -> uint { return x % 1000 }
+fn qa_uint_8(x: uint) -> uint {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_uint_8(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_uint_9(x: uint) -> uint { return x / 1000000007 }
+fn r_uint_9(x: uint) -> uint { return x % 1000000007 }
+fn qa_uint_9(x: uint) -> uint {
+  y := x
+  y /= 1000000007
+  return y
+}
+fn ra_uint_9(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 1000000007
+  a[0] /= 1000000007
+  return a[0] * 3 + a[1]
+}
+fn q_uint_10(x: uint) -> uint { return x / 2147483648 }
+fn r_uint_10(x: uint) -> uint { return x % 2147483648 }
+fn qa_uint_10(x: uint) -> uint {
+  y := x
+  y /= 2147483648
+  return y
+}
+fn ra_uint_10(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 2147483648
+  a[0] /= 2147483648
+  return a[0] * 3 + a[1]
+}
+fn q_uint_11(x: uint) -> uint { return x / 4294967296 }
+fn r_uint_11(x: uint) -> uint { return x % 4294967296 }
+fn qa_uint_11(x: uint) -> uint {
+  y := x
+  y /= 4294967296
+  return y
+}
+fn ra_uint_11(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 4294967296
+  a[0] /= 4294967296
+  return a[0] * 3 + a[1]
+}
+fn q_uint_12(x: uint) -> uint { return x / 1099511627775 }
+fn r_uint_12(x: uint) -> uint { return x % 1099511627775 }
+fn qa_uint_12(x: uint) -> uint {
+  y := x
+  y /= 1099511627775
+  return y
+}
+fn ra_uint_12(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 1099511627775
+  a[0] /= 1099511627775
+  return a[0] * 3 + a[1]
+}
+fn q_uint_13(x: uint) -> uint { return x / 9007199254740991 }
+fn r_uint_13(x: uint) -> uint { return x % 9007199254740991 }
+fn qa_uint_13(x: uint) -> uint {
+  y := x
+  y /= 9007199254740991
+  return y
+}
+fn ra_uint_13(x: uint) -> uint {
+  a := []uint{x, x}
+  a[1] %= 9007199254740991
+  a[0] /= 9007199254740991
+  return a[0] * 3 + a[1]
+}
+fn check_uint() -> []str {
+  ds := []uint{1, 2, 3, 5, 7, 10, 16, 641, 1000, 1000000007, 2147483648, 4294967296, 1099511627775, 9007199254740991}
+  bad := []str{}
+  for _, v := range values() {
+    x := uint(v)
+    if q_uint_0(x) != x / ds[0] || r_uint_0(x) != x % ds[0] || qa_uint_0(x) != x / ds[0] || ra_uint_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_uint_1(x) != x / ds[1] || r_uint_1(x) != x % ds[1] || qa_uint_1(x) != x / ds[1] || ra_uint_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_uint_2(x) != x / ds[2] || r_uint_2(x) != x % ds[2] || qa_uint_2(x) != x / ds[2] || ra_uint_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_uint_3(x) != x / ds[3] || r_uint_3(x) != x % ds[3] || qa_uint_3(x) != x / ds[3] || ra_uint_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_uint_4(x) != x / ds[4] || r_uint_4(x) != x % ds[4] || qa_uint_4(x) != x / ds[4] || ra_uint_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_uint_5(x) != x / ds[5] || r_uint_5(x) != x % ds[5] || qa_uint_5(x) != x / ds[5] || ra_uint_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_uint_6(x) != x / ds[6] || r_uint_6(x) != x % ds[6] || qa_uint_6(x) != x / ds[6] || ra_uint_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_uint_7(x) != x / ds[7] || r_uint_7(x) != x % ds[7] || qa_uint_7(x) != x / ds[7] || ra_uint_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_uint_8(x) != x / ds[8] || r_uint_8(x) != x % ds[8] || qa_uint_8(x) != x / ds[8] || ra_uint_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_uint_9(x) != x / ds[9] || r_uint_9(x) != x % ds[9] || qa_uint_9(x) != x / ds[9] || ra_uint_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+    if q_uint_10(x) != x / ds[10] || r_uint_10(x) != x % ds[10] || qa_uint_10(x) != x / ds[10] || ra_uint_10(x) != (x / ds[10]) * 3 + x % ds[10] { bad = append(bad, str(x) + " by " + str(ds[10])) }
+    if q_uint_11(x) != x / ds[11] || r_uint_11(x) != x % ds[11] || qa_uint_11(x) != x / ds[11] || ra_uint_11(x) != (x / ds[11]) * 3 + x % ds[11] { bad = append(bad, str(x) + " by " + str(ds[11])) }
+    if q_uint_12(x) != x / ds[12] || r_uint_12(x) != x % ds[12] || qa_uint_12(x) != x / ds[12] || ra_uint_12(x) != (x / ds[12]) * 3 + x % ds[12] { bad = append(bad, str(x) + " by " + str(ds[12])) }
+    if q_uint_13(x) != x / ds[13] || r_uint_13(x) != x % ds[13] || qa_uint_13(x) != x / ds[13] || ra_uint_13(x) != (x / ds[13]) * 3 + x % ds[13] { bad = append(bad, str(x) + " by " + str(ds[13])) }
+  }
+  return bad
+}
+
+fn q_uint64_0(x: uint64) -> uint64 { return x / 1 }
+fn r_uint64_0(x: uint64) -> uint64 { return x % 1 }
+fn qa_uint64_0(x: uint64) -> uint64 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_uint64_0(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_1(x: uint64) -> uint64 { return x / 2 }
+fn r_uint64_1(x: uint64) -> uint64 { return x % 2 }
+fn qa_uint64_1(x: uint64) -> uint64 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_uint64_1(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_2(x: uint64) -> uint64 { return x / 3 }
+fn r_uint64_2(x: uint64) -> uint64 { return x % 3 }
+fn qa_uint64_2(x: uint64) -> uint64 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_uint64_2(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_3(x: uint64) -> uint64 { return x / 7 }
+fn r_uint64_3(x: uint64) -> uint64 { return x % 7 }
+fn qa_uint64_3(x: uint64) -> uint64 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_uint64_3(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_4(x: uint64) -> uint64 { return x / 10 }
+fn r_uint64_4(x: uint64) -> uint64 { return x % 10 }
+fn qa_uint64_4(x: uint64) -> uint64 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_uint64_4(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_5(x: uint64) -> uint64 { return x / 19 }
+fn r_uint64_5(x: uint64) -> uint64 { return x % 19 }
+fn qa_uint64_5(x: uint64) -> uint64 {
+  y := x
+  y /= 19
+  return y
+}
+fn ra_uint64_5(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 19
+  a[0] /= 19
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_6(x: uint64) -> uint64 { return x / 1000 }
+fn r_uint64_6(x: uint64) -> uint64 { return x % 1000 }
+fn qa_uint64_6(x: uint64) -> uint64 {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_uint64_6(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_7(x: uint64) -> uint64 { return x / 2147483648 }
+fn r_uint64_7(x: uint64) -> uint64 { return x % 2147483648 }
+fn qa_uint64_7(x: uint64) -> uint64 {
+  y := x
+  y /= 2147483648
+  return y
+}
+fn ra_uint64_7(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 2147483648
+  a[0] /= 2147483648
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_8(x: uint64) -> uint64 { return x / 4294967295 }
+fn r_uint64_8(x: uint64) -> uint64 { return x % 4294967295 }
+fn qa_uint64_8(x: uint64) -> uint64 {
+  y := x
+  y /= 4294967295
+  return y
+}
+fn ra_uint64_8(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 4294967295
+  a[0] /= 4294967295
+  return a[0] * 3 + a[1]
+}
+fn q_uint64_9(x: uint64) -> uint64 { return x / 9007199254740991 }
+fn r_uint64_9(x: uint64) -> uint64 { return x % 9007199254740991 }
+fn qa_uint64_9(x: uint64) -> uint64 {
+  y := x
+  y /= 9007199254740991
+  return y
+}
+fn ra_uint64_9(x: uint64) -> uint64 {
+  a := []uint64{x, x}
+  a[1] %= 9007199254740991
+  a[0] /= 9007199254740991
+  return a[0] * 3 + a[1]
+}
+fn check_uint64() -> []str {
+  ds := []uint64{1, 2, 3, 7, 10, 19, 1000, 2147483648, 4294967295, 9007199254740991}
+  bad := []str{}
+  for _, v := range values() {
+    x := uint64(v)
+    if q_uint64_0(x) != x / ds[0] || r_uint64_0(x) != x % ds[0] || qa_uint64_0(x) != x / ds[0] || ra_uint64_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_uint64_1(x) != x / ds[1] || r_uint64_1(x) != x % ds[1] || qa_uint64_1(x) != x / ds[1] || ra_uint64_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_uint64_2(x) != x / ds[2] || r_uint64_2(x) != x % ds[2] || qa_uint64_2(x) != x / ds[2] || ra_uint64_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_uint64_3(x) != x / ds[3] || r_uint64_3(x) != x % ds[3] || qa_uint64_3(x) != x / ds[3] || ra_uint64_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_uint64_4(x) != x / ds[4] || r_uint64_4(x) != x % ds[4] || qa_uint64_4(x) != x / ds[4] || ra_uint64_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_uint64_5(x) != x / ds[5] || r_uint64_5(x) != x % ds[5] || qa_uint64_5(x) != x / ds[5] || ra_uint64_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_uint64_6(x) != x / ds[6] || r_uint64_6(x) != x % ds[6] || qa_uint64_6(x) != x / ds[6] || ra_uint64_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_uint64_7(x) != x / ds[7] || r_uint64_7(x) != x % ds[7] || qa_uint64_7(x) != x / ds[7] || ra_uint64_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_uint64_8(x) != x / ds[8] || r_uint64_8(x) != x % ds[8] || qa_uint64_8(x) != x / ds[8] || ra_uint64_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_uint64_9(x) != x / ds[9] || r_uint64_9(x) != x % ds[9] || qa_uint64_9(x) != x / ds[9] || ra_uint64_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+  }
+  return bad
+}
+
+fn q_uint32_0(x: uint32) -> uint32 { return x / 1 }
+fn r_uint32_0(x: uint32) -> uint32 { return x % 1 }
+fn qa_uint32_0(x: uint32) -> uint32 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_uint32_0(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_1(x: uint32) -> uint32 { return x / 2 }
+fn r_uint32_1(x: uint32) -> uint32 { return x % 2 }
+fn qa_uint32_1(x: uint32) -> uint32 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_uint32_1(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_2(x: uint32) -> uint32 { return x / 3 }
+fn r_uint32_2(x: uint32) -> uint32 { return x % 3 }
+fn qa_uint32_2(x: uint32) -> uint32 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_uint32_2(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_3(x: uint32) -> uint32 { return x / 7 }
+fn r_uint32_3(x: uint32) -> uint32 { return x % 7 }
+fn qa_uint32_3(x: uint32) -> uint32 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_uint32_3(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_4(x: uint32) -> uint32 { return x / 10 }
+fn r_uint32_4(x: uint32) -> uint32 { return x % 10 }
+fn qa_uint32_4(x: uint32) -> uint32 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_uint32_4(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_5(x: uint32) -> uint32 { return x / 16 }
+fn r_uint32_5(x: uint32) -> uint32 { return x % 16 }
+fn qa_uint32_5(x: uint32) -> uint32 {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_uint32_5(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_6(x: uint32) -> uint32 { return x / 1000 }
+fn r_uint32_6(x: uint32) -> uint32 { return x % 1000 }
+fn qa_uint32_6(x: uint32) -> uint32 {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_uint32_6(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_7(x: uint32) -> uint32 { return x / 65536 }
+fn r_uint32_7(x: uint32) -> uint32 { return x % 65536 }
+fn qa_uint32_7(x: uint32) -> uint32 {
+  y := x
+  y /= 65536
+  return y
+}
+fn ra_uint32_7(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 65536
+  a[0] /= 65536
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_8(x: uint32) -> uint32 { return x / 1000000007 }
+fn r_uint32_8(x: uint32) -> uint32 { return x % 1000000007 }
+fn qa_uint32_8(x: uint32) -> uint32 {
+  y := x
+  y /= 1000000007
+  return y
+}
+fn ra_uint32_8(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 1000000007
+  a[0] /= 1000000007
+  return a[0] * 3 + a[1]
+}
+fn q_uint32_9(x: uint32) -> uint32 { return x / 4294967295 }
+fn r_uint32_9(x: uint32) -> uint32 { return x % 4294967295 }
+fn qa_uint32_9(x: uint32) -> uint32 {
+  y := x
+  y /= 4294967295
+  return y
+}
+fn ra_uint32_9(x: uint32) -> uint32 {
+  a := []uint32{x, x}
+  a[1] %= 4294967295
+  a[0] /= 4294967295
+  return a[0] * 3 + a[1]
+}
+fn check_uint32() -> []str {
+  ds := []uint32{1, 2, 3, 7, 10, 16, 1000, 65536, 1000000007, 4294967295}
+  bad := []str{}
+  for _, v := range values() {
+    x := uint32(v)
+    if q_uint32_0(x) != x / ds[0] || r_uint32_0(x) != x % ds[0] || qa_uint32_0(x) != x / ds[0] || ra_uint32_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_uint32_1(x) != x / ds[1] || r_uint32_1(x) != x % ds[1] || qa_uint32_1(x) != x / ds[1] || ra_uint32_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_uint32_2(x) != x / ds[2] || r_uint32_2(x) != x % ds[2] || qa_uint32_2(x) != x / ds[2] || ra_uint32_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_uint32_3(x) != x / ds[3] || r_uint32_3(x) != x % ds[3] || qa_uint32_3(x) != x / ds[3] || ra_uint32_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_uint32_4(x) != x / ds[4] || r_uint32_4(x) != x % ds[4] || qa_uint32_4(x) != x / ds[4] || ra_uint32_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_uint32_5(x) != x / ds[5] || r_uint32_5(x) != x % ds[5] || qa_uint32_5(x) != x / ds[5] || ra_uint32_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_uint32_6(x) != x / ds[6] || r_uint32_6(x) != x % ds[6] || qa_uint32_6(x) != x / ds[6] || ra_uint32_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_uint32_7(x) != x / ds[7] || r_uint32_7(x) != x % ds[7] || qa_uint32_7(x) != x / ds[7] || ra_uint32_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+    if q_uint32_8(x) != x / ds[8] || r_uint32_8(x) != x % ds[8] || qa_uint32_8(x) != x / ds[8] || ra_uint32_8(x) != (x / ds[8]) * 3 + x % ds[8] { bad = append(bad, str(x) + " by " + str(ds[8])) }
+    if q_uint32_9(x) != x / ds[9] || r_uint32_9(x) != x % ds[9] || qa_uint32_9(x) != x / ds[9] || ra_uint32_9(x) != (x / ds[9]) * 3 + x % ds[9] { bad = append(bad, str(x) + " by " + str(ds[9])) }
+  }
+  return bad
+}
+
+fn q_uint16_0(x: uint16) -> uint16 { return x / 1 }
+fn r_uint16_0(x: uint16) -> uint16 { return x % 1 }
+fn qa_uint16_0(x: uint16) -> uint16 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_uint16_0(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_1(x: uint16) -> uint16 { return x / 2 }
+fn r_uint16_1(x: uint16) -> uint16 { return x % 2 }
+fn qa_uint16_1(x: uint16) -> uint16 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_uint16_1(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_2(x: uint16) -> uint16 { return x / 3 }
+fn r_uint16_2(x: uint16) -> uint16 { return x % 3 }
+fn qa_uint16_2(x: uint16) -> uint16 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_uint16_2(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_3(x: uint16) -> uint16 { return x / 7 }
+fn r_uint16_3(x: uint16) -> uint16 { return x % 7 }
+fn qa_uint16_3(x: uint16) -> uint16 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_uint16_3(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_4(x: uint16) -> uint16 { return x / 10 }
+fn r_uint16_4(x: uint16) -> uint16 { return x % 10 }
+fn qa_uint16_4(x: uint16) -> uint16 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_uint16_4(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_5(x: uint16) -> uint16 { return x / 16 }
+fn r_uint16_5(x: uint16) -> uint16 { return x % 16 }
+fn qa_uint16_5(x: uint16) -> uint16 {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_uint16_5(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_6(x: uint16) -> uint16 { return x / 1000 }
+fn r_uint16_6(x: uint16) -> uint16 { return x % 1000 }
+fn qa_uint16_6(x: uint16) -> uint16 {
+  y := x
+  y /= 1000
+  return y
+}
+fn ra_uint16_6(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 1000
+  a[0] /= 1000
+  return a[0] * 3 + a[1]
+}
+fn q_uint16_7(x: uint16) -> uint16 { return x / 65535 }
+fn r_uint16_7(x: uint16) -> uint16 { return x % 65535 }
+fn qa_uint16_7(x: uint16) -> uint16 {
+  y := x
+  y /= 65535
+  return y
+}
+fn ra_uint16_7(x: uint16) -> uint16 {
+  a := []uint16{x, x}
+  a[1] %= 65535
+  a[0] /= 65535
+  return a[0] * 3 + a[1]
+}
+fn check_uint16() -> []str {
+  ds := []uint16{1, 2, 3, 7, 10, 16, 1000, 65535}
+  bad := []str{}
+  for _, v := range values() {
+    x := uint16(v)
+    if q_uint16_0(x) != x / ds[0] || r_uint16_0(x) != x % ds[0] || qa_uint16_0(x) != x / ds[0] || ra_uint16_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_uint16_1(x) != x / ds[1] || r_uint16_1(x) != x % ds[1] || qa_uint16_1(x) != x / ds[1] || ra_uint16_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_uint16_2(x) != x / ds[2] || r_uint16_2(x) != x % ds[2] || qa_uint16_2(x) != x / ds[2] || ra_uint16_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_uint16_3(x) != x / ds[3] || r_uint16_3(x) != x % ds[3] || qa_uint16_3(x) != x / ds[3] || ra_uint16_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_uint16_4(x) != x / ds[4] || r_uint16_4(x) != x % ds[4] || qa_uint16_4(x) != x / ds[4] || ra_uint16_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_uint16_5(x) != x / ds[5] || r_uint16_5(x) != x % ds[5] || qa_uint16_5(x) != x / ds[5] || ra_uint16_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_uint16_6(x) != x / ds[6] || r_uint16_6(x) != x % ds[6] || qa_uint16_6(x) != x / ds[6] || ra_uint16_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_uint16_7(x) != x / ds[7] || r_uint16_7(x) != x % ds[7] || qa_uint16_7(x) != x / ds[7] || ra_uint16_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+  }
+  return bad
+}
+
+fn q_uint8_0(x: uint8) -> uint8 { return x / 1 }
+fn r_uint8_0(x: uint8) -> uint8 { return x % 1 }
+fn qa_uint8_0(x: uint8) -> uint8 {
+  y := x
+  y /= 1
+  return y
+}
+fn ra_uint8_0(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 1
+  a[0] /= 1
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_1(x: uint8) -> uint8 { return x / 2 }
+fn r_uint8_1(x: uint8) -> uint8 { return x % 2 }
+fn qa_uint8_1(x: uint8) -> uint8 {
+  y := x
+  y /= 2
+  return y
+}
+fn ra_uint8_1(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 2
+  a[0] /= 2
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_2(x: uint8) -> uint8 { return x / 3 }
+fn r_uint8_2(x: uint8) -> uint8 { return x % 3 }
+fn qa_uint8_2(x: uint8) -> uint8 {
+  y := x
+  y /= 3
+  return y
+}
+fn ra_uint8_2(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 3
+  a[0] /= 3
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_3(x: uint8) -> uint8 { return x / 7 }
+fn r_uint8_3(x: uint8) -> uint8 { return x % 7 }
+fn qa_uint8_3(x: uint8) -> uint8 {
+  y := x
+  y /= 7
+  return y
+}
+fn ra_uint8_3(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 7
+  a[0] /= 7
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_4(x: uint8) -> uint8 { return x / 10 }
+fn r_uint8_4(x: uint8) -> uint8 { return x % 10 }
+fn qa_uint8_4(x: uint8) -> uint8 {
+  y := x
+  y /= 10
+  return y
+}
+fn ra_uint8_4(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 10
+  a[0] /= 10
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_5(x: uint8) -> uint8 { return x / 16 }
+fn r_uint8_5(x: uint8) -> uint8 { return x % 16 }
+fn qa_uint8_5(x: uint8) -> uint8 {
+  y := x
+  y /= 16
+  return y
+}
+fn ra_uint8_5(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 16
+  a[0] /= 16
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_6(x: uint8) -> uint8 { return x / 128 }
+fn r_uint8_6(x: uint8) -> uint8 { return x % 128 }
+fn qa_uint8_6(x: uint8) -> uint8 {
+  y := x
+  y /= 128
+  return y
+}
+fn ra_uint8_6(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 128
+  a[0] /= 128
+  return a[0] * 3 + a[1]
+}
+fn q_uint8_7(x: uint8) -> uint8 { return x / 255 }
+fn r_uint8_7(x: uint8) -> uint8 { return x % 255 }
+fn qa_uint8_7(x: uint8) -> uint8 {
+  y := x
+  y /= 255
+  return y
+}
+fn ra_uint8_7(x: uint8) -> uint8 {
+  a := []uint8{x, x}
+  a[1] %= 255
+  a[0] /= 255
+  return a[0] * 3 + a[1]
+}
+fn check_uint8() -> []str {
+  ds := []uint8{1, 2, 3, 7, 10, 16, 128, 255}
+  bad := []str{}
+  for _, v := range values() {
+    x := uint8(v)
+    if q_uint8_0(x) != x / ds[0] || r_uint8_0(x) != x % ds[0] || qa_uint8_0(x) != x / ds[0] || ra_uint8_0(x) != (x / ds[0]) * 3 + x % ds[0] { bad = append(bad, str(x) + " by " + str(ds[0])) }
+    if q_uint8_1(x) != x / ds[1] || r_uint8_1(x) != x % ds[1] || qa_uint8_1(x) != x / ds[1] || ra_uint8_1(x) != (x / ds[1]) * 3 + x % ds[1] { bad = append(bad, str(x) + " by " + str(ds[1])) }
+    if q_uint8_2(x) != x / ds[2] || r_uint8_2(x) != x % ds[2] || qa_uint8_2(x) != x / ds[2] || ra_uint8_2(x) != (x / ds[2]) * 3 + x % ds[2] { bad = append(bad, str(x) + " by " + str(ds[2])) }
+    if q_uint8_3(x) != x / ds[3] || r_uint8_3(x) != x % ds[3] || qa_uint8_3(x) != x / ds[3] || ra_uint8_3(x) != (x / ds[3]) * 3 + x % ds[3] { bad = append(bad, str(x) + " by " + str(ds[3])) }
+    if q_uint8_4(x) != x / ds[4] || r_uint8_4(x) != x % ds[4] || qa_uint8_4(x) != x / ds[4] || ra_uint8_4(x) != (x / ds[4]) * 3 + x % ds[4] { bad = append(bad, str(x) + " by " + str(ds[4])) }
+    if q_uint8_5(x) != x / ds[5] || r_uint8_5(x) != x % ds[5] || qa_uint8_5(x) != x / ds[5] || ra_uint8_5(x) != (x / ds[5]) * 3 + x % ds[5] { bad = append(bad, str(x) + " by " + str(ds[5])) }
+    if q_uint8_6(x) != x / ds[6] || r_uint8_6(x) != x % ds[6] || qa_uint8_6(x) != x / ds[6] || ra_uint8_6(x) != (x / ds[6]) * 3 + x % ds[6] { bad = append(bad, str(x) + " by " + str(ds[6])) }
+    if q_uint8_7(x) != x / ds[7] || r_uint8_7(x) != x % ds[7] || qa_uint8_7(x) != x / ds[7] || ra_uint8_7(x) != (x / ds[7]) * 3 + x % ds[7] { bad = append(bad, str(x) + " by " + str(ds[7])) }
+  }
+  return bad
+}
+
+describe("integer division by a constant", fn() {
+  it("matches the general division for int", fn() { expect(check_int()).to_equal([]str{}) })
+  it("matches the general division for int64", fn() { expect(check_int64()).to_equal([]str{}) })
+  it("matches the general division for int32", fn() { expect(check_int32()).to_equal([]str{}) })
+  it("matches the general division for int16", fn() { expect(check_int16()).to_equal([]str{}) })
+  it("matches the general division for int8", fn() { expect(check_int8()).to_equal([]str{}) })
+  it("matches the general division for uint", fn() { expect(check_uint()).to_equal([]str{}) })
+  it("matches the general division for uint64", fn() { expect(check_uint64()).to_equal([]str{}) })
+  it("matches the general division for uint32", fn() { expect(check_uint32()).to_equal([]str{}) })
+  it("matches the general division for uint16", fn() { expect(check_uint16()).to_equal([]str{}) })
+  it("matches the general division for uint8", fn() { expect(check_uint8()).to_equal([]str{}) })
+  it("rounds toward zero and keeps the sign of the dividend in the remainder", fn() {
+    x := -7
+    expect([]int{x / 2, x % 2, x / -2, x % -2, x / 4, x % 4, x / 3, x % 3, x / -3, x % -3}).to_equal([]int{-3, -1, 3, -1, -1, -3, -2, -1, 2, -1})
+    y := 7
+    expect([]int{y / 2, y % 2, y / -2, y % -2, y / 3, y % 3, y / -3, y % -3, y / -1, y % -1}).to_equal([]int{3, 1, -3, 1, 2, 1, -2, 1, -7, 0})
+  })
+  it("wraps the minimum divided by -1 and keeps small kinds in range", fn() {
+    m := 1 << 63
+    expect(m / -1 == m).to_equal(true)
+    expect(m % -1).to_equal(0)
+    expect(m / 1 == m).to_equal(true)
+    let b: int8 = -128
+    expect(int(b / 1)).to_equal(-128)
+    let u: uint8 = 255
+    expect(int(u / 2)).to_equal(127)
+    expect(int(u % 16)).to_equal(15)
+  })
+  it("still reports a division by a literal zero at run time", fn() {
+    r := run_source("x := 5\nprint(x / 0)\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 2: Integer division by zero.")
+    r2 := run_source("x := 5\nx %= 0\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 2: Remainder of integer division by zero.")
+    r3 := run_source("a := []int{1}\na[0] /= 0\n")
+    expect(r3.output).to_equal("Runtime error in main.caju, line 2: Integer division by zero.")
+  })
+})

@@ -488,6 +488,23 @@ export fn (a: *X64) shift_cl(ext: int, r: int) {
   a.b.byte(0xC0 | (ext << 3) | (r & 7))
 }
 export fn (a: *X64) cqo() { a.byte2(0x48, 0x99) }
+# 4 shl, 5 shr, 7 sar by an immediate count (1..63)
+export fn (a: *X64) shift_imm(ext: int, r: int, c: int) {
+  a.rex(1, 0, r, false)
+  a.b.byte(0xC1)
+  a.b.byte(0xC0 | (ext << 3) | (r & 7))
+  a.b.byte(c)
+}
+# imul dst, src, v (v fits in a sign-extended 32-bit immediate)
+export fn (a: *X64) imul_imm(dst: int, src: int, v: int) {
+  if v >= -128 && v <= 127 {
+    a.rr(0x6B, dst, src)
+    a.b.byte(v & 255)
+    return
+  }
+  a.rr(0x69, dst, src)
+  a.b.u32(v)
+}
 export fn (a: *X64) setcc(cc: int, r8: int) {
   a.rex(0, 0, r8, r8 >= 4)
   a.b.byte(0x0F)

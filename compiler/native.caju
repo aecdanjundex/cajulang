@@ -2382,6 +2382,201 @@ fn (f: *Fn) int_op(op: str, k: int, n: *ast.Node) {
   }
   f.g.wrap_kind(k)
 }
+# ---- division and remainder by a constant (no zero check, no idiv) ----
+
+# the value of a constant integer divisor that const_div handles: a literal (loaded as
+# simple_to does), or a negated literal for int/int64; 0 and huge values are left to int_op
+fn (f: *Fn) const_divisor(n: *ast.Node, k: int) -> (int, bool) {
+  if n.kind == "Paren" { return f.const_divisor(n.expr, k) }
+  neg := false
+  if n.kind == "Neg" && (k == 0 || k == 4) && f.g.cls(n.ty, n) == "i" {
+    neg = true
+    n = n.arg
+  }
+  if n.kind != "Number" || f.g.cls(n.ty, n) == "f" { return 0, false }
+  v := 0
+  if n.raw != "" { v = parse_raw(n.raw) } else { v = int(n.num_value) }
+  if v <= 0 || v >= 1 << 62 { return 0, false }
+  if neg { v = -v }
+  return v, true
+}
+fn log2_exact(v: int) -> int {
+  if v <= 0 || (v & (v - 1)) != 0 { return -1 }
+  k := 0
+  for (1 << k) != v { k++ }
+  return k
+}
+# signed magic number (Hacker's Delight, 10-1) for 2 <= |d| < 2^62, |d| not a power of two:
+# q = (hi(M * x) [+ x if d > 0 and M < 0] [- x if d < 0 and M > 0]) >> s, plus 1 if negative
+fn magic_signed(d: int) -> (int, int) {
+  two63 := uint64(1) << 63
+  ad := uint64(d)
+  if d < 0 { ad = uint64(-d) }
+  t := two63
+  if d < 0 { t = t + 1 }
+  anc := t - 1 - t % ad
+  p := 63
+  q1 := two63 / anc
+  r1 := two63 - q1 * anc
+  q2 := two63 / ad
+  r2 := two63 - q2 * ad
+  for {
+    p++
+    q1 = 2 * q1
+    r1 = 2 * r1
+    if r1 >= anc {
+      q1 = q1 + 1
+      r1 = r1 - anc
+    }
+    q2 = 2 * q2
+    r2 = 2 * r2
+    if r2 >= ad {
+      q2 = q2 + 1
+      r2 = r2 - ad
+    }
+    delta := ad - r2
+    if !(q1 < delta || (q1 == delta && r1 == 0)) { break }
+  }
+  m := int(q2 + 1)
+  if d < 0 { m = -m }
+  return m, p - 64
+}
+# unsigned magic number (Hacker's Delight, 10-2) for 2 < d < 2^62, d not a power of two:
+# add == 0: q = hi(M * x) >> s; add == 1: t = hi(M * x), q = (((x - t) >> 1) + t) >> (s - 1)
+fn magic_unsigned(dv: int) -> (int, int, int) {
+  d := uint64(dv)
+  two63 := uint64(1) << 63
+  add := 0
+  nc := uint64(0) - 1 - (uint64(0) - d) % d
+  p := 63
+  q1 := two63 / nc
+  r1 := two63 - q1 * nc
+  q2 := (two63 - 1) / d
+  r2 := (two63 - 1) - q2 * d
+  for {
+    p++
+    if r1 >= nc - r1 {
+      q1 = 2 * q1 + 1
+      r1 = 2 * r1 - nc
+    } else {
+      q1 = 2 * q1
+      r1 = 2 * r1
+    }
+    if r2 + 1 >= d - r2 {
+      if q2 >= two63 - 1 { add = 1 }
+      q2 = 2 * q2 + 1
+      r2 = 2 * r2 + 1 - d
+    } else {
+      if q2 >= two63 { add = 1 }
+      q2 = 2 * q2
+      r2 = 2 * r2 + 1
+    }
+    delta := d - 1 - r2
+    if !(p < 128 && (q1 < delta || (q1 == delta && r1 == 0))) { break }
+  }
+  return int(q2 + 1), p - 64, add
+}
+# RAX = RAX / d or RAX % d (op) for integer kind k and a constant d from const_divisor: the
+# same truncated results as int_op (x / -1 wraps on the minimum), without its checks and idiv;
+# uses RCX and RDX
+fn (f: *Fn) const_div(op: str, k: int, d: int) {
+  A := f.a
+  uns := k >= 5 && k <= 9
+  ad := d
+  if d < 0 { ad = -d }
+  if ad == 1 {
+    if op == "%" {
+      A.rr32(0x31, RAX, RAX)
+    } else if d < 0 {
+      A.unary(3, RAX)
+    }
+    f.g.wrap_kind(k)
+    return
+  }
+  sh := log2_exact(ad)
+  if sh > 0 {
+    if uns {
+      if op == "/" {
+        A.shift_imm(5, RAX, sh)
+      } else if sh <= 31 {
+        A.alu_imm(4, RAX, ad - 1)
+      } else {
+        A.mov_imm(RCX, ad - 1)
+        A.alu("and", RAX, RCX)
+      }
+      f.g.wrap_kind(k)
+      return
+    }
+    # bias = 2^sh - 1 when x < 0 (rounds toward zero)
+    A.mov(RCX, RAX)
+    if sh > 1 { A.shift_imm(7, RCX, 63) }
+    A.shift_imm(5, RCX, 64 - sh)
+    if op == "/" {
+      A.alu("add", RAX, RCX)
+      A.shift_imm(7, RAX, sh)
+      if d < 0 { A.unary(3, RAX) }
+    } else {
+      A.alu("add", RCX, RAX)
+      # x - ((x + bias) & -2^sh)
+      if sh <= 31 {
+        A.alu_imm(4, RCX, -ad)
+      } else {
+        A.mov_imm(RDX, -ad)
+        A.alu("and", RCX, RDX)
+      }
+      A.alu("sub", RAX, RCX)
+    }
+    f.g.wrap_kind(k)
+    return
+  }
+  # RDX = hi(M * x); x stays in RCX when it is still needed
+  if uns {
+    m, s, add := magic_unsigned(d)
+    f.mul_high(m, op == "%" || add == 1, 4)
+    if add == 0 {
+      if s > 0 { A.shift_imm(5, RDX, s) }
+      A.mov(RAX, RDX)
+    } else {
+      A.mov(RAX, RCX)
+      A.alu("sub", RAX, RDX)
+      A.shift_imm(5, RAX, 1)
+      A.alu("add", RAX, RDX)
+      if s > 1 { A.shift_imm(5, RAX, s - 1) }
+    }
+  } else {
+    m, s := magic_signed(d)
+    f.mul_high(m, op == "%" || (d > 0 && m < 0) || (d < 0 && m > 0), 5)
+    if d > 0 && m < 0 { A.alu("add", RDX, RCX) }
+    if d < 0 && m > 0 { A.alu("sub", RDX, RCX) }
+    if s > 0 { A.shift_imm(7, RDX, s) }
+    A.mov(RAX, RDX)
+    A.shift_imm(5, RAX, 63)
+    A.alu("add", RAX, RDX)                       # q + 1 when q < 0
+  }
+  if op == "%" {
+    # x - q * d
+    if d >= -2147483648 && d <= 2147483647 {
+      A.imul_imm(RAX, RAX, d)
+    } else {
+      A.mov_imm(RDX, d)
+      A.imul(RAX, RDX)
+    }
+    A.alu("sub", RCX, RAX)
+    A.mov(RAX, RCX)
+  }
+  f.g.wrap_kind(k)
+}
+# RDX = high half of RAX * m (ext 4 mul, 5 imul); keep: x is also left in RCX
+fn (f: *Fn) mul_high(m: int, keep: bool, ext: int) {
+  A := f.a
+  if keep {
+    A.mov(RCX, RAX)
+    A.mov_imm(RAX, m)
+  } else {
+    A.mov_imm(RCX, m)
+  }
+  A.unary(ext, RCX)
+}
 fn (f: *Fn) float_op(op: str, n: *ast.Node) {
   A := f.a
   switch op {
@@ -2588,6 +2783,14 @@ fn (f: *Fn) binary(n: *ast.Node) {
         f.expr(n.right)                            # commutative: the right side first
         f.alu_src(op, RAX, n.left)
         g.wrap_kind(n.ik)
+        return
+      }
+    }
+    if op == "/" || op == "%" {
+      d, is_const := f.const_divisor(n.right, n.ik)
+      if is_const {
+        f.expr(n.left)
+        f.const_div(op, n.ik, d)
         return
       }
     }
@@ -4450,13 +4653,18 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
     f.elem_addr(tg, true)
     A.push(RAX)                                   # the element's address
     A.load(RAX, RAX, 0)
-    if !f.simple_to(n.value, RCX) {
-      A.push(RAX)
-      f.expr(n.value)
-      A.mov(RCX, RAX)
-      A.pop(RAX)
+    d, is_const := f.const_divisor(n.value, n.ik)
+    if is_const && (n.op == "/" || n.op == "%") {
+      f.const_div(n.op, n.ik, d)
+    } else {
+      if !f.simple_to(n.value, RCX) {
+        A.push(RAX)
+        f.expr(n.value)
+        A.mov(RCX, RAX)
+        A.pop(RAX)
+      }
+      f.int_op(n.op, n.ik, n)
     }
-    f.int_op(n.op, n.ik, n)
     A.pop(RCX)
     A.store(RCX, 0, RAX)
     return true
