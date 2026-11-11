@@ -50,7 +50,7 @@ comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
 
-Resultado esperado hoje: **804 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+Resultado esperado hoje: **806 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
 receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
 confere a quantidade de argumentos).
@@ -152,6 +152,10 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   posições livres (bits "em uso" + zeragem). A coleta começa com `rt_drop_runs` (devolve o resto
   das faixas) e a varredura faz só "em uso &= marcado". O bit "sem ponteiros" é da página
   (`rt_pg_flag` & 2). Um mapa novo é um bloco de 168 bytes (cabeçalho, 4 entradas, índice de 8).
+- Mapas (`rt/values.caju`): entradas na ordem de inserção + índice de slots de 32 bits (etiqueta |
+  posição + 1), no máximo 3/4 cheio (um índice menor cabe mais no cache: vale mais que sondagens
+  curtas). Chave inteira: `rt_map_fi`/`rt_map_get`/`rt_map_slot`; texto: `rt_map_fs`
+  (`rt_str_hash`, 8 bytes por passo). `==`/`!=` de textos chamam `rt_streq`.
 - Mexeu no coletor? Rode a suíte com coleta a cada 64 KB (troque `8 << 20` por `1 << 16` em
   `rt/gc.caju`, dois lugares) e desfaça depois.
 

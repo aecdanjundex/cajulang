@@ -507,6 +507,30 @@ O compilador compilando a si mesmo: 12,17 → 9,85 bilhões de instruções (−
 bilhões de ciclos (−28%). Benchmarks de CPU (fib...maps): ±0,1% de instruções. Memória: maps 3M
 igual; sort 2M 16,9 → 19,9 MB (páginas separadas por "sem ponteiros").
 
+## Rodada 27: mapas (índice menor, chaves de texto) e rotas do std/http
+
+Ponto de partida, maps 3M (`perf stat`): a Caju e o Rust executavam as **mesmas** ~1,0 bilhão de
+instruções, com falhas de cache parecidas (13,7 M × 12,1 M) e as mesmas páginas de 2 MB (as duas
+usam THP: ~230 MB em AnonHugePages), mas a Caju gastava 1,9× os ciclos e tinha 4× os desvios
+errados. O tempo de `rt_map_slot`/`rt_map_get` estava quase todo na instrução depois de ler o índice.
+
+| hipótese | resultado |
+|---|---|
+| desvios errados dependentes da falha de cache (sondagem linear: o laço termina num ponto imprevisível) | parcialmente refutada: índice 1/4 cheio corta os desvios de 3,3 M para 1,25 M, mas os ciclos **sobem** 10% (índice de 32 MB) |
+| páginas de 2 MB (`madvise(MADV_HUGEPAGE)` na arena) | rejeitada: o kernel (THP `always`) já usava páginas grandes nas duas linguagens |
+| **M3a índice até 3/4 cheio** (era 1/2): 8 MB em vez de 16 MB no maps 3M | **aceita**: ciclos −19%, maps 3M 568 → 482 ms intercalado (−15%; Go 558, Rust 320); memória 53,9 → 44,0 MB; 1M não muda (o índice tem o mesmo tamanho) |
+| M3b controle de 1 byte por slot em grupos de 8 com SWAR (como o hashbrown) + posições de 32 bits à parte | rejeitada: desvios 5,76 M → 1,70 M, mas ciclos +30% e instruções +22%: a chave presente passa a ter 3 acessos dependentes (controle → posição → entrada) em vez de 2. Mesmo resultado da tentativa com SSE2 das rodadas 20–25, agora com a causa medida |
+| M4a caminho de inteiros de `rt_map_get`/`rt_map_slot` em funções sem chamadas (variáveis em registradores) | rejeitada: +9,5% instruções, ciclos iguais (a latência da memória domina) |
+| **M1 hash de texto de 8 em 8 bytes** (`rt_str_hash`: o último passo lê os 8 bytes que terminam no último byte, sem passar do fim) e a mistura final no lugar | **aceita** |
+| **M2 `rt_streq` de 8 em 8 bytes** (mesmo endereço → igual; comprimentos; a última palavra sobrepõe o já comparado ou os comprimentos iguais) e `rt_strcmp` pulando palavras iguais; `==`/`!=` de textos chamam `rt_streq` (gerador: `cmp_expr`) | **aceita**: programa com mapa de texto e `==` de textos −45% de instruções (1,15 bi → 639 mi) |
+| **M1′ `rt_map_fs`**: sondagem própria para chaves de texto, sem chamadas a `rt_hash`/`rt_map_tag`/`rt_keq`; mesmo endereço é igual sem ler bytes | **aceita** (junto com M5 abaixo) |
+| **M5 `std/http`**: `find_route` só procura no mapa se há rotas exatas; prefixos numa lista do mais longo ao mais curto; `Request.header` só converte para minúsculas se o nome tem maiúsculas | **aceita**: servidor (web, 1 CPU) GET /users/:id 17,5 → 15,9 mil instruções por requisição (−9%), ciclos −5%; POST /users 27,3 → 25,5 mil (−7%), ciclos −3%; req/s dentro do ruído (metade do custo é o kernel) |
+
+Onde o Rust ainda ganha no maps 3M (1,5×): o controle de 1 byte por slot do hashbrown fica no cache
+(2 MB) e resolve a chave ausente sem ir à RAM, com 2 acessos dependentes na chave presente; a
+Caju precisa da posição da entrada no índice (a ordem de inserção do `range` é da linguagem), e
+um terceiro acesso custa mais que os desvios que economiza.
+
 ## O que ficou para depois
 
 Em ordem de ganho esperado:
