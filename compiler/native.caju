@@ -844,6 +844,7 @@ struct Fn {
   acc_head: str               # the start of the loop
   acc_tails: []*ast.Node      # the returns that jump back to acc_head
   acc_guard: *ast.Node        # the first statement when early_guard did it (tested at each turn)
+  arg_in: map[str]int         # parameters that arrive in a register (arg_plan): name -> register
 }
 
 # a list variable that no statement of the enclosing loop assigns: its header (data, length,
@@ -1282,11 +1283,37 @@ fn (f: *Fn) alloc_regs(body: []*ast.Node) -> []int {
     f.locals[name].reg = SAVED_REGS[i]
     used = append(used, SAVED_REGS[i])
   }
+  extra := []str{}
   for i := len(SAVED_REGS); i < len(rest); i++ {
     k := i - len(SAVED_REGS)
     if k >= len(EXTRA_REGS) || uc.n[rest[i]] <= 2 * uc.calls { break }
-    v := f.locals[rest[i]]
-    v.reg = EXTRA_REGS[k]
+    extra = append(extra, rest[i])
+  }
+  # a parameter that arrives in one of these registers (arg_plan) keeps it (no move in the
+  # prologue); the others take the free ones in order
+  taken := map[int]bool{}
+  pick := map[str]int{}
+  if f.arg_in != nil {
+    for _, name := range extra {
+      if r, ok := f.arg_in[name]; ok {
+        pick[name] = r
+        taken[r] = true
+      }
+    }
+  }
+  for _, name := range extra {
+    if _, ok := pick[name]; ok { continue }
+    for _, r := range EXTRA_REGS {
+      if !taken[r] {
+        pick[name] = r
+        taken[r] = true
+        break
+      }
+    }
+  }
+  for _, name := range extra {
+    v := f.locals[name]
+    v.reg = pick[name]
     f.a.sv_regs = append(f.a.sv_regs, v.reg)
     f.a.sv_offs = append(f.a.sv_offs, v.off)
   }
@@ -1300,9 +1327,33 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   f := &Fn{g: g, a: A, u: u, is_top: is_top, locals: map[str]*Var{}, nloc: 0, caps: map[str]*Var{}, env_off: 16 + 8 * len(params),
     rnames: []str{}, has_rn: false, ret_t: ret_t, celled_set: celled_set, fnode: fnode, rec: nil, loops: []*Loop{}, tmp_load: nil,
     xtop: 14, len_min: map[str]int{}, bounds: map[str]int{}, vdepth: 0}
+  # direct calls pass the non-pointer arguments in registers (regcall_ok, arg_plan): those
+  # parameters get a frame slot; the others are on the stack as usual
+  rc := !is_top && !is_lit && g.regcall_ok(u, fnode)
+  plan := []int{}
+  ns := len(params)
+  if rc {
+    plan = g.arg_plan(fnode, ptypes)
+    for _, k := range plan { if k >= 0 { ns-- } }
+  }
+  pvars := []*Var{}
   if !is_top {
+    k := 0
     for i, p := range params {
-      f.locals[p] = &Var{off: 16 + 8 * (len(params) - 1 - i), t: ptypes[i], celled: celled_set[p], cap: -1}
+      off := 0
+      if rc && plan[i] >= 0 {
+        off = f.new_slot()
+      } else {
+        off = 16 + 8 * (ns - 1 - k)
+        k++
+      }
+      v := &Var{off: off, t: ptypes[i], celled: celled_set[p], cap: -1}
+      f.locals[p] = v
+      pvars = append(pvars, v)
+      if rc && plan[i] >= 0 {
+        if f.arg_in == nil { f.arg_in = map[str]int{} }
+        f.arg_in[p] = ARG_REGS[plan[i]]
+      }
     }
   }
   if is_lit {
@@ -1325,13 +1376,49 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   f.decls_list(body)
 
   A.bind(label)
+  rc_mem := false                                # some parameter is celled: all go to memory first
+  if rc {
+    # the stack entry (indirect calls: function values, methods through interfaces, defer,
+    # thunks; all the arguments on the stack) loads the register arguments and falls into the
+    # register entry; when some arguments stay on the stack, it pushes them again and calls it
+    n := len(params)
+    for i, k := range plan { if k >= 0 { A.load(ARG_REGS[k], RSP, 8 + 8 * (n - 1 - i)) } }
+    re := reg_entry(u, label)
+    if ns > 0 {
+      pushed := 0
+      for i, k := range plan {
+        if k < 0 {
+          A.load(RAX, RSP, 8 + 8 * (n - 1 - i) + 8 * pushed)
+          A.push(RAX)
+          pushed++
+        }
+      }
+      A.call_noret(re)                           # (nothing to spill here)
+      A.add_imm(RSP, 8 * ns)
+      A.ret()
+    }
+    A.bind(re)
+    for i, v := range pvars { if v.celled && plan[i] >= 0 { rc_mem = true } }
+  }
   guarded := false
-  if !is_top && !is_lit && !has_defer_list(body) && len(body) > 1 { guarded = f.early_guard(body[0], params, ptypes) }
+  if !is_top && !is_lit && !has_defer_list(body) && len(body) > 1 { guarded = f.early_guard(body[0], params, ptypes, plan) }
   A.push(RBP)
   A.mov(RBP, RSP)
   A.sub_imm32(RSP, 0)
   frame_at := A.pos() - 4
+  if rc_mem { for i, v := range pvars { if plan[i] >= 0 { A.store(RBP, v.off, ARG_REGS[plan[i]]) } } }
   # celled parameters (address taken with &): the cell replaces the value
+  if rc_mem {
+    for i, v := range pvars {
+      if v.celled && plan[i] >= 0 {
+        A.load(RAX, RBP, v.off)
+        A.push(RAX)
+        A.call(g.rt_call("rt_cell"))
+        A.add_imm(RSP, 8)
+        A.store(RBP, v.off, RAX)
+      }
+    }
+  }
   for _, v := range f.locals {
     if v.off > 0 && v.celled {
       A.load(RAX, RBP, v.off)
@@ -1362,6 +1449,15 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     for _, v := range f.locals {
       if v.reg != 0 && v.off > 0 { A.load(v.reg, RBP, v.off) }     # a parameter
       if v.xr != 0 && v.off > 0 { A.movsd_load(v.xr, RBP, v.off) }
+    }
+    if rc_mem {
+      for i, v := range pvars {
+        if plan[i] < 0 { continue }
+        if v.reg != 0 { A.load(v.reg, RBP, v.off) }
+        if v.xr != 0 { A.movsd_load(v.xr, RBP, v.off) }
+      }
+    } else if rc {
+      f.home_args(pvars, plan)
     }
   }
   if hd {
@@ -1482,7 +1578,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
 # frame (the leaves of a recursion: fib's `if n < 2 { return n }` goes from 12 instructions to 4).
 # Nothing else runs before the test in the function, so skipping the prologue changes nothing.
 # Returns true when the statement was emitted here (the body skips it).
-fn (f: *Fn) early_guard(st: *ast.Node, params: []str, ptypes: []str) -> bool {
+fn (f: *Fn) early_guard(st: *ast.Node, params: []str, ptypes: []str, plan: []int) -> bool {
   if st.kind != "If" || st.init != nil || st.otherwise != nil || st.then == nil { return false }
   th := st.then
   if th.kind != "Block" || len(th.stmts) != 1 { return false }
@@ -1503,6 +1599,18 @@ fn (f: *Fn) early_guard(st: *ast.Node, params: []str, ptypes: []str) -> bool {
   if vi < 0 && !vconst { return false }
   A := f.a
   n := len(params)
+  if len(plan) > 0 {
+    # the int arguments are in registers (regcall_ok, arg_plan)
+    if plan[li] < 0 || (ri >= 0 && plan[ri] < 0) || (vi >= 0 && plan[vi] < 0) { return false }
+    rb := A.label()
+    if ri >= 0 { A.alu("cmp", ARG_REGS[plan[li]], ARG_REGS[plan[ri]]) } else { A.cmp_imm(ARG_REGS[plan[li]], rk) }
+    A.jcc(cc_signed(c.op) ^ 1, rb)
+    if vi >= 0 { A.mov(RAX, ARG_REGS[plan[vi]]) } else { A.mov_imm(RAX, vk) }
+    A.ret()
+    A.bind(rb)
+    return true
+  }
+  body := A.label()
   A.load(RAX, RSP, 8 + 8 * (n - 1 - li))        # the arguments are above the return address
   if ri >= 0 {
     A.load(RCX, RSP, 8 + 8 * (n - 1 - ri))
@@ -1510,7 +1618,6 @@ fn (f: *Fn) early_guard(st: *ast.Node, params: []str, ptypes: []str) -> bool {
   } else {
     A.cmp_imm(RAX, rk)
   }
-  body := A.label()
   A.jcc(cc_signed(c.op) ^ 1, body)
   if vi == li {
     # the tested parameter is already in RAX
@@ -1522,6 +1629,201 @@ fn (f: *Fn) early_guard(st: *ast.Node, params: []str, ptypes: []str) -> bool {
   A.ret()
   A.bind(body)
   return true
+}
+# ---- arguments in registers ----
+# A direct call to a function of the program (not the runtime) without defer passes its
+# arguments that are never pointers (integers, booleans, floats: arg_plan) in ARG_REGS and calls
+# the register entry (reg_entry) of the function; the other arguments (pointers, texts, structs,
+# any, the receiver of a method, and integers beyond the sixth) are pushed as before. The callee
+# moves the register arguments to their homes in its prologue (a register of alloc_regs, an XMM
+# register or a frame slot). The old label (all the arguments on the stack) stays for the
+# indirect calls (function values, methods through interfaces, defer, thunks).
+# ARG_REGS are the caller-saved RSI, RDI, R8..R11 (EXTRA_REGS): the caller spills its variables
+# that live in them before loading the arguments, and fills them after the call. Pointers never
+# travel in them, so the collector sees every argument.
+let ARG_REGS = []int{RSI, RDI, R8, R9, R10, R11}
+
+# where each parameter of fd is passed: the index in ARG_REGS, or -1 (the stack)
+fn (g: *Gen) arg_plan(fd: *ast.Node, pt: []str) -> []int {
+  out := []int{}
+  k := 0
+  for i, t := range pt {
+    c := g.cls(t, fd)
+    if (i > 0 || fd.recv == nil) && (c == "i" || c == "f") && k < len(ARG_REGS) {
+      out = append(out, k)
+      k++
+    } else {
+      out = append(out, -1)
+    }
+  }
+  return out
+}
+fn (g: *Gen) regcall_ok(u: *Unit, fd: *ast.Node) -> bool {
+  if u.is_runtime || fd == nil || fd.body == nil || has_defer_list(fd.body.stmts) { return false }
+  for _, k := range g.arg_plan(fd, param_types(fd)) { if k >= 0 { return true } }
+  return false
+}
+# u.r.name: the register entry of the function whose stack entry is u.f.name
+fn reg_entry(u: *Unit, label: str) -> str {
+  k := len(u.p) + 3
+  return u.p + ".r." + label[k:]
+}
+# prologue of a function called with the arguments in registers: each one goes to its home
+fn (f: *Fn) home_args(pvars: []*Var, plan: []int) {
+  A := f.a
+  # memory and XMM first (they only read the argument registers)
+  for i, v := range pvars {
+    if plan[i] < 0 { continue }
+    if v.xr != 0 {
+      A.movq_x(v.xr, ARG_REGS[plan[i]])
+    } else if v.reg == 0 {
+      A.store(RBP, v.off, ARG_REGS[plan[i]])
+    }
+  }
+  # then the moves between general registers (a variable of alloc_regs may live in another
+  # argument register): a parallel move, cycles broken through RAX
+  dst := []int{}
+  src := []int{}
+  for i, v := range pvars {
+    if plan[i] >= 0 && v.reg != 0 && v.xr == 0 && v.reg != ARG_REGS[plan[i]] {
+      dst = append(dst, v.reg)
+      src = append(src, ARG_REGS[plan[i]])
+    }
+  }
+  while len(dst) > 0 {
+    k := -1
+    for i, d := range dst {
+      blocked := false
+      for j, s2 := range src { if j != i && s2 == d { blocked = true } }
+      if !blocked {
+        k = i
+        break
+      }
+    }
+    if k < 0 {
+      # only cycles left: save one source in RAX
+      A.mov(RAX, src[0])
+      for j := 0; j < len(src); j++ { if j != 0 && src[j] == src[0] { src[j] = RAX } }
+      src[0] = RAX
+      continue
+    }
+    A.mov(dst[k], src[k])
+    nd := []int{}
+    ns := []int{}
+    for i := 0; i < len(dst); i++ {
+      if i != k {
+        nd = append(nd, dst[i])
+        ns = append(ns, src[i])
+      }
+    }
+    dst = nd
+    src = ns
+  }
+}
+# a is evaluated right before the call, after the arguments with calls: it calls nothing (no
+# variable changes behind it, no collection while the registers hold pointers) and needs no box
+# nor copy; it only uses RAX, RCX, RDX and XMM registers
+fn (f: *Fn) late_arg(a: *ast.Node, t: str) -> bool {
+  g := f.g
+  if t == "" { t = a.ty }
+  if a.ty == "" || t == "" || g.is_iface_t(a.ty) || g.is_iface_t(t) || g.is_value_type(a.ty) { return false }
+  return f.no_calls(a)
+}
+# a (late_arg) into register r
+fn (f: *Fn) arg_to(a: *ast.Node, t: str, r: int) {
+  A := f.a
+  g := f.g
+  if t == "" { t = a.ty }
+  same := g.cls(a.ty, a) == g.cls(t, a) && g.cls(t, a) != "f"
+  if same && f.simple_to(a, r) { return }
+  if same && a.kind == "Binary" && a.ik != ast.NONE && !needs_wrap(a.ik) && (a.op == "+" || a.op == "-") {
+    lr := f.reg_of(a.left)
+    imm, is_imm := f.imm32(a.right)
+    if lr != 0 && is_imm && imm > -2147483648 {
+      if a.op == "-" { imm = -imm }
+      A.rmx(0x8D, r, lr, imm, 1, 0)                # lea r, [reg + imm]
+      return
+    }
+  }
+  f.bind_value(a, t)
+  A.mov(r, RAX)
+}
+# a direct call with arguments in registers: npre arguments (the receiver, on the stack) are
+# already pushed; args[i] has the type pt[poff + i] and goes where plan[poff + i] says
+fn (f: *Fn) reg_call(nm: str, n: *ast.Node, npre: int, args: []*ast.Node, pt: []str, poff: int, plan: []int) {
+  f.reg_call_d(nm, n, npre, args, pt, poff, plan, true)
+}
+# depth_back false: the depth unit taken by the call is not given back (acc_loop keeps it)
+fn (f: *Fn) reg_call_d(nm: str, n: *ast.Node, npre: int, args: []*ast.Node, pt: []str, poff: int, plan: []int, depth_back: bool) {
+  A := f.a
+  # the arguments up to the last one that may call something are evaluated in order (pushed,
+  # or kept in a hidden slot when they go to a register); the others are computed at the end,
+  # straight into their registers (or pushed)
+  last := -1
+  for i, a := range args { if !f.late_arg(a, at_or(pt, poff + i)) { last = i } }
+  ns := npre
+  for i := 0; i < len(args); i++ { if plan[poff + i] < 0 { ns++ } }
+  held := []*Var{}
+  held_r := []int{}
+  for i := 0; i <= last; i++ {
+    f.bind_value(args[i], at_or(pt, poff + i))
+    if plan[poff + i] < 0 {
+      A.push(RAX)
+    } else {
+      h := f.hidden()
+      f.store_slot(h)
+      held = append(held, h)
+      held_r = append(held_r, ARG_REGS[plan[poff + i]])
+    }
+  }
+  A.spill()
+  loaded := []int{}
+  for i := last + 1; i < len(args); i++ {
+    # a variable in a register that an earlier argument already took is read from its slot
+    # (spilled just above)
+    hv, hr := f.hide_regs(loaded)
+    k := plan[poff + i]
+    if k < 0 {
+      f.bind_value(args[i], at_or(pt, poff + i))
+      A.push(RAX)
+    } else {
+      f.arg_to(args[i], at_or(pt, poff + i), ARG_REGS[k])
+      loaded = append(loaded, ARG_REGS[k])
+    }
+    for j, v := range hv { v.reg = hr[j] }
+  }
+  for i, h := range held { f.load_slot_r(h, held_r[i]) }
+  f.depth_in(n)
+  A.call_noret(f.u.p + ".r." + nm)               # (spilled above, filled below)
+  if depth_back { f.depth_out() }
+  A.fill()
+  if ns > 0 { A.add_imm(RSP, 8 * ns) }
+}
+# variables (and cached lists) that live in one of the registers rs: marked as in memory for a
+# while (the caller puts back the registers returned)
+fn (f: *Fn) hide_regs(rs: []int) -> ([]*Var, []int) {
+  hv := []*Var{}
+  hr := []int{}
+  if len(rs) == 0 { return hv, hr }
+  all := []*Var{}
+  for _, v := range f.locals { all = append(all, v) }
+  if f.scache != nil {
+    for _, c := range f.scache {
+      all = append(all, c.len)
+      all = append(all, c.data)
+    }
+  }
+  for _, v := range all {
+    for _, r := range rs {
+      if v.reg == r {
+        hv = append(hv, v)
+        hr = append(hr, r)
+        v.reg = 0
+        break
+      }
+    }
+  }
+  return hv, hr
 }
 # the position of n among the parameters when n is an int parameter read by value, or -1
 fn (f: *Fn) int_param(n: *ast.Node, params: []str, ptypes: []str) -> int {
@@ -1677,13 +1979,17 @@ fn (f: *Fn) acc_loop(n: *ast.Node) {
       lfd, ok := f.u.funcs[lc.name]
       if !ok { nfail("function " + types.bare(lc.name) + " not found", lc) }
       lpt := param_types(lfd)
-      for i, a := range lc.args {
-        f.bind_value(a, at_or(lpt, i))
-        A.push(RAX)
+      if f.g.regcall_ok(f.u, lfd) {
+        f.reg_call_d(lc.name, lc, 0, lc.args, lpt, 0, f.g.arg_plan(lfd, lpt), false)   # no inc r15
+      } else {
+        for i, a := range lc.args {
+          f.bind_value(a, at_or(lpt, i))
+          A.push(RAX)
+        }
+        f.depth_in(lc)
+        A.call(f.u.p + ".f." + lc.name)          # no inc r15: the turn below keeps the unit
+        if len(lc.args) > 0 { A.add_imm(RSP, 8 * len(lc.args)) }
       }
-      f.depth_in(lc)
-      A.call(f.u.p + ".f." + lc.name)            # no inc r15: the turn below keeps the unit
-      if len(lc.args) > 0 { A.add_imm(RSP, 8 * len(lc.args)) }
     } else {
       f.bind_value(l, v.ty)
     }
@@ -3874,6 +4180,10 @@ fn (f: *Fn) call(n: *ast.Node) {
     fd, ok := f.u.funcs[nm]
     if !ok { nfail("function " + types.bare(nm) + " not found", n) }
     pt := param_types(fd)
+    if f.g.regcall_ok(f.u, fd) {
+      f.reg_call(nm, n, 0, n.args, pt, 0, f.g.arg_plan(fd, pt))
+      return
+    }
     for i, a := range n.args {
       f.bind_value(a, at_or(pt, i))
       A.push(RAX)
@@ -4001,6 +4311,10 @@ fn (f: *Fn) method(n: *ast.Node) {
     f.rt("rt_copy_val", 2)
   }
   A.push(RAX)
+  if f.g.regcall_ok(f.u, fd) {
+    f.reg_call(n.target_name, n, 1, n.args, pt, 1, f.g.arg_plan(fd, pt))
+    return
+  }
   for i, a := range n.args {
     f.bind_value(a, at_or(pt, i + 1))
     A.push(RAX)

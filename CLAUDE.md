@@ -85,6 +85,12 @@ procure o endereço no arquivo do `CAJU_SYMS`.
 - `return L op f(args)` / `return f(args) op L` / `return f(args)` (f a própria função, op + * & | ^
   em int) viram laço com acumulador (`acc_plan`): cada volta gasta uma unidade de R15 e os
   `return` devolvem o R15 da entrada (`acc_depth`); os outros `return q` dão `acc op q`.
+- Chamadas diretas a funções do programa sem `defer` (`reg_call`) passam os argumentos que nunca
+  são ponteiro (int, bool, num; até 6, `arg_plan`) em RSI, RDI, R8..R11 (`ARG_REGS`) e entram em
+  `u.r.nome`; os outros (ponteiros, textos, structs, receptor) vão na pilha como antes. `u.f.nome`
+  (chamadas indiretas: valores de função, interfaces, defer) carrega os registradores e cai em
+  `u.r.nome` (ou empilha de novo os da pilha e chama). O chamador faz `A.spill` antes de carregar
+  os argumentos; argumentos com chamadas são avaliados antes (pilha ou slot escondido).
 - Caminhos de erro vão para o código frio (`A.cold_begin`/`cold_end`, `f.fail_if`): o código vai
   para depois do `ret` da função (`flush_cold`) e o caminho quente segue reto. Código frio não
   volta sozinho: termina num erro que não retorna ou num `jmp` explícito.

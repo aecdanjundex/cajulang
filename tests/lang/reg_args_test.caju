@@ -1,0 +1,304 @@
+# Direct calls pass the arguments that are never pointers (integers, booleans, floats; at most
+# 6) in registers (RSI, RDI, R8..R11) and enter after a small stack entry that indirect calls
+# (function values, method values, interfaces, defer) still use. Everything must behave as with
+# the arguments on the stack.
+import { describe, it, expect, run_source } from "std/testing"
+import "std/strings"
+
+fn six(a: int, b: int, c: int, d: int, e: int, f: int) -> int {
+  return a + 10 * b + 100 * c + 1000 * d + 10000 * e + 100000 * f
+}
+fn seven(a: int, b: int, c: int, d: int, e: int, f: int, g: int) -> int {
+  return a + 10 * b + 100 * c + 1000 * d + 10000 * e + 100000 * f + 1000000 * g
+}
+fn eight(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int) -> int {
+  return seven(a, b, c, d, e, f, g) + 10000000 * h
+}
+struct P {
+  x: int
+  y: int
+}
+fn mixed(i: int, x: num, s: str, ok: bool, p: *P, v: P) -> str {
+  v.x = v.x + 1                                   # a copy: the caller's value stays
+  p.y = p.y + 1
+  return str(i) + "|" + str(x) + "|" + s + "|" + str(ok) + "|" + str(p.x) + "|" + str(v.x)
+}
+fn mixed2(xs: []int, m: map[str]int, a: any, f: float32, b: uint8, k: int8) -> str {
+  return str(len(xs)) + "|" + str(m["k"]) + "|" + str(a) + "|" + str(f) + "|" + str(b) + "|" + str(k)
+}
+fn half(x: num) -> num { return x / 2 }
+# num parameters used in a loop live in XMM registers: they arrive in general registers
+fn poly(x: num, n: int, y: num) -> num {
+  s := 0.0
+  for i := 0; i < n; i++ { s = s * x + y * x - y + x * x }
+  return s
+}
+fn num_caller(n: int) -> num {
+  a := 0.5
+  b := 1.25
+  t := 0.0
+  for i := 0; i < n; i++ {
+    t = t + a * b + a * b + a
+    t = t + poly(a, 3, b) + poly(b, 2, a + 1.0) + half(t - a)
+  }
+  return t
+}
+
+let order: []str = nil
+fn note(s: str, v: int) -> int {
+  order = append(order, s)
+  return v
+}
+let g_counter: int = 0
+fn bump() -> int {
+  g_counter = g_counter + 1
+  return 100
+}
+fn pair(a: int, b: int) -> int { return 1000 * a + b }
+fn trio(a: int, b: int, c: int) -> int { return 1000000 * a + 1000 * b + c }
+
+# heavy use of the parameters in a loop without calls: they live in registers chosen by use
+# count, so the arguments may have to swap registers (b in RDI goes to RSI, a in RSI to RDI)
+fn swapper(a: int, b: int, c: int, d: int, e: int, f: int) -> int {
+  s := 0
+  for i := 0; i < 3; i++ {
+    s = s + c + d + e + f + c + d + e + f + c + d + e + f + c + d + e + f
+    s = s + c + d + e + f + c + d + e + f + c + d + e + f + c + d + e + f
+    s = s + b + b + b + b + b + b + b + b
+    s = s + a + a + a + a
+  }
+  return s * 1000 + a * 10 + b
+}
+# b is the 5th most used variable (goes to RSI), a the 6th (RDI): they arrive in RSI and RDI,
+# a cycle that the prologue breaks through RAX
+fn cyc(a: int, b: int) -> int {
+  s := 0
+  x := 0
+  y := 0
+  for i := 0; i < 4; i++ {
+    x = x + i + i + i + i
+    y = y + x + x + x + y + y
+    s = s + x + y + i + x + y + i + s + s
+    s = s + b + b + b + a + a
+  }
+  return s * 100 + a * 10 + b
+}
+# locals in caller-saved registers passed in another order (the argument registers overwrite
+# them while the arguments are loaded)
+fn shuffle(n: int) -> int {
+  x := 1
+  y := 2
+  z := 3
+  w := 4
+  u := 5
+  v := 6
+  t := 0
+  for i := 0; i < n; i++ {
+    t = t + x + y + z + w + u + v + x + y + z + w + u + v + x + y + z + w + u + v
+    t = t + x + y + z + w + u + v + x + y + z + w + u + v + x + y + z + w + u + v
+    t = t + six(v, u, w, z, y, x) + six(x + 1, v - 1, u, y, w, z)
+  }
+  return t
+}
+
+# the pointer arguments must reach the stack before the callee allocates (collections)
+fn churn(a: []int, s: str, p: *P, n: int) -> int {
+  junk := []str{}
+  for i := 0; i < n; i++ {
+    junk = append(junk, strings.repeat("x", 50) + str(i))
+    if len(junk) > 1000 { junk = []str{} }
+  }
+  return a[0] + a[len(a) - 1] + len(s) + p.x + p.y
+}
+fn make_list(n: int) -> []int {
+  out := []int{}
+  for i := 0; i < n; i++ { out = append(out, i) }
+  return out
+}
+
+fn guard_const(n: int) -> int {
+  if n <= 0 { return -1 }
+  return n * 3
+}
+fn guard_param(a: int, b: int, c: int) -> int {
+  if b > c { return a }
+  return a + b + c
+}
+fn guard_other(a: int, b: int) -> int {
+  if b < 10 { return 77 }
+  return a - b
+}
+
+fn cell_param(n: int, k: int) -> int {
+  p := &n
+  *p = *p + k
+  return n
+}
+fn named(a: int, b: int) -> (q: int, r: int) {
+  q = a / b
+  r = a % b
+  return
+}
+
+struct Acc { total: int }
+fn (a: *Acc) add(x: int, y: int) -> int {
+  a.total = a.total + x * y
+  return a.total
+}
+fn (a: Acc) peek(x: int) -> int {
+  a.total = a.total + x                           # receiver by value: a copy
+  return a.total
+}
+interface Adder { add(x: int, y: int) -> int }
+
+fn may_fail(xs: []int, i: int, msg: str) -> int {
+  if i >= len(xs) { panic(msg) }
+  return xs[i]
+}
+fn safe(xs: []int, i: int) -> str {
+  defer fn() { recover() }()
+  return str(may_fail(xs, i, "out " + str(i)))
+}
+let deferred: []int = nil
+fn record(a: int, b: int) { deferred = append(deferred, a * 10 + b) }
+fn record_s(s: str, a: int, p: *P) { deferred = append(deferred, len(s) * 100 + a + p.x) }
+fn with_defer(n: int) -> int {
+  defer record_s("abc", n, &P{x: 1000, y: 0})
+  defer record(n, 1)
+  defer record(n, 2)
+  return n
+}
+
+fn rec_sum(xs: []int, lo: int, hi: int) -> int {
+  if lo >= hi { return 0 }
+  if hi - lo == 1 { return xs[lo] }
+  mid := (lo + hi) / 2
+  return rec_sum(xs, lo, mid) + rec_sum(xs, mid, hi)
+}
+
+describe("arguments in registers", fn() {
+  it("pass up to six arguments and more on the stack", fn() {
+    expect(six(1, 2, 3, 4, 5, 6)).to_equal(654321)
+    expect(seven(1, 2, 3, 4, 5, 6, 7)).to_equal(7654321)
+    expect(eight(1, 2, 3, 4, 5, 6, 7, 8)).to_equal(87654321)
+    fe := eight
+    expect(fe(1, 2, 3, 4, 5, 6, 7, 8)).to_equal(87654321)
+    fs := seven
+    expect(fs(1, 2, 3, 4, 5, 6, 7)).to_equal(7654321)
+  })
+  it("mix integers, floats, texts, booleans, pointers and structs", fn() {
+    p := &P{x: 7, y: 1}
+    v := P{x: 40, y: 0}
+    expect(mixed(3, 2.5, "s", true, p, v)).to_equal("3|2.5|s|true|7|41")
+    expect(v.x).to_equal(40)
+    expect(p.y).to_equal(2)
+    expect(mixed(-1, 1, "a" + "b", 1 < 2, &P{x: 9, y: 0}, P{x: 1, y: 2})).to_equal("-1|1|ab|true|9|2")
+    # arguments with calls (kept aside until the call) between texts, pointers and structs
+    order = []str{}
+    q := &P{x: note("p", 4), y: 0}
+    got := mixed(note("i", 8), half(num(note("x", 3))), "t" + str(note("s", 1)), note("b", 0) == 0, q, P{x: note("v", 6), y: 0})
+    expect(got).to_equal("8|1.5|t1|true|4|7")
+    expect(strings.join(order, ",")).to_equal("p,i,x,s,b,v")
+    fm := mixed
+    expect(fm(2, 0.5, "f", false, q, v)).to_equal("2|0.5|f|false|4|41")
+    expect(q.y).to_equal(2)
+    expect(mixed2([]int{1, 2, 3}, map[str]int{"k": 5}, "any", 1.5, 200, -3)).to_equal("3|5|any|1.5|200|-3")
+    expect(half(5)).to_equal(2.5)
+    k := 7
+    expect(half(k)).to_equal(3.5)
+    expect(poly(2.0, 3, 1.0)).to_equal(35.0)
+    expect(num_caller(3)).to_be_close_to(28.87109375, 0.000001)
+  })
+  it("evaluate the arguments from left to right, calls included", fn() {
+    order = []str{}
+    r := trio(note("a", 1), note("b", 2), note("c", 3))
+    expect(r).to_equal(1002003)
+    expect(strings.join(order, ",")).to_equal("a,b,c")
+    g_counter = 5
+    expect(pair(g_counter, bump())).to_equal(5100)
+    expect(pair(bump(), g_counter)).to_equal(100007)
+    x := 3
+    expect(trio(x, pair(x, x), x + 1)).to_equal(6003004)
+    expect(pair(pair(1, 2), pair(3, 4))).to_equal(1002 * 1000 + 3004)
+  })
+  it("move the arguments to the registers the callee chose", fn() {
+    expect(swapper(1, 2, 3, 4, 5, 6)).to_equal(swapper(1, 2, 3, 4, 5, 6))
+    s := 0
+    for i := 0; i < 3; i++ { s = s + 4 * (3 + 4 + 5 + 6) * 2 + 2 * 8 + 4 }
+    expect(swapper(1, 2, 3, 4, 5, 6)).to_equal(s * 1000 + 12)
+    expect(cyc(1, 2)).to_equal(177212)
+    expect(cyc(7, 3)).to_equal(237273)
+    expect(swapper(9, 8, 0, 0, 0, 0)).to_equal(3 * (8 * 8 + 4 * 9) * 1000 + 98)
+  })
+  it("keep the caller's register variables while passing them in another order", fn() {
+    one := 3 * (1 + 2 + 3 + 4 + 5 + 6) + 3 * (1 + 2 + 3 + 4 + 5 + 6) + 654321 * 0
+    want := 0
+    for i := 0; i < 4; i++ { want = want + one + six(6, 5, 4, 3, 2, 1) + six(2, 5, 5, 2, 4, 3) }
+    expect(shuffle(4)).to_equal(want)
+  })
+  it("keep pointer arguments alive while the callee allocates", fn() {
+    a := make_list(1000)
+    p := &P{x: 3, y: 4}
+    total := 0
+    for i := 0; i < 20; i++ { total = total + churn(a, "abc" + str(i % 10), p, 2000) }
+    expect(total).to_equal(20 * (999 + 4 + 7))
+    expect(churn(make_list(10), strings.repeat("y", 5), &P{x: 1, y: 1}, 3000)).to_equal(9 + 5 + 2)
+  })
+  it("test the early guard on the argument registers", fn() {
+    expect(guard_const(0)).to_equal(-1)
+    expect(guard_const(5)).to_equal(15)
+    expect(guard_param(1, 5, 2)).to_equal(1)
+    expect(guard_param(1, 2, 5)).to_equal(8)
+    expect(guard_other(4, 3)).to_equal(77)
+    expect(guard_other(40, 30)).to_equal(10)
+  })
+  it("call the same functions through values, closures, methods and interfaces", fn() {
+    f := six
+    expect(f(1, 2, 3, 4, 5, 6)).to_equal(654321)
+    g := guard_param
+    expect(g(1, 5, 2)).to_equal(1)
+    expect(g(1, 2, 5)).to_equal(8)
+    base := 10
+    h := fn(x: int) -> int { return pair(x, base) + guard_const(x) }
+    expect(h(2)).to_equal(2010 + 6)
+    acc := &Acc{total: 1}
+    expect(acc.add(2, 3)).to_equal(7)
+    m := acc.add
+    expect(m(1, 1)).to_equal(8)
+    let ad: Adder = acc
+    expect(ad.add(2, 2)).to_equal(12)
+    v := Acc{total: 5}
+    expect(v.peek(3)).to_equal(8)
+    expect(v.total).to_equal(5)
+    pk := v.peek
+    expect(pk(4)).to_equal(9)
+  })
+  it("work with celled parameters and named results", fn() {
+    expect(cell_param(5, 6)).to_equal(11)
+    q, r := named(17, 5)
+    expect(q).to_equal(3)
+    expect(r).to_equal(2)
+  })
+  it("recover from panics in functions with arguments in registers", fn() {
+    xs := []int{10, 20, 30}
+    expect(safe(xs, 1)).to_equal("20")
+    expect(safe(xs, 5)).to_equal("")
+    n := 0
+    for i := 0; i < 5; i++ { n = n + len(safe(xs, i)) }
+    expect(n).to_equal(6)
+    expect(may_fail(xs, 2, "x")).to_equal(30)
+    deferred = []int{}
+    expect(with_defer(4)).to_equal(4)
+    expect(deferred).to_equal([]int{42, 41, 1304})
+  })
+  it("work from the top level of a program", fn() {
+    src := "let k: int = 0\nfn bump() -> int {\n  k = k + 1\n  return k\n}\nfn f(a: int, s: str, b: int, c: num) -> str { return str(a) + s + str(b) + str(c) }\nx := 5\nprint(f(bump(), \"-\" + str(bump()), x, 0.5))\nprint(f(x, \"+\", bump(), num(bump())))\n"
+    r := run_source(src)
+    expect(r.output).to_equal("1-250.5\n5+34")
+  })
+  it("recurse with pointer and integer arguments", fn() {
+    xs := make_list(1000)
+    expect(rec_sum(xs, 0, 1000)).to_equal(499500)
+    expect(rec_sum(xs, 10, 20)).to_equal(145)
+  })
+})
