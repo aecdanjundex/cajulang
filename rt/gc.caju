@@ -16,6 +16,7 @@ let rt_pg_kind: int = 0        # byte per page: 0 free, 1 small, 2 start of larg
 let rt_pg_info: int = 0        # word per page: object size, number of pages, or the starting page
 let rt_pg_flag: int = 0        # byte per large page: 1 marked, 2 no pointers, 4 in use
 let rt_free_pages: int = 0     # free pages below rt_top_page
+let rt_fresh: bool = false     # the last rt_take_pages came from above rt_top_page (still zeroed)
 let rt_cls_size: int = 0       # size of each class
 let rt_cls_of: int = 0         # byte per (size + 15) / 16 → class
 let rt_free: int = 0           # free list of each class
@@ -78,6 +79,7 @@ fn rt_take_pages(n: int) -> int {
         run++
         if run == n {
           rt_free_pages -= n
+          rt_fresh = false
           return i - n + 1
         }
       } else {
@@ -90,6 +92,7 @@ fn rt_take_pages(n: int) -> int {
   p := rt_top_page
   rt_top_page += n
   rt_os_commit(rt_arena + (p << 16), n << 16)
+  rt_fresh = true                # never used: zeroed by the system (mmap, VirtualAlloc)
   return p
 }
 fn rt_zero_mem(p: int, n: int) {
@@ -162,7 +165,7 @@ fn rt_alloc_x(n: int, noscan: bool) -> int {
     i++
   }
   p := rt_arena + (pi << 16)
-  rt_zero_mem(p, np << 16)
+  if !rt_fresh { rt_zero_mem(p, np << 16) }
   return p
 }
 fn rt_alloc(n: int) -> int { return rt_alloc_x(n, false) }

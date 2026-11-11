@@ -77,10 +77,15 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   Toda chamada (`A.call`, `A.call_rax`) as grava no slot delas antes e relê depois; erros do
   runtime que não voltam usam `A.call_noret`. Funções com `defer` não usam.
 - RSI, RDI, R8..R11 (`EXTRA_REGS`) guardam mais variáveis inteiras (`alloc_regs`, se os usos
-  pesam mais que as chamadas) e, em laços sem chamadas, o tamanho e os dados das listas do SCache
-  (`scache_slot`). Toda chamada as grava no slot antes e relê depois (`A.spill`/`A.fill`, junto
+  pesam mais que as chamadas) e, em laços sem chamadas (ou só dentro de ramos de `if`/`switch`),
+  o tamanho e os dados das listas do SCache (`scache_slot`). Toda chamada as grava no slot antes e relê depois (`A.spill`/`A.fill`, junto
   com as XMM), então um ponteiro de dados nelas está na pilha durante a chamada. `__syscall` também.
-- Variáveis do nível de cima que nenhuma função usa (nem `&x`) são locais do `u.top`.
+- Variáveis do nível de cima que nenhuma função usa (nem `&x`) são locais do `u.top` (uma variável
+  da própria função com o mesmo nome não conta: `func_locals`).
+- `Fn.kn`: depois de conferir `a[i]` (a e i locais fora de célula), os `a[i]` seguintes não
+  conferem até a ou i serem atribuídos. `stmt()` mantém os fatos (ver "indexes known in range");
+  código que pode não rodar (ramos, lado direito de and/or, `switch`) não aprende nada (`kn_off`).
+- Laços com condição barata (`loop_entry`) repetem a condição antes do corpo (sem o `jmp` de entrada).
 - Chamadas a funções `return E` pequenas viram a expressão (`try_inline`).
 - `return L op f(args)` / `return f(args) op L` / `return f(args)` (f a própria função, op + * & | ^
   em int) viram laço com acumulador (`acc_plan`): cada volta gasta uma unidade de R15 e os

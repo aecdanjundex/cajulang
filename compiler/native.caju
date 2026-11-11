@@ -832,6 +832,8 @@ struct Fn {
                               # length it surely has (checked before the loop)
   bounds: map[str]int         # there: variable of a bounded loop -> its bound (0 <= v < bound)
   vdepth: int                 # > 0: inside a copied loop (no more copies)
+  kn: []*KnFact               # a[i] known to be in range here (see "indexes known in range")
+  kn_off: int                 # > 0: code that may not run (or runs in another order): learns nothing
   xtop: int                   # fexpr uses xmm0..xtop (the registers above hold num variables)
   epi_here: bool              # without defer: a return restores the registers and returns
   epi_regs: []int             # right there (instead of jumping to the exit)
@@ -845,6 +847,12 @@ struct Fn {
   acc_tails: []*ast.Node      # the returns that jump back to acc_head
   acc_guard: *ast.Node        # the first statement when early_guard did it (tested at each turn)
   arg_in: map[str]int         # parameters that arrive in a register (arg_plan): name -> register
+}
+
+# a[i] passed its check (i < len(a), unsigned) and neither a nor i was assigned since
+struct KnFact {
+  l: str
+  i: str
 }
 
 # a list variable that no statement of the enclosing loop assigns: its header (data, length,
@@ -869,11 +877,16 @@ struct LoopScan {
                            # calls to functions are in fcalls: see Fn.fix_rcalls)
   uses: map[str]int        # indexes of each list, weighted by loop depth (who gets the registers)
   wt: int
+  hcalls: bool             # rcalls outside the branches of an if, a switch or the right of and/or
+  hfcalls: []*ast.Node     # (the calls to functions there: see Fn.fix_rcalls)
+  cold: int                # (inside such a branch)
 }
 
 fn (ls: *LoopScan) walk(n: *ast.Node) {
   if n == nil { return }
   if !ls.rcalls && !(n.kind == "Call" && n.call_kind == "func") && ls.g.calls_here(n) { ls.rcalls = true }
+  if !ls.hcalls && ls.cold == 0 && !(n.kind == "Call" && n.call_kind == "func") && ls.g.calls_here(n) { ls.hcalls = true }
+  if ls.cold == 0 && n.kind == "Call" && n.call_kind == "func" { ls.hfcalls = append(ls.hfcalls, n) }
   if n.kind == "FuncLit" || n.kind == "Func" { return }
   wt := ls.wt
   if (n.kind == "ForC" || n.kind == "While" || n.kind == "Range" || n.kind == "ForTo") && wt < 4096 { ls.wt = wt * 8 }
@@ -901,7 +914,9 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   if n.kind == "OpAssign" && n.target != nil && n.target.kind != "Var" && n.target.kind != "Index" && n.target.kind != "Field" { ls.deref_store = true }
   ls.walk(n.value)
   ls.walk(n.left)
+  if n.kind == "Logical" { ls.cold++ }
   ls.walk(n.right)
+  if n.kind == "Logical" { ls.cold-- }
   ls.walk(n.arg)
   ls.walk(n.expr)
   ls.walk(n.obj)
@@ -915,8 +930,10 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   ls.walk(n.cond)
   ls.walk(n.init)
   ls.walk(n.post)
+  if n.kind == "If" { ls.cold++ }
   ls.walk(n.then)
   ls.walk(n.otherwise)
+  if n.kind == "If" { ls.cold-- }
   ls.walk(n.tag)
   ls.walk(n.subject)
   ls.walk(n.from_)
@@ -928,7 +945,9 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   for _, x := range n.values { ls.walk(x) }
   for _, x := range n.targets { ls.walk(x) }
   for _, x := range n.exprs { ls.walk(x) }
+  ls.cold++                                      # (cases of a switch)
   for _, x := range n.cases { ls.walk(x) }
+  ls.cold--
   for _, x := range n.elems { ls.walk(x) }
   for _, x := range n.vars { ls.walk(x) }
   for _, x := range n.fields { ls.walk(x) }
@@ -937,7 +956,7 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
 }
 
 fn scan_loop(g: *Gen, parts: []*ast.Node) -> *LoopScan {
-  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false, g: g, rcalls: false, uses: map[str]int{}, wt: 1}
+  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false, g: g, rcalls: false, uses: map[str]int{}, wt: 1, hfcalls: []*ast.Node{}}
   for _, p := range parts { ls.walk(p) }
   return ls
 }
@@ -1141,6 +1160,40 @@ struct UseCount {
   f: *Fn                      # nil: calls are not counted
   calls: int                  # weighted count of the calls (each one saves and reloads the
                               # variables in caller-saved registers, XMM and RSI, RDI, R8..R11)
+  scoped: bool                # top level: names local to a function are not the top-level ones
+  scopes: []map[str]bool      # (the locals of the functions being walked)
+}
+# the names a function declares (parameters, results, receiver and every declaration in its
+# body, outside nested function literals): inside it they are not the top-level variables
+fn func_locals(fnode: *ast.Node) -> map[str]bool {
+  m := map[str]bool{}
+  for _, p := range fnode.params { m[p] = true }
+  for _, p := range fnode.rnames { m[p] = true }
+  if fnode.recv != nil && fnode.recv.name != "" { m[fnode.recv.name] = true }
+  decl_names(fnode.body, m)
+  return m
+}
+fn decl_names(n: *ast.Node, m: map[str]bool) {
+  if n == nil { return }
+  switch n.kind {
+  case "Func", "FuncLit", "Extern", "Struct": return
+  case "Assign": if n.decl != "" { m[n.name] = true }
+  case "ForTo": m[n.name] = true
+  case "VarDecl": for _, nm := range n.names { m[nm] = true }
+  case "Range": if n.define { for _, v := range n.vars { m[v.name] = true } }
+  case "TypeSwitch": if n.bind != "" { m[n.bind] = true }
+  }
+  for _, x := range n.stmts { decl_names(x, m) }
+  for _, x := range n.cases { decl_names(x, m) }
+  decl_names(n.body, m)
+  decl_names(n.then, m)
+  decl_names(n.otherwise, m)
+  decl_names(n.init, m)
+  decl_names(n.post, m)
+}
+fn (uc: *UseCount) local_name(name: str) -> bool {
+  for _, sc := range uc.scopes { if sc[name] { return true } }
+  return false
 }
 
 # a node whose code calls a function that returns (a guess: it only weighs the variables in
@@ -1182,19 +1235,26 @@ fn (g: *Gen) calls_here(n: *ast.Node) -> bool {
 fn (uc: *UseCount) walk(n: *ast.Node, w: int, in_lit: bool) {
   if n == nil { return }
   if n.kind == "FuncLit" || n.kind == "Func" {
+    if uc.scoped && n.kind == "Func" {
+      uc.scopes = append(uc.scopes, func_locals(n))
+      uc.walk(n.body, w, true)
+      uc.scopes = uc.scopes[0:len(uc.scopes) - 1]
+      return
+    }
     uc.walk(n.fn_, w, true)
     uc.walk(n.body, w, true)
     return
   }
   # &x: x must keep an address (top level: stays global)
-  if n.kind == "AddrOf" && n.arg != nil && n.arg.kind == "Var" { uc.in_lit[n.arg.name] = true }
+  if n.kind == "AddrOf" && n.arg != nil && n.arg.kind == "Var" && !uc.local_name(n.arg.name) { uc.in_lit[n.arg.name] = true }
   name := ""
   if n.kind == "Var" || n.kind == "ForTo" || (n.kind == "Assign" && n.name != "") { name = n.name }
+  if name != "" && uc.local_name(name) { name = "" }   # (a function's own variable)
   if name != "" {
     if in_lit { uc.in_lit[name] = true }
     uc.n[name] = uc.n[name] + w
   }
-  if n.kind == "VarDecl" { for _, nm := range n.names { uc.n[nm] = uc.n[nm] + w } }
+  if n.kind == "VarDecl" { for _, nm := range n.names { if !uc.local_name(nm) { uc.n[nm] = uc.n[nm] + w } } }
   if uc.f != nil && !in_lit && uc.is_call(n) { uc.calls = uc.calls + w }
   inner := w
   if n.kind == "ForC" || n.kind == "ForTo" || n.kind == "Range" || n.kind == "While" {
@@ -1243,7 +1303,7 @@ fn (uc: *UseCount) walk(n: *ast.Node, w: int, in_lit: bool) {
 
 # chooses the variables that go to registers; returns the registers used
 fn (f: *Fn) alloc_regs(body: []*ast.Node) -> []int {
-  uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}, f: f, calls: 0}
+  uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}, f: f, calls: 0, scoped: f.is_top, scopes: []map[str]bool{}}
   for _, st := range body { uc.walk(st, 1, false) }
   cands := []str{}
   for name, v := range f.locals {
@@ -1368,7 +1428,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     for i, nm := range f.rnames { f.add_decl(nm, rs[i], fnode) }
   }
   if is_top && !u.is_runtime && !has_defer_list(body) {
-    uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}}
+    uc := &UseCount{n: map[str]int{}, in_lit: map[str]bool{}, scoped: true, scopes: []map[str]bool{}}
     for _, st := range body { uc.walk(st, 1, false) }
     f.top_frame = true
     f.fn_used = uc.in_lit
@@ -2780,11 +2840,23 @@ fn (f: *Fn) operands(left: *ast.Node, right: *ast.Node) {
     return
   }
   f.expr(left)
-  if f.simple_to(right, RCX) { return }
+  if f.simple_to(right, RCX) || f.alu_into(right, RCX) { return }
   f.a.push(RAX)
   f.expr(right)
   f.a.mov(RCX, RAX)
   f.a.pop(RAX)
+}
+# n = a op b (a simple, b an immediate, register or slot; + - * & | ^ on integers that need no
+# wrapping) computed in r alone, without touching RAX; false (and no code) otherwise
+fn (f: *Fn) alu_into(n: *ast.Node, r: int) -> bool {
+  if n.kind != "Binary" || n.ik == ast.NONE || needs_wrap(n.ik) { return false }
+  op := n.op
+  if !(op == "+" || op == "-" || op == "*" || op == "&" || op == "|" || op == "^") { return false }
+  if !is_simple(n.left) || n.left.ty == "" || f.g.cls(n.left.ty, n) != "i" || !f.direct_operand(n.right) { return false }
+  if f.g.is_iface_t(n.left.ty) || f.g.is_iface_t(n.right.ty) { return false }
+  f.simple_to(n.left, r)
+  f.alu_src(op, r, n.right)
+  return true
 }
 # the same for a commutative operation: the operands may come swapped (RAX right, RCX left),
 # which saves a mov when the left one had to wait on the stack
@@ -2839,11 +2911,15 @@ fn (f: *Fn) jump_if(cond: *ast.Node, want: bool, dest: str) {
       is_and := cond.op == "and"
       if is_and != want {
         f.jump_if(cond.left, want, dest)
+        f.kn_off++                                # (the right side may not run)
         f.jump_if(cond.right, want, dest)
+        f.kn_off--
       } else {
         skip := A.label()
         f.jump_if(cond.left, !want, skip)
+        f.kn_off++
         f.jump_if(cond.right, want, dest)
+        f.kn_off--
         A.bind(skip)
       }
       return
@@ -3479,7 +3555,7 @@ fn (f: *Fn) enter_scache_h(ls: *LoopScan, hoist: map[str]int, covered: map[str]b
         checked[name] = true
       }
       # an outer loop keeps it in memory: a loop without calls copies it to registers
-      if ls.rcalls || outer.data.reg != 0 { continue }
+      if ls.hcalls || outer.data.reg != 0 { continue }
       _, lm := f.len_min[name]
       if (hl || lm || outer.len == nil) && (outer.len == nil || outer.len.reg == 0) && f.free_extras() >= 1 {
         # bounds checked before the loop: only the data pointer
@@ -3575,6 +3651,12 @@ fn (f: *Fn) loop_pure(ls: *LoopScan) -> bool {
 # calls to functions count as calls unless try_inline turns them into an expression that calls
 # nothing
 fn (f: *Fn) fix_rcalls(ls: *LoopScan) {
+  if !ls.hcalls {
+    for _, c := range ls.hfcalls {
+      inl := f.try_inline(c)
+      if inl == nil || scan_loop(f.g, []*ast.Node{inl}).rcalls { ls.hcalls = true }
+    }
+  }
   if ls.rcalls { return }
   for _, c := range ls.fcalls {
     inl := f.try_inline(c)
@@ -3598,11 +3680,12 @@ fn (f: *Fn) exit_scache(added: []str) {
   }
 }
 fn (f: *Fn) free_extras() -> int { return len(EXTRA_REGS) - len(f.a.sv_regs) }
-# a hidden variable of the SCache: in a loop that calls no function, a free caller-saved register
-# (with a frame slot for the spills around the calls of slow paths; the data pointer is there
-# during any call, so the collector sees it); otherwise memory
+# a hidden variable of the SCache: in a loop that calls no function (or only inside the branches
+# of an if or switch, which may run rarely), a free caller-saved register (with a frame slot for
+# the spills around every call: the data pointer is there during any call, so the collector sees
+# it); otherwise memory
 fn (f: *Fn) scache_slot(ls: *LoopScan) -> *Var {
-  if !ls.rcalls {
+  if !ls.hcalls {
     for _, r := range EXTRA_REGS {
       taken := false
       for _, x := range f.a.sv_regs { if x == r { taken = true } }
@@ -3647,6 +3730,87 @@ fn (f: *Fn) cached_list(obj: *ast.Node) -> *SCache {
   c, ok := f.scache[obj.name]
   if !ok { return nil }
   return c
+}
+
+# ---- indexes known in range ----
+# After a[i] is checked, i stays in range of a until a or i is assigned: a list's header never
+# changes (append and slicing make a new one) and an array's length is fixed. Only local
+# variables that nothing else can change qualify (not global, celled by &x, nor captured). The
+# facts flow forward through straight-line code; stmt() drops the ones a statement may break:
+# - a simple statement (assignment, expression): its checks run before its stores, so it adds
+#   its facts and then drops those of the variables it assigns;
+# - if: the facts after the condition hold in both branches; after it, minus what they assign;
+# - while/for: the facts that the loop never breaks hold everywhere inside it; with the
+#   condition after the body and no break, the loop exits right after the condition, so the
+#   facts the condition learned hold after the loop;
+# - anything else (switch, range...): its inner code learns nothing (kn_off), and after it the
+#   facts from before minus what it assigns.
+# The right side of and/or may not run, so it learns nothing either.
+fn (f: *Fn) kn_var_ok(name: str) -> bool {
+  if _, c := f.caps[name]; c { return false }
+  v, ok := f.locals[name]
+  if !ok { return false }
+  return v.sym == "" && !v.celled && v.cap < 0 && v.xr == 0
+}
+# the fact of a[i] (a list or array variable, i an int variable), or nil
+fn (f: *Fn) kn_fact(n: *ast.Node) -> *KnFact {
+  if n.kind != "Index" || n.obj == nil || n.index == nil || n.obj.kind != "Var" || n.index.kind != "Var" { return nil }
+  if n.obj.fn_ref || n.index.fn_ref || n.obj.ty == "" { return nil }
+  ot := types.dflt(n.obj.ty)
+  k := f.g.kind_of_t(ot)
+  if k != "slice" && k != "array" { return nil }
+  if !f.kn_var_ok(n.obj.name) || !f.kn_var_ok(n.index.name) { return nil }
+  if types.dflt(f.locals[n.index.name].t) != "int" || types.dflt(f.locals[n.obj.name].t) != ot { return nil }
+  return &KnFact{l: n.obj.name, i: n.index.name}
+}
+fn (f: *Fn) kn_has(n: *ast.Node) -> bool {
+  k := f.kn_fact(n)
+  if k == nil { return false }
+  for _, x := range f.kn { if x.l == k.l && x.i == k.i { return true } }
+  return false
+}
+fn (f: *Fn) kn_add(n: *ast.Node) {
+  if f.kn_off > 0 || f.kn_has(n) { return }
+  k := f.kn_fact(n)
+  if k == nil { return }
+  out := []*KnFact{}
+  for _, x := range f.kn { out = append(out, x) }
+  f.kn = append(out, k)
+}
+# the facts of xs that survive assignments to the names of as (a new list)
+fn kn_minus(xs: []*KnFact, as: map[str]bool) -> []*KnFact {
+  out := []*KnFact{}
+  for _, x := range xs { if !as[x.l] && !as[x.i] { out = append(out, x) } }
+  return out
+}
+fn (f: *Fn) kn_assigned(parts: []*ast.Node) -> map[str]bool { return scan_loop(f.g, parts).assigned }
+# entering a loop whose condition is after the body: a cheap condition is repeated before the
+# body (the first turn needs no jump); otherwise a jump to the condition (chk)
+fn (f: *Fn) loop_entry(cond: *ast.Node, chk: str, end: str, pre: []*KnFact) {
+  if node_size(cond, 0) <= 12 && (f.no_calls(cond) || (f.float_compare(cond) && f.fpure(cond.left) && f.fpure(cond.right))) {
+    f.jump_if(cond, false, end)
+    f.kn = pre                                    # (the body may also come from the other copy)
+    return
+  }
+  f.a.jmp(chk)
+}
+fn node_size(n: *ast.Node, acc: int) -> int {
+  if n == nil || acc > 100 { return acc }
+  acc = node_size(n.left, node_size(n.right, acc + 1))
+  acc = node_size(n.arg, node_size(n.expr, acc))
+  acc = node_size(n.obj, node_size(n.index, acc))
+  for _, a := range n.args { acc = node_size(a, acc) }
+  return acc
+}
+# a break anywhere in n (outside function literals): it may leave a loop around n
+fn has_break(n: *ast.Node) -> bool {
+  if n == nil { return false }
+  if n.kind == "Break" { return true }
+  if n.kind == "FuncLit" || n.kind == "Func" { return false }
+  if has_break(n.body) || has_break(n.then) || has_break(n.otherwise) { return true }
+  for _, x := range n.stmts { if has_break(x) { return true } }
+  for _, x := range n.cases { if has_break(x) { return true } }
+  return false
 }
 
 # the value of an integer literal (its type may not be annotated: `i := 0`, the 1 of `i++`)
@@ -3786,7 +3950,8 @@ fn node_kids(n: *ast.Node) -> []*ast.Node {
 }
 
 # the loop of a ForC (after its init and enter_scache); iv: counted_loop's variable
-fn (f: *Fn) for_c(n: *ast.Node, iv: str) {
+# (pre: the kn facts no turn breaks; after it, f.kn holds what is known after the loop)
+fn (f: *Fn) for_c(n: *ast.Node, iv: str, pre: []*KnFact) {
   A := f.a
   top := A.label()
   next := A.label()
@@ -3800,9 +3965,11 @@ fn (f: *Fn) for_c(n: *ast.Node, iv: str) {
   }
   rotated := n.cond != nil && !always_true(n.cond)
   chk := A.label()
-  if rotated { A.jmp(chk) }
+  f.kn = pre
+  if rotated { f.loop_entry(n.cond, chk, end, pre) }
   A.bind(top)
   if !rotated && n.cond != nil { f.cond_jump_false(n.cond, end) }   # (true: nothing)
+  f.kn = pre
   if iv != "" {
     if f.safe_idx == nil { f.safe_idx = map[str]str{} }
     f.safe_idx[iv] = n.cond.right.args[0].name
@@ -3826,13 +3993,17 @@ fn (f: *Fn) for_c(n: *ast.Node, iv: str) {
       }
     }
   }
+  f.kn = pre
   if n.post != nil { f.stmt(n.post) }
   if rotated {
     # the condition after the body (one jump per turn)
     A.bind(chk)
+    f.kn = pre
     f.jump_if(n.cond, true, top)
+    if has_break(n.body) { f.kn = pre }
   } else {
     A.jmp(top)
+    f.kn = pre
   }
   A.bind(end)
   f.pop_loop()
@@ -3869,8 +4040,8 @@ fn (f: *Fn) elem_check_b(n: *ast.Node, write: bool) -> (int, int) {
         A.mov(RCX, RAX)
       }
     }
-    if !(n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name) && !f.hoisted_ok(n) {
-      # (with counted_loop the index is always in range)
+    if !(n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name) && !f.hoisted_ok(n) && !f.kn_has(n) {
+      # (with counted_loop the index is always in range; kn: already checked)
       ok := A.label()
       bad := A.label()
       f.slot_op(0x3B, idx, c.len)                 # cmp idx, [length]
@@ -3885,10 +4056,18 @@ fn (f: *Fn) elem_check_b(n: *ast.Node, write: bool) -> (int, int) {
       f.elem_check_general(n, write, k, ot)
       A.jmp(ok)
       A.cold_end()
+      f.kn_add(n)
     }
     if c.data.reg != 0 { return c.data.reg, idx }
     f.load_slot(c.data)
     return RAX, idx
+  }
+  if f.kn_has(n) && types.dflt(n.obj.ty) == ot {
+    # already checked: the elements and the index, nothing else
+    f.simple_to(n.index, RCX)
+    f.simple_to(n.obj, RAX)
+    if k == "slice" { A.load(RAX, RAX, 0) }
+    return RAX, RCX
   }
   if is_simple(n.obj) && n.index.ty == "int" && !is_simple(n.index) && f.no_calls(n.index) {
     f.expr(n.index)
@@ -3904,6 +4083,7 @@ fn (f: *Fn) elem_check_b(n: *ast.Node, write: bool) -> (int, int) {
     }
   }
   f.elem_check_general(n, write, k, ot)
+  f.kn_add(n)
   return RAX, RCX
 }
 # RAX = the list (or array), RCX = the index: checks them; RAX = the elements
@@ -4902,7 +5082,9 @@ fn (f: *Fn) expr(n: *ast.Node) {
     f.truthy(n.left.ty, n.left)
     A.alu("test", RAX, RAX)
     if n.op == "and" { A.jcc(CC_E, end) } else { A.jcc(CC_NE, end) }
+    f.kn_off++                                    # (the right side may not run)
     f.expr(n.right)
+    f.kn_off--
     f.truthy(n.right.ty, n.right)
     A.bind(end)
     return
@@ -5039,6 +5221,15 @@ fn (f: *Fn) assign_direct(v: *Var, name: str, value: *ast.Node, decl: bool) -> b
       f.fexpr(value, 0)
       A.movq_r(v.reg, 0)
       return true
+    }
+    if value.kind == "Index" && !value.comma_ok && value.obj.ty != "" && f.g.cls(v.t, value) == "i" {
+      # x = a[i] (8-byte elements): loaded straight into x's register
+      k := f.g.kind_of_t(strip_ptr(types.dflt(value.obj.ty)))
+      if (k == "slice" || k == "array") && !f.g.byte_elems(value.obj.ty) {
+        b, idx := f.elem_check_b(value, false)
+        A.rsib(0x8B, v.reg, b, idx, 3, 1)        # mov reg, [b + idx*8]
+        return true
+      }
     }
     return false
   }
@@ -5272,6 +5463,28 @@ fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) 
         r = RDX
       }
       if byte_e { A.rsib(0x88, r, b, idx, scale, w) } else { A.rsib(0x89, r, b, idx, scale, w) }
+      return true
+    }
+    if f.kn_has(t) {
+      # a[i] already checked: nothing to evaluate first, so the value comes first and goes
+      # straight to [elements + index] (the value cannot change a nor i: kn_var_ok)
+      f.bind_value(v, t.ty)
+      idx := f.reg_of(t.index)
+      if idx == 0 {
+        f.simple_to(t.index, RCX)
+        idx = RCX
+      }
+      b := RDX
+      c := f.cached_list(t.obj)
+      if c != nil && c.data.reg != 0 {
+        b = c.data.reg
+      } else if c != nil {
+        f.load_slot_r(c.data, RDX)
+      } else {
+        f.simple_to(t.obj, RDX)
+        if g.kind_of_t(types.dflt(t.obj.ty)) == "slice" { A.load(RDX, RDX, 0) }
+      }
+      if g.byte_elems(t.obj.ty) { A.rsib(0x88, RAX, b, idx, 0, 0) } else { A.rsib(0x89, RAX, b, idx, 3, 1) }
       return true
     }
     f.elem_addr(t, true)
@@ -5559,6 +5772,28 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
 }
 
 fn (f: *Fn) stmt(n: *ast.Node) {
+  switch n.kind {
+  case "Block", "Module", "If", "While", "ForC", "Func", "Extern", "Struct", "Interface", "Fallthrough":
+    f.stmt0(n)                                    # (these keep the kn facts themselves)
+  case "ExprStmt", "Assign", "VarDecl", "MultiAssign", "FieldAssign", "OpAssign":
+    f.stmt0(n)
+    f.kn = kn_minus(f.kn, f.kn_assigned([]*ast.Node{n}))
+  case "Range", "ForTo":
+    # one body: the facts no turn breaks hold inside it and after the loop
+    pre := kn_minus(f.kn, f.kn_assigned([]*ast.Node{n}))
+    f.kn = pre
+    f.stmt0(n)
+    f.kn = pre
+  default:
+    pre := kn_minus(f.kn, f.kn_assigned([]*ast.Node{n}))
+    f.kn = pre
+    f.kn_off++
+    f.stmt0(n)
+    f.kn_off--
+    f.kn = pre
+  }
+}
+fn (f: *Fn) stmt0(n: *ast.Node) {
   A := f.a
   g := f.g
   switch n.kind {
@@ -5672,35 +5907,44 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     end := A.label()
     if n.init != nil { f.stmt(n.init) }
     f.cond_jump_false(n.cond, els)
+    kc := f.kn                                    # (what the condition learned holds in both branches)
     f.stmt(n.then)
     if n.otherwise != nil {
       A.jmp(end)
       A.bind(els)
+      f.kn = kc
       f.stmt(n.otherwise)
       A.bind(end)
     } else {
       A.bind(els)
     }
+    f.kn = kn_minus(kc, f.kn_assigned([]*ast.Node{n.then, n.otherwise}))
     return
   case "While":
     top := A.label()
     end := A.label()
-    added := f.enter_scache(scan_loop(f.g, []*ast.Node{n.cond, n.body}))
+    wls := scan_loop(f.g, []*ast.Node{n.cond, n.body})
+    added := f.enter_scache(wls)
+    pre := kn_minus(f.kn, wls.assigned)           # facts no turn breaks
+    f.kn = pre
     if always_true(n.cond) {
       f.push_loop(end, top, n.label)
       A.bind(top)
       f.cond_jump_false(n.cond, end)              # (true: nothing)
       f.stmt(n.body)
       A.jmp(top)
+      f.kn = pre
     } else {
       # rotated: the condition goes after the body (one jump per turn)
       chk := A.label()
       f.push_loop(end, chk, n.label)
-      A.jmp(chk)
+      f.loop_entry(n.cond, chk, end, pre)
       A.bind(top)
       f.stmt(n.body)
       A.bind(chk)
+      f.kn = pre
       f.jump_if(n.cond, true, top)
+      if has_break(n.body) { f.kn = pre }         # (else the loop leaves only from its condition)
     }
     A.bind(end)
     f.pop_loop()
@@ -5709,6 +5953,7 @@ fn (f: *Fn) stmt(n: *ast.Node) {
   case "ForC":
     if n.init != nil { f.stmt(n.init) }
     ls := scan_loop(f.g, []*ast.Node{n.cond, n.post, n.body})
+    pre := kn_minus(f.kn, ls.assigned)            # facts no turn breaks (each copy starts with them)
     hoist := map[str]int{}
     covered := map[str]bool{}
     if f.vdepth == 0 { hoist = f.hoist_plan(n, covered) }
@@ -5724,8 +5969,11 @@ fn (f: *Fn) stmt(n: *ast.Node) {
         f.vloop_emit(vp, slow, vdone)
         A.bind(slow)
       }
-      f.for_c(n, f.counted_loop(n, ls2))
-      if vdone != "" { A.bind(vdone) }
+      f.for_c(n, f.counted_loop(n, ls2), pre)
+      if vdone != "" {
+        A.bind(vdone)
+        f.kn = pre                                # the vloop path learned nothing: only the facts before the loop
+      }
       f.exit_scache(added)
       return
     }
@@ -5737,17 +5985,18 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     f.vdepth++
     added := f.enter_scache_h(ls, hoist, covered, slow, checked)
     for name, _ := range checked { f.len_min[name] = hoist[name] }
-    f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})))
+    f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})), pre)
     f.len_min = map[str]int{}
     f.exit_scache(added)
     if len(checked) > 0 {
       A.jmp(done)
       A.bind(slow)
       added2 := f.enter_scache(ls)
-      f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})))
+      f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})), pre)
       f.exit_scache(added2)
       A.bind(done)
     }
+    f.kn = pre                                    # (either copy may have run)
     f.vdepth--
     return
   case "ForTo":

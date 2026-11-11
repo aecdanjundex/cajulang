@@ -53,6 +53,11 @@ fn rt_is_value(d: int) -> bool {
 }
 
 # ---------------------------------------------------------------- zero, copy, equality
+# the zero value of the type is the word 0 (everything but texts, structs and arrays: rt_zero)
+fn rt_zero_is_0(d: int) -> bool {
+  k := __load64(d)
+  return k != 5 && k != 7 && k != 8
+}
 fn rt_zero(d: int) -> int {
   k := __load64(d)
   if k == 5 { return __strp("") }
@@ -71,7 +76,7 @@ fn rt_zero(d: int) -> int {
     n := __load64(d + 8)
     e := __load64(d + 16)
     p := rt_edata(e, n)
-    if rt_esize(e) == 1 { return p }              # bool: false is 0, and the block is zeroed
+    if rt_zero_is_0(e) { return p }               # (bool, numbers, pointers): the block is zeroed
     i := 0
     while i < n {
       __store64(p + 8 * i, rt_zero(e))
@@ -214,8 +219,7 @@ fn rt_sdata(s: int) -> int {
 fn rt_make_slice(ed: int, n: int, c: int) -> int {
   data := rt_edata(ed, c)
   if rt_esize(ed) == 1 { return rt_hdr(data, n, c) }
-  # numbers, pointers, lists, maps...: the zero value is 0 and the block is already zeroed
-  if !rt_is_value(ed) && rt_zero(ed) == 0 { return rt_hdr(data, n, c) }
+  if rt_zero_is_0(ed) { return rt_hdr(data, n, c) }   # the new block is already zeroed
   i := 0
   while i < c {
     __store64(data + 8 * i, rt_zero(ed))
