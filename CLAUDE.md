@@ -60,7 +60,8 @@ autocompilação (estágio 2 == estágio 3). `tools/compare-compilers.sh` ficou 
 Mudou o gerador de código ou o `rt/`? Rode a suíte, a autocompilação e
 `python3 bench/compare/run.py --langs=caju`; registre a medição em OPTIMIZATION.md.
 
-Ver o código gerado: `tools/disasm.sh programa.caju função` (usa `CAJU_SYMS=arquivo`, que grava
+Medir: `tools/profile.sh` (tempo por função) e `tools/icount.sh` (instruções exatas, ciclos,
+falhas de cache), ver docs/tools.md. Ver o código gerado: `tools/disasm.sh programa.caju função` (usa `CAJU_SYMS=arquivo`, que grava
 o endereço de cada símbolo). Crash: `gdb -batch -ex run -ex 'info registers rip' binário` e
 procure o endereço no arquivo do `CAJU_SYMS`.
 
