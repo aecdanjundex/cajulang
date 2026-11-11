@@ -1,0 +1,77 @@
+# Inside a loop, the native compiler keeps the length and data pointer of a local list that the
+# loop never assigns (SCache), and in `for i := 0; i < len(a); i++` it skips the range check of
+# a[i]. Everything must behave as without these shortcuts.
+import { describe, it, expect, run_source } from "std/testing"
+
+describe("lists inside loops", fn() {
+  it("read and write elements of a list the loop does not assign", fn() {
+    a := []int{1, 2, 3, 4, 5}
+    s := 0
+    for i := 0; i < len(a); i++ {
+      a[i] = a[i] * 10
+      s += a[i]
+    }
+    expect(s).to_equal(150)
+    expect(a).to_equal([]int{10, 20, 30, 40, 50})
+  })
+  it("see a list assigned inside the loop", fn() {
+    a := []int{1}
+    n := 0
+    for i := 0; i < len(a); i++ {
+      if len(a) < 5 { a = append(a, i + 2) }
+      n += a[i]
+    }
+    expect(n).to_equal(15)
+    expect(len(a)).to_equal(5)
+  })
+  it("keep a list appended to without being assigned", fn() {
+    a := make([]int, 3, 10)
+    s := 0
+    for i := 0; i < len(a); i++ {
+      append(a, 7)
+      s += a[i] + len(a)
+    }
+    expect(s).to_equal(9)
+  })
+  it("do nothing over a nil list", fn() {
+    let a: []int
+    n := 0
+    for i := 0; i < len(a); i++ { n++ }
+    for _, x := range a { n += x }
+    expect(n).to_equal(0)
+  })
+  it("still check indexes other than the loop variable", fn() {
+    r := run_source("a := []int{1, 2, 3}\ns := 0\nfor i := 0; i < len(a); i++ {\n  s += a[i + 1]\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 4: Index 3 out of range (length 3).")
+    r2 := run_source("let a: []int\ni := 0\nwhile i < 3 {\n  a[i] = 1\n  i++\n}\n")
+    expect(r2.code).not_().to_equal(0)
+  })
+  it("check the index when the loop variable changes through a pointer", fn() {
+    r := run_source("a := []int{1, 2, 3}\ns := 0\nfor i := 0; i < len(a); i++ {\n  p := &i\n  *p = 7\n  s += a[i]\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 6: Index 7 out of range (length 3).")
+  })
+  it("check the index when a closure changes the loop variable", fn() {
+    r := run_source("a := []int{1, 2, 3}\ns := 0\nfor i := 0; i < len(a); i++ {\n  f := fn() { i = 9 }\n  f()\n  s += a[i]\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 6: Index 9 out of range (length 3).")
+  })
+  it("see a list changed by a closure", fn() {
+    a := []int{1, 2, 3}
+    grow := fn() { a = append(a, 4) }
+    s := 0
+    for i := 0; i < len(a); i++ {
+      if i == 0 { grow() }
+      s += a[i]
+    }
+    expect(s).to_equal(10)
+  })
+  it("range over a list reads its elements once per turn", fn() {
+    a := []int{1, 2, 3}
+    s := 0
+    for i, x := range a {
+      a[i] = 0
+      s += x
+    }
+    expect(s).to_equal(6)
+    expect(a).to_equal([]int{0, 0, 0})
+  })
+})

@@ -34,6 +34,7 @@ garantida pela suíte de testes e pela autocompilação.
 | 8 | a[i] op= v direto; lado composto sem chamadas calculado primeiro (sem push/pop) | 65 ms | 185 ms | 435 ms | 93 ms | 133 ms | 283 ms | 1.21 s |
 | 9 | inline de funções `return E` pequenas; `__sqrt` vira sqrtsd no registrador | 66 ms | 187 ms | 427 ms | 94 ms | 136 ms | 287 ms | 1.26 s |
 | 10 | mapas: caminho de chave inteira sem chamadas; leitura `m[k]` numa só chamada | 69 ms | 188 ms | 419 ms | 94 ms | 145 ms | 284 ms | 966 ms |
+| 11 | listas em laço: tamanho e dados lidos uma vez; `a[i]` sem verificação em `for i := 0; i < len(a); i++` | 64 ms | 144 ms | 425 ms | 90 ms | 108 ms | 234 ms | 833 ms |
 
 **Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
 matmul 1,8×, sort 2,2×, maps 2,1×.
@@ -57,29 +58,29 @@ para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuç�
 ## Todas as medições
 
 <!-- python3 bench/compare/rounds/table.py -->
-| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | total gain |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.23× |
-| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.70× |
-| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 1.83× |
-| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2.03× |
-| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 2.38× |
-| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 2.31× |
-| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 1.55× |
-| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 1.70× |
-| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 1.76× |
-| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 2.32× |
-| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 2.48× |
-| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 2.58× |
-| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 1.63× |
-| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 1.73× |
-| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 1.77× |
-| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 2.12× |
-| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 2.23× |
-| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 2.24× |
-| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 3.26× |
-| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 2.22× |
-| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 2.07× |
+| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | round 11 | total gain |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.57× |
+| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.87× |
+| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 64 ms | 1.97× |
+| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2 ms | 3.01× |
+| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 11 ms | 3.71× |
+| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 144 ms | 3.01× |
+| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 5 ms | 1.63× |
+| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 44 ms | 1.72× |
+| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 425 ms | 1.73× |
+| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 2.53× |
+| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 24 ms | 2.63× |
+| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 90 ms | 2.70× |
+| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 5 ms | 2.25× |
+| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 33 ms | 2.36× |
+| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 108 ms | 2.37× |
+| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 11 ms | 2.57× |
+| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 56 ms | 2.71× |
+| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 234 ms | 2.73× |
+| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 10 ms | 3.62× |
+| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 176 ms | 3.18× |
+| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 833 ms | 2.41× |
 
 A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
 código dela não foi salvo à parte).
@@ -288,6 +289,40 @@ tentativa da busca chamava `rt_hash` e `rt_keq`, mesmo com chave inteira.
 
 **Resultado:** maps −23% (1,26 s → 966 ms).
 
+## Rodada 11: listas dentro de laços
+
+**Hipótese:** em `for i := 0; i < len(a); i++ { ... a[i] ... }`, cada volta chamava `rt_slen`
+para o `len(a)`, e cada `a[i]` lia o cabeçalho da lista, conferia nil, lia o tamanho, comparava
+e lia o ponteiro dos dados. Mas o cabeçalho de uma lista nunca muda: `append` e `a[x:y]` criam
+um cabeçalho novo (`rt_hdr`). Se o laço não atribui a variável, o tamanho e os dados não mudam.
+**Mudança:**
+- `scan_loop` lista as variáveis que um laço (condição, passo e corpo) indexa e as que ele
+  atribui. Antes de um `while`, `for` ou `range`, `enter_scache` guarda o tamanho e o ponteiro
+  dos dados de cada lista local que o laço indexa e não atribui (fora: listas em célula,
+  capturadas, globais ou em registrador) em duas variáveis escondidas na pilha (o coletor vê o
+  ponteiro ali). Dentro do laço, `len(a)` lê a variável escondida e `a[i]` faz só
+  `cmp rcx,[tamanho]; jae lento; mov rax,[dados]`; o caminho lento é o de antes e dá o mesmo erro.
+- `counted_loop`: em `for i := K; i < len(a); i++` com `K >= 0` e nem `i` nem `a` atribuídos na
+  condição ou no corpo, `a[i]` está sempre dentro dos limites e não é conferido. `i` tem que ser
+  um `int` local fora de célula e não capturado (um `*p = 7` com `p := &i`, ou uma função anônima
+  que muda `i`, mudariam o índice sem que a varredura visse).
+- `len`/`cap` de uma lista viram duas instruções (sem chamar `rt_slen`), e o `range` lê os dados
+  uma vez.
+- O agente que escreveu a primeira versão mediu o ganho, mas o `counted_loop` nunca era ativado:
+  o `0` de `i := 0` e o `1` de `i++` vêm sem tipo anotado (`imm32` os tomava por `num`), e a
+  varredura incluía o próprio `i++`, então `i` sempre parecia atribuído. Corrigido com `int_lit`
+  e varrendo só a condição e o corpo; o código gerado (`tools/disasm.sh`) conferido.
+- Testes novos: `tests/lang/loop_lists_test.caju` (lista atribuída no laço, `append` sem
+  atribuir, lista nil, índice que não é a variável do laço, `&i`, função anônima que muda `i` ou
+  a lista). A suíte também passou com coleta a cada 64 KB.
+
+O laço de soma de uma lista (`for i := 0; i < len(a); i++ { s += a[i] }`) passou de 26
+instruções mais uma chamada a `rt_slen` por volta para 17 instruções.
+**Resultado** (base remedida na mesma sessão, melhor de 3 passadas de 5 execuções): matmul −21%
+(136 → 108 ms), crivo −17% (173 → 144 ms), sort −13% (269 → 234 ms). O nbody ficou 7% mais lento,
+mas o código de `advance` é idêntico instrução por instrução: só o endereço da função mudou
+(o nbody usa listas globais, que a rodada não toca). É efeito de alinhamento do código.
+
 ## O que ficou para depois
 
 Em ordem de ganho esperado:
@@ -296,8 +331,8 @@ Em ordem de ganho esperado:
    do runtime.
 2. **Mais registradores para `num`** (XMM preservados não existem no Linux: precisaria guardar em
    volta das chamadas) e carregar `num` da memória direto para XMM (`movsd xmm, [rbp-x]`).
-3. **Tirar verificações repetidas** de laço (nil e limite de uma lista que não muda dentro do
-   laço), e manter o ponteiro de dados de uma lista local num registrador.
+3. ~~Tirar verificações repetidas de laço~~ (rodada 11, para listas locais). Falta: listas
+   globais (o nbody), e manter o ponteiro de dados num registrador.
 4. **Desvios curtos** (`jcc rel8`) e código frio (chamadas de erro) fora do caminho quente.
 5. **Uma representação intermediária** com alocação de registradores de verdade: o salto maior,
    mas é reescrever o gerador.
