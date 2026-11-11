@@ -34,6 +34,36 @@ struct Node {
   v: int
   kids: []*Node
 }
+struct Kinds {
+  i8: int8
+  i32: int32
+  u8: uint8
+  u16: uint16
+  i: int
+  n: num
+  f: float32
+  b: bool
+  s: str
+  bl: []bool
+  ba: [3]bool
+  il: []int
+  sl: [][]str
+  pi: *int
+  pa: *Addr
+  a: Addr
+  ms: map[str]Addr
+}
+struct Loud {
+  code: int
+}
+fn (l: Loud) Error() -> str {
+  inner, _ := json.marshal(map[str]int{"code": l.code})
+  return "loud " + inner
+}
+struct Holder {
+  e: error
+  n: int
+}
 
 fn enc(v: any) -> str {
   s, err := json.marshal(v)
@@ -194,6 +224,83 @@ describe("json.unmarshal", fn() {
     expect(json.unmarshal("{}", u).Error()).to_contain("needs a non-nil pointer")
     let p: *User
     expect(json.unmarshal("{}", p).Error()).to_contain("needs a non-nil pointer")
+  })
+})
+
+describe("json fast paths", fn() {
+  it("round-trip each kind of field", fn() {
+    k := 7
+    v := Kinds{i8: -128, i32: 2147483647, u8: 255, u16: 65535, i: -9007199254740993, n: -0.125, f: 0.5, b: true, s: "tab\there \"q\" é 😀 \u0001", bl: []bool{true, false, true, true}, ba: [3]bool{false, true, false}, il: []int{0, -1, 1 << 62}, sl: [][]str{[]str{"a"}, []str{}, nil}, pi: &k, pa: &Addr{city: "Rio", zip: 2}, a: Addr{city: "x"}, ms: map[str]Addr{"b": Addr{zip: 1}, "a": Addr{zip: 2}}}
+    text := enc(v)
+    expect(text).to_equal("{\"i8\":-128,\"i32\":2147483647,\"u8\":255,\"u16\":65535,\"i\":-9007199254740993,\"n\":-0.125,\"f\":0.5,\"b\":true,\"s\":\"tab\\there \\\"q\\\" é 😀 \\u0001\",\"bl\":[true,false,true,true],\"ba\":[false,true,false],\"il\":[0,-1,4611686018427387904],\"sl\":[[\"a\"],[],null],\"pi\":7,\"pa\":{\"city\":\"Rio\",\"zip\":2},\"a\":{\"city\":\"x\",\"zip\":0},\"ms\":{\"a\":{\"city\":\"\",\"zip\":2},\"b\":{\"city\":\"\",\"zip\":1}}}")
+    let back: Kinds
+    expect(json.unmarshal(text, &back)).to_be_nil()
+    expect(enc(back)).to_equal(text)
+    expect(back.bl).to_equal([]bool{true, false, true, true})
+    expect(back.ba).to_equal([3]bool{false, true, false})
+    expect(*back.pi).to_equal(7)
+    expect(back.ms["b"].zip).to_equal(1)
+  })
+  it("write nil pointers, lists and maps as null and read them back as nil", fn() {
+    let v: Kinds
+    text := enc(v)
+    expect(text).to_contain("\"pi\":null,\"pa\":null")
+    expect(text).to_contain("\"bl\":null")
+    expect(text).to_contain("\"ms\":null")
+    k := Kinds{pi: &v.i, bl: []bool{true}, ms: map[str]Addr{}}
+    expect(json.unmarshal(text, &k)).to_be_nil()
+    expect(k.pi == nil).to_be_true()
+    expect(k.bl == nil).to_be_true()
+    expect(k.ms == nil).to_be_true()
+  })
+  it("check integer ranges and kinds like the tree decoder", fn() {
+    let k: Kinds
+    expect(json.unmarshal("{\"i32\": 2147483648}", &k).Error()).to_equal("json: cannot unmarshal number 2147483648 into field Kinds.i32 of type int32")
+    expect(json.unmarshal("{\"u16\": 1e2}", &k).Error()).to_equal("json: cannot unmarshal number 1e2 into field Kinds.u16 of type uint16")
+    expect(json.unmarshal("{\"il\": [1, \"2\"]}", &k).Error()).to_equal("json: cannot unmarshal string into field Kinds.il of type int")
+    expect(json.unmarshal("{\"i\": 99999999999999999999}", &k).Error()).to_equal("json: cannot unmarshal number 99999999999999999999 into field Kinds.i of type int")
+    expect(json.unmarshal("{\"a\": {\"zip\": true}}", &k).Error()).to_equal("json: cannot unmarshal bool into field Kinds.a.zip of type int")
+  })
+  it("leave a value untouched when the text has a syntax error", fn() {
+    k := Kinds{i: 5, a: Addr{city: "keep"}}
+    err := json.unmarshal("{\"i\": 6, \"a\": {\"city\": \"new\"}, \"s\": }", &k)
+    expect(err.Error()).to_contain("syntax error")
+    expect(k.i).to_equal(5)
+    expect(k.a.city).to_equal("keep")
+  })
+  it("use the last of repeated keys and prefer the exact name", fn() {
+    let a: Addr
+    expect(json.unmarshal("{\"zip\": 1, \"zip\": 2, \"CITY\": \"a\", \"city\": \"b\", \"City\": \"c\"}", &a)).to_be_nil()
+    expect(a.zip).to_equal(2)
+    expect(a.city).to_equal("b")
+    let k: Kinds
+    expect(json.unmarshal("{\"a\": {\"city\": \"x\"}, \"a\": {\"zip\": 3}}", &k)).to_be_nil()
+    expect(k.a.city).to_equal("")
+    expect(k.a.zip).to_equal(3)
+    let b: Addr
+    expect(json.unmarshal("{\"CITY\": \"first\", \"City\": \"second\"}", &b)).to_be_nil()
+    expect(b.city).to_equal("first")
+  })
+  it("read keys and strings with escapes", fn() {
+    let a: Addr
+    expect(json.unmarshal("{\"c\\u0069ty\": \"S\\u00e3o \\\"P\\\"\", \"zip\": 1}", &a)).to_be_nil()
+    expect(a.city).to_equal("São \"P\"")
+  })
+  it("read fields in any order, with white space and unknown keys around", fn() {
+    let us: []Addr
+    expect(json.unmarshal(" [ {\"zip\" : 1 , \"x\": [{\"]\": \"}\"}], \"city\":\"a\"} ,\n{ } ] ", &us)).to_be_nil()
+    expect(len(us)).to_equal(2)
+    expect(us[0].city).to_equal("a")
+    expect(us[0].zip).to_equal(1)
+    expect(us[1].zip).to_equal(0)
+  })
+  it("allow marshal inside an Error method while marshaling", fn() {
+    h := Holder{e: Loud{code: 7}, n: 1}
+    expect(enc(h)).to_equal("{\"e\":\"loud {\\\"code\\\":7}\",\"n\":1}")
+    expect(enc(h)).to_equal("{\"e\":\"loud {\\\"code\\\":7}\",\"n\":1}")
+  })
+  it("write fractions in their shortest form", fn() {
+    expect(enc([]num{0.1, 98.5, -12.25, 1.0 / 3.0, 0.0001, 123456.789, 1e-7, 2.5e15})).to_equal("[0.1,98.5,-12.25,0.3333333333333333,0.0001,123456.789,1e-07,2500000000000000]")
   })
 })
 
