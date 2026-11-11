@@ -33,6 +33,34 @@ caju test                           # roda os *_test.caju do diretório
 caju version
 ```
 
+## Biblioteca padrão
+
+`import "std/x"`: `strings`, `strconv`, `math`, `bytes`, `os`, `fs`, `path`, `net`, `http`, `json`,
+`toml`, `crypto`, `hash`, `hex`, `base64`, `testing`.
+
+- `std/json`: `json.marshal(v)` / `json.unmarshal(texto, &v)` para structs, listas, mapas e `any`,
+  no estilo do `encoding/json` do Go (a chave é o nome do campo), e `json.parse` para uma árvore.
+- `std/http`: servidor HTTP/1.1 com keep-alive e laço de eventos (epoll); vários processos na mesma
+  porta com `http.listen_and_serve_workers(host, porta, n)`.
+
+Para APIs REST há o framework no estilo Gin [`github.com/aecdanjundex/web`](https://github.com/aecdanjundex/web):
+
+```sh
+caju pkg add github.com/aecdanjundex/web
+```
+
+## Desempenho
+
+Executáveis nativos de ~50–300 KB, sem dependências. Comparações com Go, Rust e Python em
+`bench/compare/RESULTS.md` (fib, sieve, nbody, mandelbrot, matmul, sort, maps) e servidor HTTP
+em `bench/http/RESULTS.md`. Um exemplo (API JSON, 1 CPU, req/s):
+
+| rota | Caju + web | Go + Gin | Go net/http |
+|---|--:|--:|--:|
+| GET /users/:id | **65.198** | 33.424 | 32.687 |
+| GET /users (50 itens) | **32.177** | 18.824 | 21.054 |
+| POST /users | **65.470** | 29.354 | 31.434 |
+
 ## Compilando do código-fonte
 
 Precisa de Node 22+ só para o primeiro estágio (o compilador original em JavaScript):
@@ -60,8 +88,6 @@ describe("strings.split", fn() {
 
 ## Documentos
 
-- `docs/releasing.md`: como publicar uma versão nova.
-
 - `CLAUDE.md`: mapa do projeto, como trabalhar, estado e cuidados.
 - `docs/packages.md`: o gerenciador de pacotes (caju.toml, caju.lock, hashes).
 - `docs/testing.md`: testes com `caju test` e `std/testing`.
@@ -69,6 +95,7 @@ describe("strings.split", fn() {
 - `docs/arquitetura-nativo.md`: como o compilador nativo funciona por dentro.
 - `docs/plano-compilador-nativo.md`: o plano das fases.
 - `docs/historico.md`: o que foi feito até aqui e por quê.
+- `docs/releasing.md`: como publicar uma versão nova.
 
 ## Licença
 
