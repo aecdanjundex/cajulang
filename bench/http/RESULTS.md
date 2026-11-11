@@ -46,3 +46,17 @@ SYSCALLS.md (nenhuma ganhou: o laço já faz 1 read + 1 write por requisição).
 | | POST /users | **118.174** (30,7 µs) | 60.591 (56,4 µs) | 66.844 (51,8 µs) |
 
 req/s (CPU do servidor por requisição). Nenhum erro em nenhum teste.
+
+## Rodada 3: JSON mais rápido e mapas (2026-11-11)
+
+Mesma medição da rodada 2 (Go igual: os servidores Go não mudaram). JSON: bench/json/RESULTS.md
+(rodada 2, agora à frente do encoding/json nos 7 casos); mapas: OPTIMIZATION.md, rodada 27.
+
+| cenário | rota | Caju rodada 2 | Caju rodada 3 | Gin | Go net/http |
+|---|---|--:|--:|--:|--:|
+| 1 CPU, 50 conexões | GET /users/:id | 65.198 | **72.468** (12,5 µs) | 33.424 | 32.687 |
+| | GET /users (50) | 32.177 | **41.463** (23,7 µs) | 18.824 | 21.054 |
+| | POST /users | 65.470 | **65.638** (14,4 µs) | 29.354 | 31.434 |
+| 4 núcleos, 1000 conexões | GET /users/:id | 122.188 | **134.502** | 70.738 | 71.297 |
+| | GET /users (50) | 61.202 | **64.907** | 43.028 | 38.256 |
+| | POST /users | 118.174 | **122.580** | 60.591 | 66.844 |

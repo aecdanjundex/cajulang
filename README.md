@@ -57,9 +57,9 @@ em `bench/http/RESULTS.md`. Um exemplo (API JSON, 1 CPU, req/s):
 
 | rota | Caju + web | Go + Gin | Go net/http |
 |---|--:|--:|--:|
-| GET /users/:id | **65.198** | 33.424 | 32.687 |
-| GET /users (50 itens) | **32.177** | 18.824 | 21.054 |
-| POST /users | **65.470** | 29.354 | 31.434 |
+| GET /users/:id | **72.468** | 33.424 | 32.687 |
+| GET /users (50 itens) | **41.463** | 18.824 | 21.054 |
+| POST /users | **65.638** | 29.354 | 31.434 |
 
 ## Compilando do código-fonte
 
