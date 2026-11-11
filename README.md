@@ -17,7 +17,7 @@ print(greet("world"))
 Linux x86-64 (no Windows, use o WSL; o `caju` do Linux também gera `.exe` com `--target windows`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/main/install.sh | sh
 ```
 
 O instalador baixa a última release, confere o SHA-256, instala em `~/.caju` e cria o comando

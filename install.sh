@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs Caju from the GitHub releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/main/install.sh | sh
 #
 # Environment:
 #   CAJU_VERSION=0.1.0     a given version (default: the latest release)

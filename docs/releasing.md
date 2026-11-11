@@ -15,7 +15,7 @@ simbólico em `~/.local/bin` funciona porque `os.executable()` lê `/proc/self/e
 1. Atualize `VERSION` em `compiler/pkg.caju` (é o que `caju version` mostra) e faça o commit.
 2. Rode localmente: `TAG=v0.2.0 tools/release.sh`. O script faz a cadeia JS → estágio 1 → 2 → 3,
    exige estágio 2 == estágio 3, monta `dist/` e testa o pacote fora do repositório.
-3. `git tag v0.2.0 && git push origin master v0.2.0`.
+3. `git tag v0.2.0 && git push origin main v0.2.0`.
 4. O workflow `.github/workflows/release.yml` refaz tudo, roda a suíte e o instalador, e cria a
    release com as notas geradas pelos commits.
 
