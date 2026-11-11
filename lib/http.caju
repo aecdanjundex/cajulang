@@ -40,15 +40,49 @@ export fn (r: *Response) set_status(code: int) { r.status = code }
 export fn (r: *Response) write(s: str) { r.body.write(s) }
 
 # the header value for name (any case), or ""
-export fn (r: *Request) header(name: str) -> str { return r.headers[strings.to_lower(name)] }
+export fn (r: *Request) header(name: str) -> str {
+  for i := 0; i < len(name); i++ {
+    c := int(name[i])
+    if c >= 65 && c <= 90 { return r.headers[strings.to_lower(name)] }
+  }
+  return r.headers[name]
+}
 
 let routes = map[str]fn(*Request, *Response){}
-let route_order = []str{}
+let exact_routes: int = 0          # registered paths not ending in "/"
+# the paths ending in "/" and their handlers, longest first (the first that matches wins)
+let prefixes = []str{}
+let prefix_handlers = []fn(*Request, *Response){}
 
 # registers a handler for a path; a path ending in "/" also matches everything below it
 export fn handle(path: str, h: fn(*Request, *Response)) {
-  if _, ok := routes[path]; !ok { route_order = append(route_order, path) }
+  _, had := routes[path]
   routes[path] = h
+  if !strings.has_suffix(path, "/") {
+    if !had { exact_routes++ }
+    return
+  }
+  for i, p := range prefixes {
+    if p == path {
+      prefix_handlers[i] = h
+      return
+    }
+  }
+  at := len(prefixes)
+  for i, p := range prefixes {
+    if len(p) < len(path) {
+      at = i
+      break
+    }
+  }
+  prefixes = append(prefixes, path)
+  prefix_handlers = append(prefix_handlers, h)
+  for j := len(prefixes) - 1; j > at; j-- {
+    prefixes[j] = prefixes[j - 1]
+    prefix_handlers[j] = prefix_handlers[j - 1]
+  }
+  prefixes[at] = path
+  prefix_handlers[at] = h
 }
 
 let idle_timeout_ms: int = 5000
@@ -92,12 +126,13 @@ export fn status_text(code: int) -> str {
 
 # the handler for a path: an exact match, else the longest registered prefix ending in "/"
 fn find_route(path: str) -> (fn(*Request, *Response), bool) {
-  if h, ok := routes[path]; ok { return h, true }
-  best := ""
-  for _, p := range route_order {
-    if strings.has_suffix(p, "/") && strings.has_prefix(path, p) && len(p) > len(best) { best = p }
+  # an exact match first (a path ending in "/" is also the longest prefix of itself)
+  if exact_routes > 0 {
+    if h, ok := routes[path]; ok { return h, true }
   }
-  if best != "" { return routes[best], true }
+  for i, p := range prefixes {
+    if strings.has_prefix(path, p) { return prefix_handlers[i], true }
+  }
   return nil, false
 }
 
