@@ -153,6 +153,11 @@ export fn (a: *X64) rsib(op: int, reg: int, base: int, index: int, scale: int, w
   a.b.byte(0x04 | ((reg & 7) << 3))
   a.b.byte((scale << 6) | ((index & 7) << 3) | (base & 7))
 }
+# the same with a prefix (F2: movsd/addsd... xmm reg, [base + index * (1 << scale)])
+export fn (a: *X64) rsibx(op: int, reg: int, base: int, index: int, scale: int, w: int, pre: int) {
+  a.pre(pre)
+  a.rsib(op, reg, base, index, scale, w)
+}
 # register with [rip + symbol]
 export fn (a: *X64) ripx(op: int, reg: int, sym: str, w: int, pre: int, after: int) {
   a.pre(pre)

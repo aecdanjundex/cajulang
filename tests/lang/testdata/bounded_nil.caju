@@ -1,0 +1,10 @@
+fn f() {
+  let a: []int
+  print("start")
+  t := 0
+  for i := 0; i < 3; i++ {
+    t += a[i]
+  }
+  print(t)
+}
+f()

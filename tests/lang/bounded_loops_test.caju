@@ -1,0 +1,217 @@
+# In `for i := K; i < C; i++` loops with a constant bound (and loops nested in them like
+# `for j := i + 1; j < C; j++`), the native compiler checks the length of the lists they index
+# once before the loop and runs a copy without range checks when every list is long enough;
+# otherwise it runs the loop as written. Elements of num lists are also used straight from
+# memory (addsd xmm, [list + i*8]) and simple num assignments are computed in the variable's
+# register. Everything must behave exactly as without these shortcuts.
+import { describe, it, expect, run_file } from "std/testing"
+import "std/math"
+
+let gx = []num{0.0, 4.84143144246472090, 8.34336671824457987, 12.8943695621391310, 15.3796971148509165}
+let gy = []num{0.0, -1.16032004402742839, 4.12479856412430479, -15.1111514016986312, -25.9193146099879641}
+let gv = []num{0.0, 0.606326392995832, -1.01077434617733, 1.08279100644154, 0.979090732243898}
+let gm = []num{39.47841760435743, 0.03769367487038949, 0.011286326131968767, 0.0017237240570597112, 0.0020336868699246304}
+
+# the shape of the nbody benchmark: bounded loops over global lists
+fn step_fixed(dt: num) {
+  for i := 0; i < 5; i++ {
+    for j := i + 1; j < 5; j++ {
+      dx := gx[i] - gx[j]
+      dy := gy[i] - gy[j]
+      d2 := dx * dx + dy * dy
+      mag := dt / (d2 * math.sqrt(d2))
+      gv[i] -= dx * gm[j] * mag
+      gv[j] += dy * gm[i] * mag
+    }
+  }
+  for i := 0; i < 5; i++ {
+    gx[i] += dt * gv[i]
+    gy[i] += gv[i] * dt - gm[i]
+  }
+}
+# the same with a bound that is not a literal: the checks stay in the loop
+fn step_var(dt: num, xs: []num, ys: []num, vs: []num, ms: []num) {
+  n := len(xs)
+  for i := 0; i < n; i++ {
+    for j := i + 1; j < n; j++ {
+      dx := xs[i] - xs[j]
+      dy := ys[i] - ys[j]
+      d2 := dx * dx + dy * dy
+      mag := dt / (d2 * math.sqrt(d2))
+      vs[i] -= dx * ms[j] * mag
+      vs[j] += dy * ms[i] * mag
+    }
+  }
+  for i := 0; i < n; i++ {
+    xs[i] += dt * vs[i]
+    ys[i] += vs[i] * dt - ms[i]
+  }
+}
+fn bits_of(xs: []num) -> []int {
+  out := []int{}
+  for _, x := range xs { out = append(out, math.bits(x)) }
+  return out
+}
+
+# two globals that may point to the same list
+let ga = []num{1.5, 2.25, 3.0, 4.5}
+let gb = []num{0.5, 0.25, 0.125, 2.0}
+fn mix() {
+  for i := 0; i < 4; i++ {
+    ga[i] += gb[i] * 2.0
+    gb[i] = gb[i] * 3.0 + ga[i]
+    for j := i + 1; j < 4; j++ {
+      ga[j] -= gb[i] * ga[i]
+    }
+  }
+}
+
+let gs = []num{1.0, 2.0, 3.0}
+fn sum5() -> num {
+  s := 0.0
+  for i := 0; i < 5; i++ { s += gs[i] }
+  return s
+}
+
+let gk = []int{3, 1, 4, 1, 5, 9, 2, 6}
+let gf = []bool{true, false, true, true, false, true, false, false}
+fn ints_and_bools() -> int {
+  t := 0
+  for i := 0; i < 8; i++ {
+    if gf[i] { t += gk[i] * (i + 1) } else { gk[i] = gk[i] + i }
+    for j := i; j <= 7; j++ {
+      if gf[j] && j % 3 == 0 { t += gk[j] }
+    }
+  }
+  return t
+}
+
+let gn = []num{1.0, 0.0, -0.0, 2.0}
+fn specials(out: []num) {
+  inf := math.inf()
+  nan := math.nan()
+  for i := 0; i < 4; i++ {
+    a := gn[i] * inf
+    b := gn[i] - nan
+    c := -0.0 * gn[i]
+    d := gn[i] + -0.0
+    out[i * 4] = a
+    out[i * 4 + 1] = b
+    out[i * 4 + 2] = c
+    out[i * 4 + 3] = d
+  }
+}
+
+# (the tests call these functions: a global that a closure uses lives in a cell, and loops do
+# not keep lists in cells)
+fn nbody_case() -> [][]int {
+  xs := []num{}
+  ys := []num{}
+  vs := []num{}
+  ms := []num{}
+  for k := 0; k < 5; k++ {
+    xs = append(xs, gx[k])
+    ys = append(ys, gy[k])
+    vs = append(vs, gv[k])
+    ms = append(ms, gm[k])
+  }
+  for s := 0; s < 50; s++ {
+    step_fixed(0.01)
+    step_var(0.01, xs, ys, vs, ms)
+  }
+  return [][]int{bits_of(gx), bits_of(gy), bits_of(gv), bits_of(xs), bits_of(ys), bits_of(vs)}
+}
+fn alias_case() -> [][]int {
+  mix()
+  first := bits_of(ga)
+  ga = []num{1.5, 2.25, 3.0, 4.5}
+  gb = ga
+  mix()
+  return [][]int{first, bits_of(ga), bits_of(gb)}
+}
+fn replaced_case() -> num {
+  gs = []num{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}
+  a := sum5()
+  gs = []num{1.0, 2.0, 3.0, 4.0, 5.0}
+  return a + sum5()
+}
+
+describe("loops with a constant bound", fn() {
+  it("give bit-identical results to the checked loop (nbody shape, global lists)", fn() {
+    r := nbody_case()
+    expect(r[0]).to_equal(r[3])
+    expect(r[1]).to_equal(r[4])
+    expect(r[2]).to_equal(r[5])
+  })
+  it("see stores through another global that points to the same list", fn() {
+    r := alias_case()
+    expect(r[0]).to_equal([]int{4612811918334230528, -4603523244102778880, -4590592987360133120, -4564708422057984000})
+    # ga and gb are the same list: every store is seen by the next read
+    expect(r[2]).to_equal(r[1])
+    expect(r[1]).to_equal([]int{4625759767262920704, -4562663192991367168, -4493093418225893376, -4353484018961840518})
+  })
+  it("run the checked loop when a list is shorter than the bound", fn() {
+    r := run_file("testdata/bounded_short.caju")
+    expect(r.output).to_equal("0 1\n1 2\n2 3\nRuntime error in bounded_short.caju, line 4: Index 3 out of range (length 3).")
+  })
+  it("report a nil list as before", fn() {
+    r := run_file("testdata/bounded_nil.caju")
+    expect(r.output).to_equal("start\nRuntime error in bounded_nil.caju, line 6: Index 0 in a nil slice.")
+  })
+  it("check again when a global list is replaced between runs", fn() {
+    expect(replaced_case()).to_equal(30.0)
+    r := run_file("testdata/bounded_replaced.caju")
+    expect(r.output).to_equal("15\n6\nRuntime error in bounded_replaced.caju, line 5: Index 4 out of range (length 4).")
+  })
+  it("fail in the inner loop at the same iteration, after the same side effects", fn() {
+    r := run_file("testdata/bounded_inner.caju")
+    expect(r.output).to_equal("[0 1 2 3]\n[0 1 4 6]\n[0 1 2 9]\n[0 1 2 3]\nRuntime error in bounded_inner.caju, line 7: Index 4 out of range (length 4).")
+  })
+  it("work with int and bool lists, <= bounds, break and continue", fn() {
+    expect(ints_and_bools()).to_equal(80)
+    a := []int{5, 6, 7, 8, 9, 10}
+    s := 0
+    for i := 0; i < 6; i++ {
+      if i == 1 { continue }
+      for j := i; j < 6; j++ {
+        if a[j] == 9 { break }
+        s += a[j] * a[i]
+      }
+      if a[i] == 9 { break }
+    }
+    expect(s).to_equal(299)
+    # labels and closures inside the loop
+    b := []int{1, 2, 3, 4}
+    u := 0
+    outer: for i := 0; i < 4; i++ {
+      for j := 0; j < 4; j++ {
+        if b[j] * b[i] == 6 { continue outer }
+        if b[i] + b[j] == 7 { break outer }
+        u += b[i] * 10 + b[j]
+      }
+    }
+    expect(u).to_equal(207)
+    c := []int{1, 2, 3, 4}
+    fs := []int{}
+    for i := 0; i < 3; i++ {
+      add := fn(k: int) -> int { return c[i] + k }
+      fs = append(fs, add(c[i + 1]))
+    }
+    expect(fs).to_equal([]int{3, 5, 7})
+  })
+  it("keep the checks when the loop variable changes in the body", fn() {
+    r := run_file("testdata/bounded_changed.caju")
+    expect(r.output).to_equal("Runtime error in bounded_changed.caju, line 6: Index 5 out of range (length 5).")
+  })
+  it("propagate NaN, infinities and negative zeros the same way", fn() {
+    out := make([]num, 16)
+    specials(out)
+    # (the bits the checked loop gives: 0 * inf is the default NaN, with the sign bit set)
+    want := []int{9218868437227405312, 9221120237041090560, -9223372036854775808, 4607182418800017408, -2251799813685248, 9221120237041090560, -9223372036854775808, 0, -2251799813685248, 9221120237041090560, 0, -9223372036854775808, 9218868437227405312, 9221120237041090560, -9223372036854775808, 4611686018427387904}
+    expect(bits_of(out)).to_equal(want)
+  })
+  it("still report a division by zero computed into a variable", fn() {
+    r := run_file("testdata/bounded_divzero.caju")
+    expect(r.output).to_equal("Runtime error in bounded_divzero.caju, line 6: Division by zero.")
+  })
+})

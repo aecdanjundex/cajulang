@@ -828,6 +828,10 @@ struct Fn {
   fn_used: map[str]bool       # top level: names used inside some function (stay global)
   scache: map[str]*SCache     # lists whose length and data pointer are kept for the current loops
   safe_idx: map[str]str       # index variable -> list it is always in range of (no check needed)
+  len_min: map[str]int        # in the copy of a loop whose bounds checks were hoisted: list ->
+                              # length it surely has (checked before the loop)
+  bounds: map[str]int         # there: variable of a bounded loop -> its bound (0 <= v < bound)
+  vdepth: int                 # > 0: inside a copied loop (no more copies)
   xtop: int                   # fexpr uses xmm0..xtop (the registers above hold num variables)
   epi_here: bool              # without defer: a return restores the registers and returns
   epi_regs: []int             # right there (instead of jumping to the exit)
@@ -860,13 +864,18 @@ struct LoopScan {
   fcalls: []*ast.Node      # calls to functions: pure only if try_inline turns them into an expression
   deref_store: bool        # stores through a pointer (*p = v): could reassign a global list
   g: *Gen
-  rcalls: bool             # surely calls a function, runtime included (estimate: Gen.calls_here)
+  rcalls: bool             # surely calls a function, runtime included (estimate: Gen.calls_here;
+                           # calls to functions are in fcalls: see Fn.fix_rcalls)
+  uses: map[str]int        # indexes of each list, weighted by loop depth (who gets the registers)
+  wt: int
 }
 
 fn (ls: *LoopScan) walk(n: *ast.Node) {
   if n == nil { return }
-  if !ls.rcalls && ls.g.calls_here(n) { ls.rcalls = true }
+  if !ls.rcalls && !(n.kind == "Call" && n.call_kind == "func") && ls.g.calls_here(n) { ls.rcalls = true }
   if n.kind == "FuncLit" || n.kind == "Func" { return }
+  wt := ls.wt
+  if (n.kind == "ForC" || n.kind == "While" || n.kind == "Range" || n.kind == "ForTo") && wt < 4096 { ls.wt = wt * 8 }
   switch n.kind {
   case "Assign": if n.name != "" { ls.assigned[n.name] = true }
   case "OpAssign": if n.target != nil && n.target.kind == "Var" { ls.assigned[n.target.name] = true }
@@ -875,9 +884,16 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   case "Range": for _, v := range n.vars { if v.kind == "Var" { ls.assigned[v.name] = true } }
   case "ForTo": ls.assigned[n.name] = true
   case "TypeSwitch": if n.bind != "" { ls.assigned[n.bind] = true }
-  case "Index": if n.obj != nil && n.obj.kind == "Var" { ls.used[n.obj.name] = true }
+  case "Index":
+    if n.obj != nil && n.obj.kind == "Var" {
+      ls.used[n.obj.name] = true
+      ls.uses[n.obj.name] = ls.uses[n.obj.name] + ls.wt
+    }
   case "Call":
-    if n.call_kind == "builtin" && (n.name == "len" || n.name == "cap") && len(n.args) == 1 && n.args[0].kind == "Var" { ls.used[n.args[0].name] = true }
+    if n.call_kind == "builtin" && (n.name == "len" || n.name == "cap") && len(n.args) == 1 && n.args[0].kind == "Var" {
+      ls.used[n.args[0].name] = true
+      ls.uses[n.args[0].name] = ls.uses[n.args[0].name] + ls.wt
+    }
     if n.call_kind == "func" { ls.fcalls = append(ls.fcalls, n) } else if n.call_kind != "builtin" && n.call_kind != "conv" { ls.calls = true }
   case "MethodCall", "CallValue", "Defer": ls.calls = true
   }
@@ -916,10 +932,11 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   for _, x := range n.vars { ls.walk(x) }
   for _, x := range n.fields { ls.walk(x) }
   for _, x := range n.sfields { ls.walk(x) }
+  ls.wt = wt
 }
 
 fn scan_loop(g: *Gen, parts: []*ast.Node) -> *LoopScan {
-  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false, g: g, rcalls: false}
+  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false, g: g, rcalls: false, uses: map[str]int{}, wt: 1}
   for _, p := range parts { ls.walk(p) }
   return ls
 }
@@ -1282,7 +1299,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   A := g.a
   f := &Fn{g: g, a: A, u: u, is_top: is_top, locals: map[str]*Var{}, nloc: 0, caps: map[str]*Var{}, env_off: 16 + 8 * len(params),
     rnames: []str{}, has_rn: false, ret_t: ret_t, celled_set: celled_set, fnode: fnode, rec: nil, loops: []*Loop{}, tmp_load: nil,
-    xtop: 14}
+    xtop: 14, len_min: map[str]int{}, bounds: map[str]int{}, vdepth: 0}
   if !is_top {
     for i, p := range params {
       f.locals[p] = &Var{off: 16 + 8 * (len(params) - 1 - i), t: ptypes[i], celled: celled_set[p], cap: -1}
@@ -2039,6 +2056,15 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
       A.ripx(0x0F00 | op, d, f.g.fconst(c), 0, 0xF2, 0)
       return
     }
+    if n.op != "/" && f.num_elem(n.right) && is_simple(n.right.index) && n.right.index.ty == "int" && f.no_calls(n.right) {
+      # an element of a list: used in place (read after the left operand, as fpair does)
+      f.fexpr(n.left, d)
+      b, ix := f.elem_check_b(n.right, false)
+      op := 0x58
+      if n.op == "-" { op = 0x5C } else if n.op == "*" { op = 0x59 }
+      A.rsibx(0x0F00 | op, d, b, ix, 3, 0, 0xF2)  # addsd/subsd/mulsd xmm d, [b + ix*8]
+      return
+    }
     off := f.fslot_of(n.right)
     if off != 0 && n.op != "/" {
       f.fexpr(n.left, d)
@@ -2112,9 +2138,8 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
     return
   }
   if f.num_elem(n) {
-    ix := f.elem_check(n, false)
-    if ix != RCX { f.a.mov(RCX, ix) }
-    f.movsd_elem(0x10, d)                         # movsd xmm d, [rax + rcx*8]
+    b, ix := f.elem_check_b(n, false)
+    A.rsibx(0x0F10, d, b, ix, 3, 0, 0xF2)         # movsd xmm d, [b + ix*8]
     return
   }
   f.expr_to(n, "num")
@@ -3112,18 +3137,54 @@ fn (f: *Fn) slot_op(op: int, reg: int, v: *Var) {
 
 # before a loop: keeps the length and data pointer of the local lists the loop indexes and never
 # assigns; returns the names added (exit_scache removes them)
-fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
+fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str { return f.enter_scache_h(ls, map[str]int{}, map[str]bool{}, "", map[str]bool{}) }
+# the same for the copy of a loop whose bounds checks are hoisted (slow != ""): every list in
+# hoist (hoist_plan) must have at least that length, or the code jumps to slow (nchk[0] counts
+# these checks). Only their data pointer needs a register; the lists in covered (only indexed
+# by bounded variables) do not even keep their length (SCache.len is nil). checked: the lists
+# whose length is checked.
+fn (f: *Fn) enter_scache_h(ls: *LoopScan, hoist: map[str]int, covered: map[str]bool, slow: str, checked: map[str]bool) -> []str {
   A := f.a
   if f.scache == nil { f.scache = map[str]*SCache{} }
+  f.fix_rcalls(ls)
   names := []str{}
   for name, _ := range ls.used { names = append(names, name) }
   sort_names(names)
+  # the most indexed lists get the registers first (ties: by name)
+  for i := 1; i < len(names); i++ {
+    j := i
+    while j > 0 && ls.uses[names[j]] > ls.uses[names[j - 1]] {
+      t := names[j]
+      names[j] = names[j - 1]
+      names[j - 1] = t
+      j--
+    }
+  }
   added := []str{}
   for _, name := range names {
     if ls.assigned[name] { continue }
+    need, hl := hoist[name]
+    if slow == "" { hl = false }
     if outer, has := f.scache[name]; has {
+      if hl && outer.len != nil {
+        f.load_slot(outer.len)
+        A.cmp_imm(RAX, need)
+        A.jcc(CC_L, slow)
+        checked[name] = true
+      }
       # an outer loop keeps it in memory: a loop without calls copies it to registers
-      if ls.rcalls || outer.len.reg != 0 || f.free_extras() < 2 { continue }
+      if ls.rcalls || outer.data.reg != 0 { continue }
+      _, lm := f.len_min[name]
+      if (hl || lm || outer.len == nil) && (outer.len == nil || outer.len.reg == 0) && f.free_extras() >= 1 {
+        # bounds checked before the loop: only the data pointer
+        c := &SCache{len: outer.len, data: f.scache_slot(ls), prev: outer}
+        f.load_slot(outer.data)
+        f.store_slot(c.data)
+        f.scache[name] = c
+        added = append(added, name)
+        continue
+      }
+      if outer.len == nil || outer.len.reg != 0 || f.free_extras() < 2 { continue }
       d := f.scache_slot(ls)                    # the data first: [reg + rcx*8] saves a load
       c := &SCache{len: f.scache_slot(ls), data: d, prev: outer}
       f.load_slot(outer.data)
@@ -3145,6 +3206,38 @@ fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
     } else if v.sym != "" { continue }
     if v.celled || v.reg != 0 || v.cap >= 0 { continue }
     if f.g.kind_of_t(types.dflt(v.t)) != "slice" { continue }
+    if hl {
+      # nil or too short: the copy with the checks (it reports the error where the loop would)
+      c := &SCache{len: nil, data: f.scache_slot(ls), prev: nil}
+      f.load_v(v)
+      A.alu("test", RAX, RAX)
+      A.jcc(CC_E, slow)
+      if covered[name] {
+        if need <= 127 {
+          A.rm(0x83, 7, RAX, 8)                    # cmp qword [rax+8], imm8
+          A.byte(need)
+        } else {
+          A.rm(0x81, 7, RAX, 8)                    # cmp qword [rax+8], imm32
+          A.d32(need)
+        }
+      } else {
+        c.len = f.hidden()
+        A.load(RCX, RAX, 8)
+        A.cmp_imm(RCX, need)
+        f.store_slot_r(c.len, RCX)
+      }
+      A.jcc(CC_L, slow)
+      checked[name] = true
+      if c.data.reg != 0 {
+        A.load(c.data.reg, RAX, 0)
+      } else {
+        A.load(RAX, RAX, 0)
+        f.store_slot(c.data)
+      }
+      f.scache[name] = c
+      added = append(added, name)
+      continue
+    }
     d := f.scache_slot(ls)
     c := &SCache{len: f.scache_slot(ls), data: d, prev: nil}
     is_nil := A.label()
@@ -3154,10 +3247,12 @@ fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
     A.jcc(CC_E, is_nil)
     A.load(RCX, RAX, 8)
     A.load(RAX, RAX, 0)
-    A.jmp(put)
+    A.bind(put)
+    A.cold_begin()
     A.bind(is_nil)
     A.rr32(0x31, RCX, RCX)                       # a nil list: length 0 (the slow path reports nil)
-    A.bind(put)
+    A.jmp(put)                                   # (data: RAX = 0)
+    A.cold_end()
     f.store_slot(c.data)
     f.store_slot_r(c.len, RCX)
     f.scache[name] = c
@@ -3171,10 +3266,27 @@ fn (f: *Fn) loop_pure(ls: *LoopScan) -> bool {
   for _, c := range ls.fcalls { if f.try_inline(c) == nil { return false } }
   return true
 }
+# calls to functions count as calls unless try_inline turns them into an expression that calls
+# nothing
+fn (f: *Fn) fix_rcalls(ls: *LoopScan) {
+  if ls.rcalls { return }
+  for _, c := range ls.fcalls {
+    inl := f.try_inline(c)
+    if inl == nil || scan_loop(f.g, []*ast.Node{inl}).rcalls {
+      ls.rcalls = true
+      return
+    }
+  }
+}
 fn (f: *Fn) exit_scache(added: []str) {
   for _, name := range added {
     c := f.scache[name]
-    f.free_extra(c.len)
+    if c.prev != nil && c.prev.len == c.len {
+      f.free_extra(c.data)
+      f.scache[name] = c.prev
+      continue
+    }
+    if c.len != nil { f.free_extra(c.len) }
     f.free_extra(c.data)
     if c.prev != nil { f.scache[name] = c.prev } else { delete(f.scache, name) }
   }
@@ -3264,6 +3376,163 @@ fn (f: *Fn) counted_loop(n: *ast.Node, ls: *LoopScan) -> str {
   return i
 }
 
+# ---- bounds checks hoisted out of loops with a constant bound ----
+# for v := E; v < C; v++ { body } (or v <= C) with E >= 0 (an int literal, or u or u + K with u
+# a variable of an enclosing loop of this kind), C an int literal and v an int local that only
+# the v++ changes (neither the condition nor the body assigns it; not behind a pointer nor
+# captured): in the body, 0 <= v < bound. Returns v and the bound, or "".
+fn (f: *Fn) bounded_loop(n: *ast.Node, env: map[str]int) -> (str, int) {
+  ini := n.init
+  if ini == nil || ini.kind != "Assign" || ini.name == "" || ini.value == nil { return "", 0 }
+  v := ini.name
+  iv, has := f.locals[v]
+  if !has || types.dflt(iv.t) != "int" || iv.celled || iv.cap >= 0 || iv.sym != "" { return "", 0 }
+  if _, captured := f.caps[v]; captured { return "", 0 }
+  if !nonneg_init(ini.value, env) { return "", 0 }
+  c := n.cond
+  if c == nil || c.kind != "Binary" || (c.op != "<" && c.op != "<=") || c.left.kind != "Var" || c.left.name != v { return "", 0 }
+  k, ok := int_lit(c.right)
+  if !ok || k < 0 || k > 1 << 30 { return "", 0 }
+  if c.op == "<=" { k++ }
+  p := n.post
+  if p == nil || p.kind != "OpAssign" || p.op != "+" || p.target == nil || p.target.kind != "Var" || p.target.name != v { return "", 0 }
+  one, ok2 := int_lit(p.value)
+  if !ok2 || one != 1 { return "", 0 }
+  if scan_loop(f.g, []*ast.Node{n.cond, n.body}).assigned[v] { return "", 0 }
+  return v, k
+}
+# an int expression surely >= 0 (and small: no overflow when added): a literal, a bounded
+# variable (env) or a sum of them
+fn nonneg_init(e: *ast.Node, env: map[str]int) -> bool {
+  if e.kind == "Paren" { return nonneg_init(e.expr, env) }
+  k, ok := int_lit(e)
+  if ok { return k >= 0 && k <= 1 << 30 }
+  if e.kind == "Var" {
+    _, b := env[e.name]
+    return b
+  }
+  if e.kind == "Binary" && e.op == "+" { return nonneg_init(e.left, env) && nonneg_init(e.right, env) }
+  return false
+}
+# for a bounded loop (bounded_loop): the lists its body (and the bounded loops inside it) index
+# with the variables of these loops, each with the length that makes all those indexes valid.
+# Empty when the loop is not bounded, its body cannot be generated twice (closures, defer) or
+# it is too big to be copied.
+# covered (filled here): the lists the loop uses only as a[v] with v a bounded variable.
+fn (f: *Fn) hoist_plan(n: *ast.Node, covered: map[str]bool) -> map[str]int {
+  need := map[str]int{}
+  v, k := f.bounded_loop(n, map[str]int{})
+  if v == "" { return need }
+  env := map[str]int{}
+  env[v] = k
+  size := []int{0}
+  other := map[str]bool{}
+  if !f.hoist_walk(n.body, env, need, other, size) || size[0] > 1500 { return map[str]int{} }
+  for name, _ := range need { if !other[name] { covered[name] = true } }
+  return need
+}
+# other: the names used in any other way
+fn (f: *Fn) hoist_walk(n: *ast.Node, env: map[str]int, need: map[str]int, other: map[str]bool, size: []int) -> bool {
+  if n == nil { return true }
+  size[0] = size[0] + 1
+  switch n.kind {
+  case "FuncLit", "Func", "Defer", "Go", "Select": return false
+  case "Var": other[n.name] = true
+  case "Index":
+    if n.obj != nil && n.obj.kind == "Var" && n.index != nil && n.index.kind == "Var" {
+      b, ok := env[n.index.name]
+      if ok {
+        if b > need[n.obj.name] { need[n.obj.name] = b }
+        return true
+      }
+    }
+  case "ForC":
+    v, k := f.bounded_loop(n, env)
+    if v != "" {
+      if !f.hoist_walk(n.init, env, need, other, size) || !f.hoist_walk(n.cond, env, need, other, size) || !f.hoist_walk(n.post, env, need, other, size) { return false }
+      inner := map[str]int{}
+      for name, b := range env { inner[name] = b }
+      inner[v] = k
+      return f.hoist_walk(n.body, inner, need, other, size)
+    }
+  }
+  for _, c := range node_kids(n) { if !f.hoist_walk(c, env, need, other, size) { return false } }
+  return true
+}
+# a[v] needs no check: a's length was checked before the loop (len_min) against the bound of v
+fn (f: *Fn) hoisted_ok(n: *ast.Node) -> bool {
+  if len(f.len_min) == 0 || n.index.kind != "Var" || n.obj.kind != "Var" { return false }
+  b, ok := f.bounds[n.index.name]
+  if !ok { return false }
+  m, ok2 := f.len_min[n.obj.name]
+  return ok2 && m >= b
+}
+# the children of a node
+fn node_kids(n: *ast.Node) -> []*ast.Node {
+  out := []*ast.Node{}
+  for _, c := range []*ast.Node{n.value, n.left, n.right, n.arg, n.expr, n.obj, n.index, n.lo, n.hi, n.key, n.ch, n.call, n.fn_, n.cond, n.init, n.post, n.then, n.otherwise, n.tag, n.subject, n.from_, n.to_, n.body, n.target} {
+    if c != nil { out = append(out, c) }
+  }
+  for _, xs := range [][]*ast.Node{n.stmts, n.args, n.values, n.targets, n.exprs, n.cases, n.elems, n.vars, n.fields, n.sfields} {
+    for _, c := range xs { if c != nil { out = append(out, c) } }
+  }
+  return out
+}
+
+# the loop of a ForC (after its init and enter_scache); iv: counted_loop's variable
+fn (f: *Fn) for_c(n: *ast.Node, iv: str) {
+  A := f.a
+  top := A.label()
+  next := A.label()
+  end := A.label()
+  f.push_loop(end, next, n.label)
+  bv := ""
+  if len(f.len_min) > 0 {
+    bvar, k := f.bounded_loop(n, f.bounds)
+    if bvar != "" { bv = bvar }
+    if bvar != "" { f.bounds[bvar] = k }
+  }
+  rotated := n.cond != nil && !always_true(n.cond)
+  chk := A.label()
+  if rotated { A.jmp(chk) }
+  A.bind(top)
+  if !rotated && n.cond != nil { f.cond_jump_false(n.cond, end) }   # (true: nothing)
+  if iv != "" {
+    if f.safe_idx == nil { f.safe_idx = map[str]str{} }
+    f.safe_idx[iv] = n.cond.right.args[0].name
+  }
+  f.stmt(n.body)
+  if iv != "" { delete(f.safe_idx, iv) }
+  A.bind(next)
+  # loop variable captured by a closure: each iteration gets its own cell (Go 1.22)
+  lv := []str{}
+  if n.init != nil {
+    if n.init.kind == "Assign" && n.init.decl != "" { lv = []str{n.init.name} } else if n.init.kind == "VarDecl" { lv = n.init.names }
+  }
+  for _, nm := range lv {
+    if nm != "_" {
+      v := f.lookup(nm, n)
+      if v.celled {
+        f.load_v(v)
+        A.push(RAX)
+        f.rt("rt_cell", 1)
+        f.store_slot(v)
+      }
+    }
+  }
+  if n.post != nil { f.stmt(n.post) }
+  if rotated {
+    # the condition after the body (one jump per turn)
+    A.bind(chk)
+    f.jump_if(n.cond, true, top)
+  } else {
+    A.jmp(top)
+  }
+  A.bind(end)
+  f.pop_loop()
+  if bv != "" { delete(f.bounds, bv) }
+}
+
 fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
   b, idx := f.elem_check_b(n, write)
   scale := 3
@@ -3294,7 +3563,7 @@ fn (f: *Fn) elem_check_b(n: *ast.Node, write: bool) -> (int, int) {
         A.mov(RCX, RAX)
       }
     }
-    if !(n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name) {
+    if !(n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name) && !f.hoisted_ok(n) {
       # (with counted_loop the index is always in range)
       ok := A.label()
       bad := A.label()
@@ -4409,6 +4678,11 @@ fn (f: *Fn) assign_var(name: str, value: *ast.Node, n: *ast.Node, decl: bool) {
   }
   if v.xr != 0 && value != nil && value.ty == "num" && f.fdirect(value) {
     x := f.xreg_of(value)
+    if x < 0 && f.fchain(value) && count_var(value, name) == 0 {
+      # computed straight into the variable's register (no other XMM register is used)
+      f.fexpr(value, v.xr)
+      return
+    }
     if x < 0 {
       f.fexpr(value, 0)
       x = 0
@@ -4459,6 +4733,21 @@ fn (f: *Fn) assign_direct(v: *Var, name: str, value: *ast.Node, decl: bool) -> b
   if r == 0 { return false }
   f.store_slot_r(v, r)
   return true
+}
+# fexpr computes n in xmm d using no other XMM register (but xmm15) and no GPR variable: a
+# constant, variable or list element, or a chain of + - * / whose right operands are those
+fn (f: *Fn) fchain(n: *ast.Node) -> bool {
+  if n.kind == "Paren" && n.ty == "num" && n.expr.ty == "num" { return f.fchain(n.expr) }
+  if f.is_fbin(n) { return f.fchain(n.left) && f.fchain_right(n.right, n.op) }
+  return f.fchain_right(n, "+")
+}
+fn (f: *Fn) fchain_right(n: *ast.Node, op: str) -> bool {
+  if f.xreg_of(n) >= 0 { return true }
+  c, is_c := f.fconst_of(n)
+  if is_c { return op != "/" || c != 0 }
+  if op == "/" { return false }
+  if f.fslot_of(n) != 0 { return true }
+  return f.num_elem(n) && is_simple(n.index) && n.index.ty == "int" && f.no_calls(n)
 }
 # fexpr computes n in an XMM register without going through RAX
 fn (f: *Fn) fdirect(n: *ast.Node) -> bool {
@@ -4933,14 +5222,14 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
     if c != nil && f.num_elem(tg) && types.dflt(tg.obj.ty) == strip_ptr(types.dflt(tg.obj.ty)) && g.kind_of_t(types.dflt(tg.obj.ty)) == "slice" && is_simple(tg.index) && tg.index.ty == "int" {
       # cached list, simple index: neither changes while the value is computed (fpure), so the
       # address is computed again instead of being kept on the stack
-      ix := f.elem_check(tg, true)
-      if ix != RCX { f.a.mov(RCX, ix) }
-      f.movsd_elem(0x10, 0)                       # the current value
+      b, ix := f.elem_check_b(tg, true)
+      A.rsibx(0x0F10, 0, b, ix, 3, 0, 0xF2)       # the current value
       f.fexpr(n.value, 1)
       f.fop(n.op, 0, 1, n)
-      f.simple_to(tg.index, RCX)
-      f.load_slot(c.data)
-      f.movsd_elem(0x11, 0)
+      # the data and index registers keep their values (fpure); RAX and RCX are reloaded
+      if b == RAX { f.load_slot(c.data) }
+      if ix == RCX { f.simple_to(tg.index, RCX) }
+      A.rsibx(0x0F11, 0, b, ix, 3, 0, 0xF2)
       return true
     }
     f.elem_addr(tg, true)
@@ -5104,53 +5393,37 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     f.exit_scache(added)
     return
   case "ForC":
-    top := A.label()
-    next := A.label()
-    end := A.label()
     if n.init != nil { f.stmt(n.init) }
     ls := scan_loop(f.g, []*ast.Node{n.cond, n.post, n.body})
-    added := f.enter_scache(ls)
-    iv := f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body}))   # i++ itself does not count
-    f.push_loop(end, next, n.label)
-    rotated := n.cond != nil && !always_true(n.cond)
-    chk := A.label()
-    if rotated { A.jmp(chk) }
-    A.bind(top)
-    if !rotated && n.cond != nil { f.cond_jump_false(n.cond, end) }   # (true: nothing)
-    if iv != "" {
-      if f.safe_idx == nil { f.safe_idx = map[str]str{} }
-      f.safe_idx[iv] = n.cond.right.args[0].name
+    hoist := map[str]int{}
+    covered := map[str]bool{}
+    if f.vdepth == 0 { hoist = f.hoist_plan(n, covered) }
+    if len(hoist) == 0 {
+      added := f.enter_scache(ls)
+      f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})))   # i++ itself does not count
+      f.exit_scache(added)
+      return
     }
-    f.stmt(n.body)
-    if iv != "" { delete(f.safe_idx, iv) }
-    A.bind(next)
-    # loop variable captured by a closure: each iteration gets its own cell (Go 1.22)
-    lv := []str{}
-    if n.init != nil {
-      if n.init.kind == "Assign" && n.init.decl != "" { lv = []str{n.init.name} } else if n.init.kind == "VarDecl" { lv = n.init.names }
-    }
-    for _, nm := range lv {
-      if nm != "_" {
-        v := f.lookup(nm, n)
-        if v.celled {
-          f.load_v(v)
-          A.push(RAX)
-          f.rt("rt_cell", 1)
-          f.store_slot(v)
-        }
-      }
-    }
-    if n.post != nil { f.stmt(n.post) }
-    if rotated {
-      # the condition after the body (one jump per turn)
-      A.bind(chk)
-      f.jump_if(n.cond, true, top)
-    } else {
-      A.jmp(top)
-    }
-    A.bind(end)
-    f.pop_loop()
+    # bounds checks hoisted: if every list is long enough, a copy of the loop without them;
+    # otherwise the loop as written (same errors at the same point)
+    slow := A.label()
+    done := A.label()
+    checked := map[str]bool{}
+    f.vdepth++
+    added := f.enter_scache_h(ls, hoist, covered, slow, checked)
+    for name, _ := range checked { f.len_min[name] = hoist[name] }
+    f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})))
+    f.len_min = map[str]int{}
     f.exit_scache(added)
+    if len(checked) > 0 {
+      A.jmp(done)
+      A.bind(slow)
+      added2 := f.enter_scache(ls)
+      f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})))
+      f.exit_scache(added2)
+      A.bind(done)
+    }
+    f.vdepth--
     return
   case "ForTo":
     f.for_to(n)
