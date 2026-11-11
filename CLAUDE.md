@@ -80,6 +80,12 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   com as XMM), então um ponteiro de dados nelas está na pilha durante a chamada. `__syscall` também.
 - Variáveis do nível de cima que nenhuma função usa (nem `&x`) são locais do `u.top`.
 - Chamadas a funções `return E` pequenas viram a expressão (`try_inline`).
+- Caminhos de erro vão para o código frio (`A.cold_begin`/`cold_end`, `f.fail_if`): o código vai
+  para depois do `ret` da função (`flush_cold`) e o caminho quente segue reto. Código frio não
+  volta sozinho: termina num erro que não retorna ou num `jmp` explícito.
+- Laços `while`/`for`/`range` têm a condição depois do corpo (um desvio por volta). O `x64.finish`
+  (ao gravar o executável) encurta desvios para rel8 e tira desvios para a instrução seguinte:
+  posições guardadas com `A.pos()` só valem até lá, e nada pode emitir desvios em bytes crus.
 
 ## O que falta
 

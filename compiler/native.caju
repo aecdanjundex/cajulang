@@ -829,6 +829,10 @@ struct Fn {
   scache: map[str]*SCache     # lists whose length and data pointer are kept for the current loops
   safe_idx: map[str]str       # index variable -> list it is always in range of (no check needed)
   xtop: int                   # fexpr uses xmm0..xtop (the registers above hold num variables)
+  epi_here: bool              # without defer: a return restores the registers and returns
+  epi_regs: []int             # right there (instead of jumping to the exit)
+  epi_saved: []*Var
+  last_stmt: *ast.Node        # the function's last statement: its return falls into the exit
 }
 
 # a list variable that no statement of the enclosing loop assigns: its header (data, length,
@@ -1366,6 +1370,12 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     }
   }
   f.exit_l = A.label()
+  if !hd && !is_top {
+    f.epi_here = true
+    f.epi_regs = regs
+    f.epi_saved = saved_regs
+  }
+  if len(body) > 0 { f.last_stmt = body[len(body) - 1] }
 
   for _, st := range body { f.stmt(st) }
   if is_top { A.rr32(0x31, RAX, RAX) } else if f.has_rn { f.load_results() }
@@ -1424,6 +1434,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   A.mov(RSP, RBP)
   A.pop(RBP)
   A.ret()
+  A.flush_cold()
   A.xs_reg = []int{}
   A.xs_off = []int{}
   A.sv_regs = outer_sv_regs
@@ -1433,6 +1444,19 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   if land_at >= 0 { A.b.set_u32(land_at, size) }
 }
 
+# leaves the function with the result in RAX: the epilogue right here (no jump), or a jump to
+# the exit (functions with defer, and the last statement, which falls into the exit)
+fn (f: *Fn) ret_jump(n: *ast.Node) {
+  A := f.a
+  if !f.epi_here || n == f.last_stmt {
+    A.jmp(f.exit_l)
+    return
+  }
+  for i, r := range f.epi_regs { A.load(r, RBP, f.epi_saved[i].off) }
+  A.mov(RSP, RBP)
+  A.pop(RBP)
+  A.ret()
+}
 fn (f: *Fn) where_arg(n: *ast.Node) {
   f.a.lea(RAX, f.g.str_lit(f.g.where_text(n)))
   f.a.push(RAX)
@@ -1443,6 +1467,16 @@ fn (f: *Fn) fail_here(n: *ast.Node, msg: str) {
   f.a.lea(RAX, f.g.str_lit(msg))
   f.a.push(RAX)
   f.a.call_noret(f.g.rt_call("rt_fail"))
+}
+# a runtime error when the flags say cc: the error call goes to the function's cold code
+fn (f: *Fn) fail_if(cc: int, n: *ast.Node, msg: str) {
+  A := f.a
+  l := A.label()
+  A.jcc(cc, l)
+  A.cold_begin()
+  A.bind(l)
+  f.fail_here(n, msg)
+  A.cold_end()
 }
 # calls a runtime function with the arguments already pushed
 fn (f: *Fn) rt(name: str, nargs: int) {
@@ -1876,8 +1910,7 @@ fn (f: *Fn) fop(op: str, d: int, s: int, n: *ast.Node) {
     A.ssep(0x57, 15, 15, 0x66)                    # xorpd xmm15, xmm15
     A.ucomisd(s, 15)
     A.jcc(CC_NE, ok)
-    A.jcc(CC_P, ok)
-    f.fail_here(n, "Division by zero")
+    f.fail_if(CC_NP, n, "Division by zero")      # equal to 0 and not NaN
     A.bind(ok)
     A.sse(0x5E, d, s)
   }
@@ -2165,6 +2198,19 @@ fn (f: *Fn) operands(left: *ast.Node, right: *ast.Node) {
   f.a.mov(RCX, RAX)
   f.a.pop(RAX)
 }
+# the same for a commutative operation: the operands may come swapped (RAX right, RCX left),
+# which saves a mov when the left one had to wait on the stack
+fn (f: *Fn) operands_comm(left: *ast.Node, right: *ast.Node, comm: bool) {
+  if !comm || (is_simple(left) && !is_simple(right) && f.stable_vs(left, right)) {
+    f.operands(left, right)
+    return
+  }
+  f.expr(left)
+  if f.simple_to(right, RCX) { return }
+  f.a.push(RAX)
+  f.expr(right)
+  f.a.pop(RCX)
+}
 
 # true for a comparison of two integers (or pointers, booleans...) that compare() does with cmp
 fn (f: *Fn) int_compare(n: *ast.Node) -> bool {
@@ -2300,8 +2346,7 @@ fn (f: *Fn) int_op(op: str, k: int, n: *ast.Node) {
     ok := A.label()
     done := A.label()
     A.alu("test", RCX, RCX)
-    A.jcc(CC_NE, ok)
-    if op == "/" { f.fail_here(n, "Integer division by zero") } else { f.fail_here(n, "Remainder of integer division by zero") }
+    if op == "/" { f.fail_if(CC_E, n, "Integer division by zero") } else { f.fail_if(CC_E, n, "Remainder of integer division by zero") }
     A.bind(ok)
     if uns {
       A.rr32(0x31, RDX, RDX)
@@ -2323,8 +2368,7 @@ fn (f: *Fn) int_op(op: str, k: int, n: *ast.Node) {
     small := A.label()
     done := A.label()
     A.alu("test", RCX, RCX)
-    A.jcc(CC_NS, ok)
-    f.fail_here(n, "Negative shift")
+    f.fail_if(CC_S, n, "Negative shift")
     A.bind(ok)
     A.cmp_imm(RCX, 64)
     A.jcc(CC_L, small)
@@ -2349,8 +2393,7 @@ fn (f: *Fn) float_op(op: str, n: *ast.Node) {
     A.rrx(0x0F57, 2, 2, 0, 0x66)
     A.ucomisd(1, 2)
     A.jcc(CC_NE, ok)
-    A.jcc(CC_P, ok)
-    if op == "/" { f.fail_here(n, "Division by zero") } else { f.fail_here(n, "Remainder of division by zero") }
+    if op == "/" { f.fail_if(CC_NP, n, "Division by zero") } else { f.fail_if(CC_NP, n, "Remainder of division by zero") }
     A.bind(ok)
     if op == "/" { A.sse(0x5E, 0, 1) } else { f.fmod_x87() }
   default:
@@ -2548,7 +2591,7 @@ fn (f: *Fn) binary(n: *ast.Node) {
         return
       }
     }
-    f.operands(n.left, n.right)
+    f.operands_comm(n.left, n.right, op == "+" || op == "*" || op == "&" || op == "|" || op == "^")
     f.int_op(op, n.ik, n)
     return
   }
@@ -2593,12 +2636,8 @@ fn (f: *Fn) struct_obj(obj: *ast.Node, path: []str, name: str, n: *ast.Node) -> 
   return t
 }
 fn (f: *Fn) nil_check(n: *ast.Node, msg: str) {
-  A := f.a
-  ok := A.label()
-  A.alu("test", RAX, RAX)
-  A.jcc(CC_NE, ok)
-  f.fail_here(n, msg)
-  A.bind(ok)
+  f.a.alu("test", RAX, RAX)
+  f.fail_if(CC_E, n, msg)
 }
 # address of element obj[i] (slice, array or string) in RAX, bounds-checked
 # ---- lists inside loops (SCache) ----
@@ -2798,13 +2837,19 @@ fn (f: *Fn) elem_check_b(n: *ast.Node, write: bool) -> (int, int) {
     if !(n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name) {
       # (with counted_loop the index is always in range)
       ok := A.label()
+      bad := A.label()
       f.slot_op(0x3B, idx, c.len)                 # cmp idx, [length]
-      A.jcc(CC_B, ok)
-      # out of range: the list is the cached one, so the general checks always report the error
+      A.jcc(CC_AE, bad)
+      A.bind(ok)
+      # out of range (cold code): the list is the cached one, so the general checks always
+      # report the error
+      A.cold_begin()
+      A.bind(bad)
       if idx != RCX { A.mov(RCX, idx) }
       f.simple_to(n.obj, RAX)
       f.elem_check_general(n, write, k, ot)
-      A.bind(ok)
+      A.jmp(ok)
+      A.cold_end()
     }
     if c.data.reg != 0 { return c.data.reg, idx }
     f.load_slot(c.data)
@@ -2833,32 +2878,37 @@ fn (f: *Fn) elem_check_general(n: *ast.Node, write: bool, k: str, ot: str) {
   if k == "array" {
     A.mov_imm(RDX, types.tinfo(ot).n)
     A.alu("cmp", RCX, RDX)
-    A.jcc(CC_B, ok)
-    f.where_arg(n)
-    A.push(RCX)
-    A.push(RDX)
-    f.rt("rt_index_fail", 3)
-    A.bind(ok)
+    f.index_fail_if(n)
   } else {
-    not_nil := A.label()
+    is_nil := A.label()
     A.alu("test", RAX, RAX)
-    A.jcc(CC_NE, not_nil)
+    A.jcc(CC_E, is_nil)
+    A.cold_begin()
+    A.bind(is_nil)
     f.where_arg(n)
     A.push(RCX)
     if write { A.mov_imm(RAX, 1) } else { A.mov_imm(RAX, 0) }
     A.push(RAX)
-    f.rt("rt_nil_index", 3)
-    A.bind(not_nil)
+    f.rt("rt_nil_index", 3)                       # does not return
+    A.cold_end()
     A.load(RDX, RAX, 8)
     A.alu("cmp", RCX, RDX)
-    A.jcc(CC_B, ok)
-    f.where_arg(n)
-    A.push(RCX)
-    A.push(RDX)
-    f.rt("rt_index_fail", 3)
-    A.bind(ok)
+    f.index_fail_if(n)
     A.load(RAX, RAX, 0)
   }
+}
+# after cmp rcx, rdx (index, length): an index out of range is an error (cold code)
+fn (f: *Fn) index_fail_if(n: *ast.Node) {
+  A := f.a
+  bad := A.label()
+  A.jcc(CC_AE, bad)
+  A.cold_begin()
+  A.bind(bad)
+  f.where_arg(n)
+  A.push(RCX)
+  A.push(RDX)
+  f.rt("rt_index_fail", 3)                        # does not return
+  A.cold_end()
 }
 fn (f: *Fn) str_index(n: *ast.Node) {
   A := f.a
@@ -2867,15 +2917,9 @@ fn (f: *Fn) str_index(n: *ast.Node) {
   f.expr_to(n.index, "int")
   A.mov(RCX, RAX)
   A.pop(RAX)
-  ok := A.label()
   A.load(RDX, RAX, 0)
   A.alu("cmp", RCX, RDX)
-  A.jcc(CC_B, ok)
-  f.where_arg(n)
-  A.push(RCX)
-  A.push(RDX)
-  f.rt("rt_index_fail", 3)
-  A.bind(ok)
+  f.index_fail_if(n)
   A.byte4(0x48, 0x0F, 0xB6, 0x44)                 # movzx rax, byte [rax + rcx + 8]
   A.byte2(0x08, 0x08)
 }
@@ -3147,12 +3191,14 @@ fn (f: *Fn) call_value(n: *ast.Node, mode: int, v: *Var, ft: str, args: []*ast.N
   h := f.hidden()
   f.load_fn(n, mode, v)
   f.store_slot(h)
-  ok := A.label()
+  bad := A.label()
   A.alu("test", RAX, RAX)
-  A.jcc(CC_NE, ok)
+  A.jcc(CC_E, bad)
+  A.cold_begin()
+  A.bind(bad)
   f.where_arg(n)
-  f.rt("rt_nil_call", 1)
-  A.bind(ok)
+  f.rt("rt_nil_call", 1)                          # does not return
+  A.cold_end()
   A.push(RAX)
   for i, a := range args {
     pt := ""
@@ -3173,10 +3219,7 @@ fn (f: *Fn) depth_in(n: *ast.Node) {
   if f.u.is_runtime { return }
   A := f.a
   A.cmp_imm(R15, 10000)
-  ok := A.label()
-  A.jcc(CC_L, ok)
-  f.fail_here(n, "Too much recursion: more than 10,000 nested function calls")
-  A.bind(ok)
+  f.fail_if(CC_GE, n, "Too much recursion: more than 10,000 nested function calls")
   A.byte3(0x49, 0xFF, 0xC7)                       # inc r15
 }
 fn (f: *Fn) depth_out() { if !f.u.is_runtime { f.a.byte3(0x49, 0xFF, 0xCF) } }   # dec r15
@@ -4573,11 +4616,22 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     top := A.label()
     end := A.label()
     added := f.enter_scache(scan_loop(f.g, []*ast.Node{n.cond, n.body}))
-    f.push_loop(end, top, n.label)
-    A.bind(top)
-    f.cond_jump_false(n.cond, end)
-    f.stmt(n.body)
-    A.jmp(top)
+    if always_true(n.cond) {
+      f.push_loop(end, top, n.label)
+      A.bind(top)
+      f.cond_jump_false(n.cond, end)              # (true: nothing)
+      f.stmt(n.body)
+      A.jmp(top)
+    } else {
+      # rotated: the condition goes after the body (one jump per turn)
+      chk := A.label()
+      f.push_loop(end, chk, n.label)
+      A.jmp(chk)
+      A.bind(top)
+      f.stmt(n.body)
+      A.bind(chk)
+      f.jump_if(n.cond, true, top)
+    }
     A.bind(end)
     f.pop_loop()
     f.exit_scache(added)
@@ -4591,8 +4645,11 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     added := f.enter_scache(ls)
     iv := f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body}))   # i++ itself does not count
     f.push_loop(end, next, n.label)
+    rotated := n.cond != nil && !always_true(n.cond)
+    chk := A.label()
+    if rotated { A.jmp(chk) }
     A.bind(top)
-    if n.cond != nil { f.cond_jump_false(n.cond, end) }
+    if !rotated && n.cond != nil { f.cond_jump_false(n.cond, end) }   # (true: nothing)
     if iv != "" {
       if f.safe_idx == nil { f.safe_idx = map[str]str{} }
       f.safe_idx[iv] = n.cond.right.args[0].name
@@ -4617,7 +4674,13 @@ fn (f: *Fn) stmt(n: *ast.Node) {
       }
     }
     if n.post != nil { f.stmt(n.post) }
-    A.jmp(top)
+    if rotated {
+      # the condition after the body (one jump per turn)
+      A.bind(chk)
+      f.jump_if(n.cond, true, top)
+    } else {
+      A.jmp(top)
+    }
     A.bind(end)
     f.pop_loop()
     f.exit_scache(added)
@@ -4735,13 +4798,13 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     want := results_of_t(f.ret_t)
     if len(vals) == 0 && f.has_rn {
       f.load_results()
-      A.jmp(f.exit_l)
+      f.ret_jump(n)
       return
     }
     if len(want) <= 1 && len(vals) == 1 && !optional(vals[0].unpack) {
       f.bind_value(vals[0], f.ret_t)
       if f.has_rn { f.store_v(f.lookup(f.rnames[0], n), false) }   # the defer sees (and may change) the result
-      A.jmp(f.exit_l)
+      f.ret_jump(n)
       return
     }
     hs := []*Var{}
@@ -4774,7 +4837,7 @@ fn (f: *Fn) stmt(n: *ast.Node) {
         A.store(RCX, 8 * i, RAX)
       }
     }
-    A.jmp(f.exit_l)
+    f.ret_jump(n)
     return
   }
   nfail(n.kind + " is not supported yet", n)
@@ -4950,11 +5013,10 @@ fn (f: *Fn) range_(n: *ast.Node) {
   }
   added := f.enter_scache(scan_loop(f.g, []*ast.Node{n}))      # the Range node: its variables are assigned every turn
   f.push_loop(end, next, n.label)
+  # rotated: the test i < lim goes after the body (one jump per turn)
+  chk := A.label()
+  A.jmp(chk)
   A.bind(top)
-  f.load_slot(i)
-  f.load_slot_r(lim, RCX)
-  A.alu("cmp", RAX, RCX)
-  A.jcc(CC_GE, end)
   if rk == "map" {
     live := A.label()
     f.load_slot(obj)
@@ -5003,7 +5065,7 @@ fn (f: *Fn) range_(n: *ast.Node) {
     f.load_slot_r(step, RCX)
     A.alu("add", RAX, RCX)
     f.store_slot(i)
-    A.jmp(top)
+    f.range_check(i, lim, chk, top)
     A.bind(end)
     f.pop_loop()
     f.exit_scache(added)
@@ -5031,8 +5093,21 @@ fn (f: *Fn) range_(n: *ast.Node) {
   f.load_slot(i)
   A.add_imm(RAX, 1)
   f.store_slot(i)
-  A.jmp(top)
+  f.range_check(i, lim, chk, top)
   A.bind(end)
   f.pop_loop()
   f.exit_scache(added)
+}
+# the test of a rotated range loop: back to top while i < lim
+fn (f: *Fn) range_check(i: *Var, lim: *Var, chk: str, top: str) {
+  f.a.bind(chk)
+  f.load_slot(i)
+  f.load_slot_r(lim, RCX)
+  f.a.alu("cmp", RAX, RCX)
+  f.a.jcc(CC_L, top)
+}
+# a loop condition that is the literal true (a rotated loop would only add a jump)
+fn always_true(c: *ast.Node) -> bool {
+  while c.kind == "Paren" { c = c.expr }
+  return c.kind == "Bool" && c.bool_value
 }

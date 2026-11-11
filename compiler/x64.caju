@@ -42,6 +42,19 @@ export const CC_G = 15
 export const SEC_TEXT = 0
 export const SEC_DATA = 1
 
+# one level of cold code: its bytes and the fixups, labels and jumps recorded in them
+struct Cold {
+  b: *bytes.Buffer
+  fix: []int
+  syms: []str
+  jat: []int
+  jfix: []int
+  jcc: []int
+}
+fn new_cold() -> *Cold {
+  return &Cold{b: bytes.new_buffer(1 << 10), fix: []int{}, syms: []str{}, jat: []int{}, jfix: []int{}, jcc: []int{}}
+}
+
 export struct X64 {
   b: *bytes.Buffer
   syms: map[str]int        # symbol -> off * 2 + section
@@ -56,11 +69,24 @@ export struct X64 {
   # the same for integer variables kept in RSI, RDI, R8..R11
   sv_regs: []int
   sv_offs: []int
+  # cold code (error paths): emitted into a side buffer between cold_begin and cold_end, and
+  # appended after the function by flush_cold, so that the hot path falls through. Cold code
+  # inside cold code goes to the next level (it must not be on the path of the outer one).
+  hot: *bytes.Buffer
+  colds: []*Cold
+  in_cold: int             # current level (0: hot)
+  # jumps (jmp: cc -1) to relax at the end: rel8 when the target is near, none when it is next
+  j_at: []int
+  j_fix: []int
+  j_cc: []int
+  add8_end: int            # end of the last `add rsp, 8` (-1: none), for push (peephole)
+  bind_at: int             # position of the last label bound
 }
 
 export fn new_x64() -> *X64 {
-  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0, xs_reg: []int{}, xs_off: []int{},
-    sv_regs: []int{}, sv_offs: []int{}}
+  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0,
+    hot: nil, colds: []*Cold{}, in_cold: 0, j_at: []int{}, j_fix: []int{}, j_cc: []int{}, add8_end: -1, bind_at: -1,
+    xs_reg: []int{}, xs_off: []int{}, sv_regs: []int{}, sv_offs: []int{}}
 }
 
 export fn (a: *X64) pos() -> int { return a.b.n }
@@ -139,6 +165,10 @@ export fn (a: *X64) ripx(op: int, reg: int, sym: str, w: int, pre: int, after: i
 }
 export fn (a: *X64) rip(op: int, reg: int, sym: str) { a.ripx(op, reg, sym, 1, 0, 0) }
 fn (a: *X64) add_fix(at: int, sym: str, end: int) {
+  if a.in_cold > 0 {
+    c := a.colds[a.in_cold - 1]
+    c.fix = append(c.fix, len(a.fix_at))
+  }
   a.fix_at = append(a.fix_at, at)
   a.fix_sym = append(a.fix_sym, sym)
   a.fix_end = append(a.fix_end, end)
@@ -148,20 +178,194 @@ export fn (a: *X64) label() -> str {
   a.nlab++
   return s
 }
-export fn (a: *X64) bind(sym: str) { a.syms[sym] = a.b.n * 2 + SEC_TEXT }
+export fn (a: *X64) bind(sym: str) {
+  a.syms[sym] = a.b.n * 2 + SEC_TEXT
+  a.bind_at = a.b.n
+  if a.in_cold > 0 {
+    c := a.colds[a.in_cold - 1]
+    c.syms = append(c.syms, sym)
+  }
+}
 export fn (a: *X64) bind_data(sym: str, off: int) { a.syms[sym] = off * 2 + SEC_DATA }
+fn (a: *X64) add_jump(at: int, cc: int) {
+  if a.in_cold > 0 {
+    c := a.colds[a.in_cold - 1]
+    c.jat = append(c.jat, at)
+    c.jfix = append(c.jfix, len(a.fix_at))
+    c.jcc = append(c.jcc, cc)
+    return
+  }
+  a.j_at = append(a.j_at, at)
+  a.j_fix = append(a.j_fix, len(a.fix_at))
+  a.j_cc = append(a.j_cc, cc)
+}
 export fn (a: *X64) jmp(sym: str) {
+  a.add_jump(a.b.n, -1)
   a.b.byte(0xE9)
   at := a.b.n
   a.b.u32(0)
   a.add_fix(at, sym, at + 4)
 }
 export fn (a: *X64) jcc(cc: int, sym: str) {
+  a.add_jump(a.b.n, cc)
   a.b.byte(0x0F)
   a.b.byte(0x80 + cc)
   at := a.b.n
   a.b.u32(0)
   a.add_fix(at, sym, at + 4)
+}
+
+# ---- cold code ----
+export fn (a: *X64) cold_begin() {
+  if a.in_cold == 0 { a.hot = a.b }
+  if a.in_cold == len(a.colds) { a.colds = append(a.colds, new_cold()) }
+  a.b = a.colds[a.in_cold].b
+  a.in_cold++
+  a.add8_end = -1
+  a.bind_at = -1
+}
+export fn (a: *X64) cold_end() {
+  a.in_cold--
+  if a.in_cold == 0 { a.b = a.hot } else { a.b = a.colds[a.in_cold - 1].b }
+  a.add8_end = -1
+  a.bind_at = -1
+}
+# appends the cold code to the text (after a function's ret: it is only reached by jumps)
+export fn (a: *X64) flush_cold() {
+  if a.in_cold != 0 { panic("x64: flush_cold inside cold code") }
+  for _, c := range a.colds {
+    base := a.b.n
+    a.b.append(c.b)
+    for _, i := range c.fix {
+      a.fix_at[i] += base
+      a.fix_end[i] += base
+    }
+    for _, s := range c.syms { a.syms[s] = a.syms[s] + base * 2 }
+    for i, at := range c.jat {
+      a.j_at = append(a.j_at, at + base)
+      a.j_fix = append(a.j_fix, c.jfix[i])
+      a.j_cc = append(a.j_cc, c.jcc[i])
+    }
+    c.b.reset()
+    c.fix = []int{}
+    c.syms = []str{}
+    c.jat = []int{}
+    c.jfix = []int{}
+    c.jcc = []int{}
+  }
+}
+
+# ---- final layout: short jumps (rel8), jumps to the next instruction removed ----
+# the number of positions in xs (sorted) below p
+fn count_below(xs: []int, p: int) -> int {
+  lo := 0
+  hi := len(xs)
+  while lo < hi {
+    mid := (lo + hi) / 2
+    if xs[mid] < p { lo = mid + 1 } else { hi = mid }
+  }
+  return lo
+}
+fn jump_len(cc: int) -> int {
+  if cc < 0 { return 5 }
+  return 6
+}
+export fn (a: *X64) finish() {
+  a.flush_cold()
+  nj := len(a.j_at)
+  # the target of each jump (-1: not a text label, stays rel32)
+  tgt := []int{}
+  for k := 0; k < nj; k++ {
+    t := -1
+    s, ok := a.syms[a.fix_sym[a.j_fix[k]]]
+    if ok && (s & 1) == SEC_TEXT { t = s >> 1 }
+    tgt = append(tgt, t)
+  }
+  # state: 0 rel32, 1 rel8, 2 removed; shrinking only brings code closer, so it converges
+  st := make([]int, nj)
+  cum := make([]int, nj + 1)                      # bytes removed by the jumps before k
+  changed := true
+  while changed {
+    changed = false
+    for k := 0; k < nj; k++ {
+      r := 0
+      if st[k] == 1 { r = jump_len(a.j_cc[k]) - 2 } else if st[k] == 2 { r = jump_len(a.j_cc[k]) }
+      cum[k + 1] = cum[k] + r
+    }
+    for k := 0; k < nj; k++ {
+      t := tgt[k]
+      if t < 0 || st[k] == 2 { continue }
+      at := a.j_at[k]
+      jl := 2                                      # bytes this jump has now
+      if st[k] == 0 { jl = jump_len(a.j_cc[k]) }
+      nat := at - cum[k]
+      nt := t - cum[count_below(a.j_at, t)]
+      if t > at && nt - (nat + jl) == 0 {
+        st[k] = 2
+        changed = true
+        continue
+      }
+      if st[k] == 1 { continue }
+      if t > at { nt -= jl - 2 }
+      d := nt - (nat + 2)
+      if d >= -128 && d <= 127 {
+        st[k] = 1
+        changed = true
+      }
+    }
+  }
+  for k := 0; k < nj; k++ {
+    r := 0
+    if st[k] == 1 { r = jump_len(a.j_cc[k]) - 2 } else if st[k] == 2 { r = jump_len(a.j_cc[k]) }
+    cum[k + 1] = cum[k] + r
+  }
+  # rewrite the code
+  out := bytes.new_buffer(a.b.n + 16)
+  src := a.b
+  cur := 0
+  for k := 0; k < nj; k++ {
+    at := a.j_at[k]
+    copy_range(out, src, cur, at)
+    cur = at
+    if st[k] == 1 {
+      disp := a.final_pos(tgt[k], cum) - (a.final_pos(at, cum) + 2)
+      if a.j_cc[k] < 0 { out.byte(0xEB) } else { out.byte(0x70 + a.j_cc[k]) }
+      out.byte(disp & 255)
+      cur = at + jump_len(a.j_cc[k])
+    } else if st[k] == 2 {
+      cur = at + jump_len(a.j_cc[k])
+    }
+  }
+  copy_range(out, src, cur, src.n)
+  # fixups of the jumps that went away; the others move
+  drop := make([]bool, len(a.fix_at))
+  for k2 := 0; k2 < nj; k2++ { if st[k2] != 0 { drop[a.j_fix[k2]] = true } }
+  fa := []int{}
+  fs := []str{}
+  fe := []int{}
+  for x := 0; x < len(a.fix_at); x++ {
+    if drop[x] { continue }
+    # the end moves with the instruction (a position right after it may move differently)
+    nf := a.final_pos(a.fix_at[x], cum)
+    fa = append(fa, nf)
+    fs = append(fs, a.fix_sym[x])
+    fe = append(fe, nf + a.fix_end[x] - a.fix_at[x])
+  }
+  a.fix_at = fa
+  a.fix_sym = fs
+  a.fix_end = fe
+  for name, s := range a.syms {
+    if (s & 1) == SEC_TEXT { a.syms[name] = a.final_pos(s >> 1, cum) * 2 + SEC_TEXT }
+  }
+  a.b = out
+  a.j_at = []int{}
+  a.j_fix = []int{}
+  a.j_cc = []int{}
+}
+# where position p goes in the final layout
+fn (a: *X64) final_pos(p: int, cum: []int) -> int { return p - cum[count_below(a.j_at, p)] }
+fn copy_range(out: *bytes.Buffer, src: *bytes.Buffer, lo: int, hi: int) {
+  for x := lo; x < hi; x++ { out.byte(src.get(x)) }
 }
 export fn (a: *X64) call(sym: str) {
   a.spill()
@@ -216,6 +420,13 @@ export fn (a: *X64) load_sym(r: int, sym: str) { a.rip(0x8B, r, sym) }
 export fn (a: *X64) store_sym(sym: str, r: int) { a.rip(0x89, r, sym) }
 export fn (a: *X64) lea(r: int, sym: str) { a.rip(0x8D, r, sym) }
 export fn (a: *X64) push(r: int) {
+  # add rsp, 8; push rax -> mov [rsp], rax (the slot just freed is reused; nothing jumps between)
+  if r == RAX && a.add8_end == a.b.n && a.bind_at != a.b.n {
+    a.b.truncate(a.b.n - 4)
+    a.add8_end = -1
+    a.byte4(0x48, 0x89, 0x04, 0x24)
+    return
+  }
   if r >= 8 { a.b.byte(0x41) }
   a.b.byte(0x50 + (r & 7))
 }
@@ -255,6 +466,7 @@ export fn (a: *X64) alu_imm(ext: int, r: int, v: int) {
     a.b.byte(0x83)
     a.b.byte(0xC0 | (ext << 3) | (r & 7))
     a.b.byte(v & 255)
+    if ext == 0 && r == RSP && v == 8 { a.add8_end = a.b.n }
     return
   }
   a.b.byte(0x81)

@@ -48,6 +48,7 @@ fn align_up(n: int, a: int) -> int { return (n + a - 1) / a * a }
 
 # ---- ELF x86-64 (Linux): two segments, code and data ----
 export fn write_elf(a: *x64.X64, data: *bytes.Buffer, relocs: *Relocs) -> *bytes.Buffer {
+  a.finish()
   base := 0x400000
   text_off := 0x1000
   text_len := a.b.len()
@@ -103,6 +104,7 @@ fn put_u64(data: *bytes.Buffer, v: int) {
 
 # dlls: the DLL names in order; imports[dll]: its symbols in order
 export fn write_pe(a: *x64.X64, data: *bytes.Buffer, dlls: []str, imports: map[str][]str, relocs: *Relocs) -> *bytes.Buffer {
+  a.finish()
   IMAGE_BASE := 0x140000000
   SA := 0x1000
   FA := 0x200
