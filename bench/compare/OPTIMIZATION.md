@@ -37,21 +37,22 @@ garantida pela suíte de testes e pela autocompilação.
 | 11 | listas em laço: tamanho e dados lidos uma vez; `a[i]` sem verificação em `for i := 0; i < len(a); i++` | 64 ms | 144 ms | 425 ms | 90 ms | 108 ms | 234 ms | 833 ms |
 | 12 | `[]bool` e `[N]bool` com 1 byte por elemento | 64 ms | 70 ms | 396 ms | 90 ms | 107 ms | 229 ms | 852 ms |
 | 13–16 | mapas com etiqueta; listas globais em laços; operações direto em registradores; `num` em XMM; RSI/RDI/R8–R11 | 62 ms | 29 ms | 175 ms | 37 ms | 35 ms | 184 ms | 605 ms |
+| 17–18 | laços com teste no fim, código frio, desvios curtos; divisão e resto por constante sem `idiv` | 57 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
 
 **Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
 matmul 1,8×, sort 2,2×, maps 2,1×.
 
-**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho, depois da rodada 16):
+**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho, depois da rodada 18):
 
 | desafio | Caju antes | Caju depois | Go | Rust | Python | Caju ÷ Go antes → depois |
 |---|--:|--:|--:|--:|--:|--:|
-| fib 35 | 126 ms | 62 ms | 38 ms | 20 ms | 1.18 s | 3.2× → 1.6× |
-| sieve 10M | 435 ms | 29 ms | 22 ms | 18 ms | 2.00 s | 13× → 1.3× |
-| nbody 1M | 737 ms | 175 ms | 165 ms | 64 ms | 8.69 s | 4.3× → 1.1× |
-| mandelbrot 1k | 243 ms | 38 ms | 36 ms | 36 ms | 5.79 s | 6.4× → 1.1× |
-| matmul 300 | 256 ms | 34 ms | 30 ms | 11 ms | 5.44 s | 8.0× → 1.1× |
-| sort 2M | 637 ms | 186 ms | 134 ms | 129 ms | 6.42 s | 4.5× → 1.4× |
-| maps 3M | 2.00 s | 610 ms | 525 ms | 296 ms | 1.77 s | 3.3× → 1.2× |
+| fib 35 | 126 ms | 57 ms | 36 ms | 20 ms | 1.17 s | 3.2× → 1.6× |
+| sieve 10M | 435 ms | 20 ms | 19 ms | 19 ms | 1.99 s | 13× → 1.1× |
+| nbody 1M | 737 ms | 174 ms | 166 ms | 64 ms | 8.69 s | 4.3× → 1.1× |
+| mandelbrot 1k | 243 ms | 37 ms | 35 ms | 35 ms | 6.54 s | 6.4× → 1.1× |
+| matmul 300 | 256 ms | 33 ms | 31 ms | 11 ms | 5.67 s | 8.0× → 1.1× |
+| sort 2M | 637 ms | 165 ms | 135 ms | 129 ms | 6.37 s | 4.5× → 1.2× |
+| maps 3M | 2.00 s | 605 ms | 503 ms | 299 ms | 1.79 s | 3.3× → 1.2× |
 
 Contra Python, a Caju passou de 3 a 25 vezes mais rápida para 2 a 70 vezes (e nos mapas, de empate
 para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuções (o matmul variou de
@@ -60,29 +61,29 @@ para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuç�
 ## Todas as medições
 
 <!-- python3 bench/compare/rounds/table.py -->
-| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | round 11 | round 12 | round 16 | total gain |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1.53× |
-| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 1.92× |
-| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 64 ms | 64 ms | 62 ms | 2.03× |
-| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2 ms | 2 ms | 1 ms | 4.64× |
-| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 11 ms | 7 ms | 4 ms | 10.60× |
-| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 144 ms | 70 ms | 29 ms | 15.07× |
-| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 5 ms | 5 ms | 3 ms | 3.03× |
-| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 44 ms | 41 ms | 19 ms | 4.03× |
-| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 425 ms | 396 ms | 175 ms | 4.21× |
-| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 3 ms | 4.96× |
-| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 24 ms | 23 ms | 10 ms | 6.08× |
-| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 90 ms | 90 ms | 37 ms | 6.52× |
-| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 3 ms | 4.59× |
-| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 33 ms | 33 ms | 11 ms | 6.98× |
-| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 108 ms | 107 ms | 35 ms | 7.37× |
-| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 11 ms | 11 ms | 9 ms | 3.19× |
-| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 56 ms | 54 ms | 44 ms | 3.43× |
-| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 234 ms | 229 ms | 184 ms | 3.47× |
-| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 10 ms | 10 ms | 10 ms | 3.56× |
-| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 176 ms | 191 ms | 115 ms | 4.87× |
-| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 833 ms | 852 ms | 605 ms | 3.32× |
+| challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | round 11 | round 12 | round 16 | round 18 | total gain |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fib | 25 | 2 ms | 2 ms | — | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 2 ms | 1 ms | 1.71× |
+| fib | 30 | 13 ms | 13 ms | — | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 6 ms | 2.08× |
+| fib | 35 | 126 ms | 125 ms | 94 ms | 92 ms | 91 ms | 65 ms | 66 ms | 66 ms | 65 ms | 66 ms | 69 ms | 64 ms | 64 ms | 62 ms | 57 ms | 2.21× |
+| sieve | 100,000 | 6 ms | 5 ms | — | 4 ms | 4 ms | 4 ms | 3 ms | 3 ms | 3 ms | 3 ms | 3 ms | 2 ms | 2 ms | 1 ms | 1 ms | 4.65× |
+| sieve | 1,000,000 | 40 ms | 41 ms | — | 28 ms | 29 ms | 27 ms | 18 ms | 16 ms | 16 ms | 16 ms | 17 ms | 11 ms | 7 ms | 4 ms | 3 ms | 13.77× |
+| sieve | 10,000,000 | 435 ms | 424 ms | 370 ms | 317 ms | 320 ms | 304 ms | 218 ms | 185 ms | 185 ms | 187 ms | 188 ms | 144 ms | 70 ms | 29 ms | 21 ms | 20.83× |
+| nbody | 10,000 | 9 ms | 9 ms | — | 7 ms | 7 ms | 7 ms | 6 ms | 6 ms | 6 ms | 6 ms | 6 ms | 5 ms | 5 ms | 3 ms | 3 ms | 3.09× |
+| nbody | 100,000 | 75 ms | 76 ms | — | 59 ms | 55 ms | 53 ms | 46 ms | 45 ms | 44 ms | 43 ms | 44 ms | 44 ms | 41 ms | 19 ms | 18 ms | 4.08× |
+| nbody | 1,000,000 | 737 ms | 735 ms | 725 ms | 576 ms | 532 ms | 516 ms | 449 ms | 438 ms | 435 ms | 427 ms | 419 ms | 425 ms | 396 ms | 175 ms | 175 ms | 4.21× |
+| mandelbrot | 250 | 17 ms | 17 ms | — | 17 ms | 9 ms | 10 ms | 9 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 7 ms | 3 ms | 3 ms | 5.08× |
+| mandelbrot | 500 | 62 ms | 62 ms | — | 61 ms | 33 ms | 33 ms | 33 ms | 24 ms | 25 ms | 25 ms | 25 ms | 24 ms | 23 ms | 10 ms | 10 ms | 6.05× |
+| mandelbrot | 1,000 | 243 ms | 243 ms | 251 ms | 237 ms | 127 ms | 128 ms | 125 ms | 92 ms | 93 ms | 94 ms | 94 ms | 90 ms | 90 ms | 37 ms | 37 ms | 6.51× |
+| matmul | 100 | 12 ms | 12 ms | — | 10 ms | 10 ms | 10 ms | 9 ms | 9 ms | 7 ms | 7 ms | 7 ms | 5 ms | 5 ms | 3 ms | 2 ms | 5.08× |
+| matmul | 200 | 78 ms | 79 ms | — | 65 ms | 65 ms | 66 ms | 64 ms | 62 ms | 41 ms | 41 ms | 45 ms | 33 ms | 33 ms | 11 ms | 11 ms | 7.34× |
+| matmul | 300 | 256 ms | 253 ms | 209 ms | 212 ms | 214 ms | 213 ms | 210 ms | 202 ms | 133 ms | 136 ms | 145 ms | 108 ms | 107 ms | 35 ms | 33 ms | 7.75× |
+| sort | 100,000 | 28 ms | 28 ms | — | 18 ms | 18 ms | 18 ms | 14 ms | 13 ms | 14 ms | 14 ms | 13 ms | 11 ms | 11 ms | 9 ms | 8 ms | 3.48× |
+| sort | 500,000 | 151 ms | 148 ms | — | 92 ms | 96 ms | 94 ms | 68 ms | 67 ms | 67 ms | 69 ms | 68 ms | 56 ms | 54 ms | 44 ms | 40 ms | 3.81× |
+| sort | 2,000,000 | 637 ms | 626 ms | 484 ms | 390 ms | 397 ms | 394 ms | 287 ms | 280 ms | 283 ms | 287 ms | 284 ms | 234 ms | 229 ms | 184 ms | 164 ms | 3.88× |
+| maps | 100,000 | 35 ms | 35 ms | — | 25 ms | 24 ms | 24 ms | 16 ms | 16 ms | 13 ms | 13 ms | 11 ms | 10 ms | 10 ms | 10 ms | 10 ms | 3.61× |
+| maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 176 ms | 191 ms | 115 ms | 115 ms | 4.89× |
+| maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 833 ms | 852 ms | 605 ms | 607 ms | 3.30× |
 
 A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
 código dela não foi salvo à parte).
@@ -372,14 +373,23 @@ execuções, maior tamanho): sieve 67 → 29 ms (−57%), nbody 390 → 175 ms (
 37 ms (−58%), matmul 106 → 35 ms (−67%), sort 225 → 184 ms (−18%), maps 809 → 605 ms (−25%),
 fib 63 → 62 ms.
 
-**Ficaram de fora (por enquanto):**
-- Divisão e resto por constante (branch `worktree-agent-a7777e1fb0cf9a771`, commit 0d989aa,
-  sobre 01668a2, 651 testes): neutro nos 7 desafios, −21% de ciclos num laço com `%` constante.
-  Pronto para integrar.
-- Fluxo de controle (laço com teste no fim, código frio, desvios rel8, alinhamento): interrompido
-  antes de commitar; o trabalho está em `worktree-agent-a46a23f725b873a03` (commit "wip" +
-  mudanças não commitadas). A medição dele sobre 01668a2 dava −3% a −13% de instruções (fib −9%,
-  sieve −13%), com o código frio pesando mais no sort e no nbody.
+## Rodadas 17 e 18: fluxo de controle e divisão por constante
+
+- **17 (ângulo 7, cfad91b):** laços `while`/`for`/`range` com a condição depois do corpo (um
+  desvio por volta); caminhos de erro (limites, nil, divisão, deslocamento, profundidade) no
+  código frio, depois do `ret`; `x64.finish` encurta desvios para rel8 e tira desvios para a
+  instrução seguinte; `return` no meio da função faz o epílogo ali. Testes:
+  `tests/lang/loop_layout_test.caju`.
+- **18 (ângulo 1, 9c18cb7):** `x / d` e `x % d` com `d` constante sem `idiv` nem verificações
+  (deslocamentos para potências de 2, multiplicação pelo número mágico para os outros). Testes:
+  `tests/lang/const_div_test.caju` (10 tipos inteiros, conferidos contra o caminho geral).
+
+Medidas separadas sobre a rodada 16 (tempo, 3 passadas intercaladas): a 17 deu sieve −31%,
+sort −11%, fib −7%; a 18 deu sort −5% e matmul −15% sozinha, mas na combinação o matmul fica em
+−4% (a inicialização do matmul faz só 90 mil divisões, ~1 ms: o −15% era efeito de alinhamento).
+Juntas, sobre a rodada 16: sieve 29 → 21 ms (−28%), sort 184 → 164 ms (−11%), fib 62 → 57 ms
+(−8%); o resto igual. A 18 vale mais fora destes desafios: −21% de ciclos num laço com `%`
+constante.
 
 ## O que ficou para depois
 
