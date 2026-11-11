@@ -146,6 +146,12 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   não compila o novo (gera o formato velho e liga o runtime novo: o estágio 2 cai). Comece a
   cadeia pelo JS (`node bootstrap/caju.js build -o build/s1 ...`), que usa o runtime congelado.
 - Listas e arrays de `bool` têm 1 byte por elemento (`byte_elems`, `rt_esize`); todo o resto, 8.
+- Alocador (`rt/gc.caju`): sem listas livres. Cada "chave" (classe × 2 + sem ponteiros) tem
+  páginas próprias e uma faixa [próximo, fim, tamanho] em `rt_krun`; `rt_alloc`/`rt_alloc_ns`
+  só avançam o ponteiro da faixa, `rt_alloc_slow`/`rt_next_run` reservam a próxima faixa de
+  posições livres (bits "em uso" + zeragem). A coleta começa com `rt_drop_runs` (devolve o resto
+  das faixas) e a varredura faz só "em uso &= marcado". O bit "sem ponteiros" é da página
+  (`rt_pg_flag` & 2). Um mapa novo é um bloco de 168 bytes (cabeçalho, 4 entradas, índice de 8).
 - Mexeu no coletor? Rode a suíte com coleta a cada 64 KB (troque `8 << 20` por `1 << 16` em
   `rt/gc.caju`, dois lugares) e desfaça depois.
 

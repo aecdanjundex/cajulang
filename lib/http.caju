@@ -136,6 +136,29 @@ fn mem_lower(p: int, n: int) -> str {
   return __pstr(m)
 }
 
+# do the n bytes at p equal t? With fold, ASCII letters of p count as lower case (t in lower case)
+fn mem_is(p: int, n: int, t: str, fold: bool) -> bool {
+  if n != len(t) { return false }
+  tp := __strp(t) + 8
+  for i := 0; i < n; i++ {
+    c := __load8(p + i)
+    if fold && c >= 65 && c <= 90 { c += 32 }
+    if c != __load8(tp + i) { return false }
+  }
+  return true
+}
+
+# texts that arrive in almost every request: returned without allocating a new string
+let KNOWN_METHODS = []str{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "HTTP/1.1", "HTTP/1.0"}
+let KNOWN_HEADERS = []str{"host", "user-agent", "accept", "accept-encoding", "accept-language", "connection", "content-type", "content-length", "authorization", "cookie", "origin", "referer", "cache-control", "x-forwarded-for", "x-real-ip", "upgrade-insecure-requests", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest", "if-none-match", "if-modified-since", "pragma", "dnt"}
+
+# mem_str, reusing a known text when the bytes are one of them
+fn mem_known(p: int, n: int, known: []str, fold: bool) -> str {
+  for _, k := range known { if mem_is(p, n, k, fold) { return k } }
+  if fold { return mem_lower(p, n) }
+  return mem_str(p, n)
+}
+
 # does s equal t ignoring the case of ASCII letters? (t in lower case)
 fn eq_fold(s: str, t: str) -> bool {
   n := len(s)
@@ -153,8 +176,18 @@ fn eq_fold(s: str, t: str) -> bool {
 # does the comma-separated header value contain the token t (lower case), in any case?
 fn has_token(v: str, t: str) -> bool {
   if v == "" { return false }
-  for _, part := range strings.split(v, ",") {
-    if eq_fold(strings.trim_space(part), t) { return true }
+  p := __strp(v) + 8
+  n := len(v)
+  a := 0
+  while a <= n {
+    b := a
+    while b < n && __load8(p + b) != 44 { b++ }
+    s := a
+    e := b
+    while s < e && (__load8(p + s) == 32 || __load8(p + s) == 9) { s++ }
+    while e > s && (__load8(p + e - 1) == 32 || __load8(p + e - 1) == 9) { e-- }
+    if mem_is(p + s, e - s, t, true) { return true }
+    a = b + 1
   }
   return false
 }
@@ -258,6 +291,18 @@ fn (cl: *Client) put(s: str) {
   cl.out_n += n
 }
 
+# the decimal digits of v >= 0
+fn (cl: *Client) put_int(v: int) {
+  cl.out_room(20)
+  d := 1
+  while d * 10 <= v { d *= 10 }
+  while d > 0 {
+    __store8(cl.outb + cl.out_n, 48 + v / d % 10)
+    cl.out_n++
+    d /= 10
+  }
+}
+
 fn (cl: *Client) put_mem(p: int, n: int) {
   cl.out_room(n)
   mcopy(cl.outb + cl.out_n, p, n)
@@ -292,7 +337,7 @@ fn (cl: *Client) take_request() -> (*Request, int) {
   sp2 := sp1 + 1
   while sp2 < le && __load8(p + sp2) != 32 { sp2++ }
   if sp1 >= le || sp2 >= le || sp1 == s || sp2 == sp1 + 1 { return nil, 400 }
-  req := &Request{method: mem_str(p + s, sp1 - s), version: mem_str(p + sp2 + 1, le - sp2 - 1), headers: map[str]str{}, remote_addr: cl.conn.remote_addr}
+  req := &Request{method: mem_known(p + s, sp1 - s, KNOWN_METHODS, false), version: mem_known(p + sp2 + 1, le - sp2 - 1, KNOWN_METHODS, false), headers: map[str]str{}, remote_addr: cl.conn.remote_addr}
   q := sp1 + 1
   while q < sp2 && __load8(p + q) != 63 { q++ }
   req.path = mem_str(p + sp1 + 1, q - sp1 - 1)
@@ -311,7 +356,7 @@ fn (cl: *Client) take_request() -> (*Request, int) {
     while vs < e && (__load8(p + vs) == 32 || __load8(p + vs) == 9) { vs++ }
     ve := e
     while ve > vs && (__load8(p + ve - 1) == 32 || __load8(p + ve - 1) == 9) { ve-- }
-    req.headers[mem_lower(p + ls, ne - ls)] = mem_str(p + vs, ve - vs)
+    req.headers[mem_known(p + ls, ne - ls, KNOWN_HEADERS, true)] = mem_str(p + vs, ve - vs)
     ls = e + 2
   }
   body_start := head_end + 4
@@ -352,7 +397,11 @@ fn keep_alive(req: *Request) -> bool {
 
 # appends the response to the output buffer
 fn (cl: *Client) put_response(res: *Response, head_only: bool, keep: bool, http10: bool) {
-  cl.put("HTTP/1.1 " + str(res.status) + " " + status_text(res.status) + "\r\n")
+  cl.put("HTTP/1.1 ")
+  cl.put_int(res.status)
+  cl.put(" ")
+  cl.put(status_text(res.status))
+  cl.put("\r\n")
   typed := false
   for k, v := range res.headers {
     if eq_fold(k, "content-length") || eq_fold(k, "connection") { continue }
@@ -364,7 +413,7 @@ fn (cl: *Client) put_response(res: *Response, head_only: bool, keep: bool, http1
   }
   if !typed { cl.put("Content-Type: text/plain; charset=utf-8\r\n") }
   cl.put("Content-Length: ")
-  cl.put(str(res.body.n))
+  cl.put_int(res.body.n)
   if !keep { cl.put("\r\nConnection: close\r\n\r\n") } else if http10 { cl.put("\r\nConnection: keep-alive\r\n\r\n") } else { cl.put("\r\n\r\n") }
   if !head_only && res.body.n > 0 { cl.put_mem(res.body.mem + 8, res.body.n) }
 }

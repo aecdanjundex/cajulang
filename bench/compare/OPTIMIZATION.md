@@ -475,6 +475,38 @@ desenrolado).
 limite de profundidade e o `push` de volta), matmul (1,2×), mandelbrot (1,1×) e o maps grande
 (1,9×: a tabela do Rust é mais compacta e o hash mais barato).
 
+## Rodada 26: alocação e coleta (servidor HTTP)
+
+Perfil do servidor HTTP (`bench/http`, `GET /users/:id`, um núcleo): ~55% do tempo de usuário
+em alocação e coleta, 33% só dentro de `rt_alloc_x`, quase tudo numa instrução: a leitura do
+próximo nó da lista livre (`__load64(p)`), que era uma falha de cache (objetos livres frios).
+Medido com instruções exatas por requisição (callgrind) e CPU de usuário por requisição.
+
+| hipótese | resultado |
+|---|---|
+| H2a alocar pela varredura do bitmap "em uso" em vez de lista livre (sem divisão, sem `rt_bit_set`/`rt_bit_clr`, bit "sem ponteiros" por página: chave = classe×2 + sem ponteiros) | aceita: 33,3 → 29,5 mil instr./req. |
+| H2b faixas: reserva uma sequência de posições livres de uma vez (bits e zeragem juntos); cada alocação só avança um ponteiro; a coleta devolve o resto das faixas antes de marcar; varredura = `em uso &= marcado` | aceita: → 24,6 mil |
+| H2c caminho rápido completo em `rt_alloc`/`rt_alloc_ns` ([próximo, fim, tamanho] por chave), o resto em `rt_alloc_slow` | aceita: → 22,5 mil |
+| H2d limite de coleta menor (2 MB, 1 MB) para caber no cache | inconclusiva (ruído de outro processo); não mudou |
+| H2e alocação expandida no lugar pelo gerador para tamanhos constantes | não feita: ~35 instr. por struct, ~1% por requisição |
+| H1a mapa num bloco só (72 + 128 + 64 bytes) | rejeitada: menos alocações, mesmas instruções e mais bytes (classe de 320) |
+| H1a′ mapa num bloco de 168 bytes (cabeçalho + 4 entradas + índice de 8) | aceita: 17,8 → 17,2 mil; 272 → 176 bytes por mapa vazio |
+| H1b literais de struct: campo omitido cujo zero é 0 não chama `rt_zero` (texto: o literal `""`) | aceita: 18,3 → 17,8 mil |
+| H1c `std/http`: linha de status e Content-Length sem concatenar (`put_int`), método/versão/nomes de cabeçalho comuns sem alocar (`mem_known`), `has_token` sem `split` | aceita: 18,9 → 18,3 mil |
+| H1d framework web: roteador sem `split` (compara os bytes do caminho com os filhos fixos), `params`/`keys` criados só quando usados, cadeia de handlers guardada por rota | aceita: 22,5 → 18,9 mil |
+
+Total no servidor, num núcleo (req/s, CPU de usuário por requisição):
+
+| rota | antes | depois |
+|---|---|---|
+| GET /users/:id | 56,9 mil, 8,0 µs | 67,5 mil (+19%), 4,4 µs |
+| GET /users (50) | 30,3 mil, 21,3 µs | 32,7 mil (+8%), 19,1 µs |
+| POST /users | 50,4 mil, 10,7 µs | 64,2 mil (+27%), 6,1 µs |
+
+O compilador compilando a si mesmo: 12,17 → 9,85 bilhões de instruções (−19%), 7,1 → 5,1
+bilhões de ciclos (−28%). Benchmarks de CPU (fib...maps): ±0,1% de instruções. Memória: maps 3M
+igual; sort 2M 16,9 → 19,9 MB (páginas separadas por "sem ponteiros").
+
 ## O que ficou para depois
 
 Em ordem de ganho esperado:

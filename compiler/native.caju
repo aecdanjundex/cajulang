@@ -4251,6 +4251,10 @@ fn (f: *Fn) composite(n: *ast.Node) {
       }
       if given != nil {
         f.bind_value(given.value, d.type)
+      } else if types.dflt(d.type) == "str" {
+        A.lea(RAX, g.str_lit(""))
+      } else if !g.is_value_type(d.type) {
+        continue                                   # zero is 0: the new object is already zeroed
       } else {
         f.push_desc(d.type, n)
         f.rt("rt_zero", 1)
