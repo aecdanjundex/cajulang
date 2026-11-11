@@ -214,6 +214,8 @@ fn rt_sdata(s: int) -> int {
 fn rt_make_slice(ed: int, n: int, c: int) -> int {
   data := rt_edata(ed, c)
   if rt_esize(ed) == 1 { return rt_hdr(data, n, c) }
+  # numbers, pointers, lists, maps...: the zero value is 0 and the block is already zeroed
+  if !rt_is_value(ed) && rt_zero(ed) == 0 { return rt_hdr(data, n, c) }
   i := 0
   while i < c {
     __store64(data + 8 * i, rt_zero(ed))

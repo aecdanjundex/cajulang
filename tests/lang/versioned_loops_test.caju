@@ -1,0 +1,388 @@
+# In `for j := A; j < B; j++ { ... }` whose statements only store into list elements indexed by
+# base + j (base loop-invariant) or into local variables, the native compiler checks the whole
+# range before the loop and runs a copy without bounds checks, 4 iterations per turn (vloop);
+# when a check fails it runs the normal loop. Everything must behave as the plain loop: the
+# references below are the same loops written with while (never versioned).
+import { describe, it, expect, run_source } from "std/testing"
+import "std/math"
+
+fn axpy(c: []int, b: []int, x: int, y: int, s: int, lo: int, hi: int) {
+  for j := lo; j < hi; j++ { c[x + j] += s * b[y + j] }
+}
+fn axpy_ref(c: []int, b: []int, x: int, y: int, s: int, lo: int, hi: int) {
+  j := lo
+  while j < hi {
+    c[x + j] += s * b[y + j]
+    j++
+  }
+}
+fn faxpy(c: []num, b: []num, x: int, s: num, n: int) {
+  for j := 0; j < n; j++ { c[j] += s * b[x + j] }
+}
+fn faxpy_ref(c: []num, b: []num, x: int, s: num, n: int) {
+  j := 0
+  while j < n {
+    c[j] += s * b[x + j]
+    j++
+  }
+}
+fn ramp(n: int, k: int) -> []int {
+  a := make([]int, n)
+  for i := 0; i < n; i++ { a[i] = i * k - 7 }
+  return a
+}
+fn same(a: []int, b: []int) -> bool {
+  if len(a) != len(b) { return false }
+  i := 0
+  while i < len(a) {
+    if a[i] != b[i] { return false }
+    i++
+  }
+  return true
+}
+fn same_bits(a: []num, b: []num) -> bool {
+  if len(a) != len(b) { return false }
+  i := 0
+  while i < len(a) {
+    if math.bits(a[i]) != math.bits(b[i]) { return false }
+    i++
+  }
+  return true
+}
+# fills a[j - off] = j + 1 for j in [lo, hi); returns how many stores happened before an error
+fn fill(a: []int, off: int, lo: int, hi: int) -> int {
+  defer fn() { recover() }()
+  for j := lo; j < hi; j++ { a[j - off] = j + 1 }
+  return -1
+}
+fn count_set(a: []int) -> int {
+  n := 0
+  i := 0
+  while i < len(a) {
+    if a[i] != 0 { n++ }
+    i++
+  }
+  return n
+}
+
+# element-wise loops (2 elements per instruction when nothing overlaps)
+fn vadd(c: []int, a: []int, b: []int, k: int, n: int) {
+  for j := 0; j < n; j++ { c[j] = (a[j] + b[j] - k) ^ (a[j] | 5) }
+}
+fn vadd_ref(c: []int, a: []int, b: []int, k: int, n: int) {
+  j := 0
+  while j < n {
+    c[j] = (a[j] + b[j] - k) ^ (a[j] | 5)
+    j++
+  }
+}
+fn vacc(c: []int, a: []int, x: int, n: int) {
+  for j := 0; j < n; j++ { c[x + j] += a[j] & 1023 }
+}
+fn vacc_ref(c: []int, a: []int, x: int, n: int) {
+  j := 0
+  while j < n {
+    c[x + j] += a[j] & 1023
+    j++
+  }
+}
+fn vnum(c: []num, a: []num, b: []num, s: num, n: int) {
+  for j := 0; j < n; j++ {
+    c[j] = a[j] * s - b[j] / 3.0
+    c[j] -= a[j] + 0.25
+  }
+}
+fn vnum_ref(c: []num, a: []num, b: []num, s: num, n: int) {
+  j := 0
+  while j < n {
+    c[j] = a[j] * s - b[j] / 3.0
+    c[j] -= a[j] + 0.25
+    j++
+  }
+}
+
+describe("versioned loops", fn() {
+  it("match the plain loop for every start, end and offset", fn() {
+    ok := true
+    lo := -2
+    while lo < 4 {
+      hi := lo - 1
+      while hi < 14 {
+        x := 0
+        while x < 5 {
+          c1 := ramp(16, 3)
+          c2 := ramp(16, 3)
+          b := ramp(20, 5)
+          y := 4 - x
+          if lo + x >= 0 && hi + x <= 16 && lo + y >= 0 && hi + y <= 20 {
+            axpy(c1, b, x, y, 9, lo, hi)
+            axpy_ref(c2, b, x, y, 9, lo, hi)
+          }
+          if !same(c1, c2) { ok = false }
+          x++
+        }
+        hi++
+      }
+      lo++
+    }
+    expect(ok).to_be_true()
+  })
+  it("give the sequential result when source and destination overlap", fn() {
+    ok := true
+    for d := -3; d <= 3; d++ {
+      for n := 0; n < 11; n++ {
+        a1 := ramp(20, 7)
+        a2 := ramp(20, 7)
+        axpy(a1, a1, 4, 4 + d, 3, 0, n)
+        axpy_ref(a2, a2, 4, 4 + d, 3, 0, n)
+        if !same(a1, a2) { ok = false }
+      }
+    }
+    expect(ok).to_be_true()
+    a := []int{1, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    for j := 0; j < 9; j++ { a[j + 1] = a[j] * 2 + 1 }
+    expect(a).to_equal([]int{1, 3, 7, 15, 31, 63, 127, 255, 511, 1023})
+  })
+  it("stop at the same element with the same error", fn() {
+    r := run_source("a := make([]int, 10)\nfor j := 0; j < 12; j++ {\n  a[j] = j + 1\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 3: Index 10 out of range (length 10).")
+    r2 := run_source("a := make([]int, 10)\nb := make([]int, 7)\nfor j := 0; j < 10; j++ {\n  a[j] += 2 * b[j]\n}\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 4: Index 7 out of range (length 7).")
+    r3 := run_source("let a: []int\nfor j := 0; j < 3; j++ {\n  a[j] = 1\n}\n")
+    expect(r3.code).not_().to_equal(0)
+    a := make([]int, 10)
+    expect(fill(a, 0, 0, 13)).to_equal(0)
+    expect(count_set(a)).to_equal(10)
+    expect(a[9]).to_equal(10)
+    b := make([]int, 10)
+    fill(b, 0, 7, 13)
+    expect(count_set(b)).to_equal(3)
+  })
+  it("check negative indexes", fn() {
+    a := make([]int, 8)
+    fill(a, 2, 0, 6)
+    expect(count_set(a)).to_equal(0)
+    fill(a, 2, 2, 10)
+    expect(a).to_equal([]int{3, 4, 5, 6, 7, 8, 9, 10})
+    r := run_source("a := make([]int, 8)\nk := 3\nfor j := 1; j < 6; j++ {\n  a[j - k] = j\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 4: Index -2 out of range (length 8).")
+  })
+  it("report an index that wraps around", fn() {
+    big := (1 << 62) + ((1 << 62) - 1)
+    r := run_source("a := make([]int, 8)\nbig := (1 << 62) + ((1 << 62) - 1)\nfor j := 0; j < 3; j++ {\n  a[big + j] = 1\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 4: Index 9223372036854775807 out of range (length 8).")
+    r2 := run_source("a := make([]int, 8)\nbig := (1 << 62) + ((1 << 62) - 1)\nfor j := 1; j < 3; j++ {\n  a[big + j] = 1\n}\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 4: Index -9223372036854775808 out of range (length 8).")
+    # the end near the largest int: no overflow in the unrolled turns
+    a := make([]int, 8)
+    n := 0
+    for j := big - 5; j < big; j++ { a[j - (big - 5)] += 1 }
+    for j := big - 5; j < big; j++ { n++ }
+    expect(a).to_equal([]int{1, 1, 1, 1, 1, 0, 0, 0})
+    expect(n).to_equal(5)
+  })
+  it("wrap integer products at 64 bits", fn() {
+    c1 := make([]int, 9)
+    c2 := make([]int, 9)
+    b := []int{1 << 62, -(1 << 61), 3037000500, -3037000500, 1 << 40, 7, -1, 1 << 63, 123456789123}
+    s := (0x55555555 << 32) | 0x55555555
+    axpy(c1, b, 0, 0, s, 0, 9)
+    axpy_ref(c2, b, 0, 0, s, 0, 9)
+    expect(same(c1, c2)).to_be_true()
+    d := make([]int, 9)
+    for j := 0; j < 9; j++ { d[j] = b[j] * b[j] - b[j] * 3 }
+    j := 0
+    while j < 9 {
+      expect(d[j]).to_equal(b[j] * b[j] - b[j] * 3)
+      j++
+    }
+  })
+  it("keep NaN, infinities and signed zeros as the plain loop", fn() {
+    b := []num{math.nan(), math.inf(), -math.inf(), -0.0, 0.0, 1.5, -2.25, 1e308, 3.0, 4.0, 5.0}
+    for _, s := range []num{2.0, -0.0, math.inf(), math.nan(), 1e300} {
+      c1 := []num{1.0, -0.0, 0.0, math.inf(), 2.0, -3.0, 1e308, 5.0, 6.0, 7.0}
+      c2 := []num{1.0, -0.0, 0.0, math.inf(), 2.0, -3.0, 1e308, 5.0, 6.0, 7.0}
+      faxpy(c1, b, 1, s, 10)
+      faxpy_ref(c2, b, 1, s, 10)
+      expect(same_bits(c1, c2)).to_be_true()
+    }
+    x := make([]num, 7)
+    y := []num{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}
+    for j := 0; j < 7; j++ { x[j] = y[j] * 0.5 - y[j] / 4.0 + 1.0 }
+    expect(x).to_equal([]num{1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75})
+  })
+  it("leave the loop variable where the plain loop leaves it", fn() {
+    a := make([]int, 10)
+    j := 0
+    for j = 3; j < 9; j++ { a[j] = j }
+    expect(j).to_equal(9)
+    for j = 7; j < 2; j++ { a[j] = 100 }
+    expect(j).to_equal(7)
+    k := 0
+    for k = 0; k < len(a); k++ { a[k] += k }
+    expect(k).to_equal(10)
+    expect(a).to_equal([]int{0, 1, 2, 6, 8, 10, 12, 14, 16, 9})
+  })
+  it("run empty ranges", fn() {
+    a := make([]int, 4)
+    n := 0
+    for j := 0; j < n; j++ { a[j] = 1 }
+    for j := 5; j < 2; j++ { a[j] = 1 }
+    for j := -3; j < -3; j++ { a[j] = 1 }
+    let e: []int
+    for j := 0; j < len(e); j++ { e[j] = 1 }
+    expect(a).to_equal([]int{0, 0, 0, 0})
+  })
+  it("reduce into variables", fn() {
+    a := ramp(37, 3)
+    b := ramp(37, -2)
+    s := 0
+    m := 1
+    for j := 0; j < len(a); j++ {
+      s += a[j] * b[j]
+      m *= a[j] | 1
+    }
+    s2 := 0
+    m2 := 1
+    i := 0
+    while i < len(a) {
+      s2 += a[i] * b[i]
+      m2 *= a[i] | 1
+      i++
+    }
+    expect(s).to_equal(s2)
+    expect(m).to_equal(m2)
+    x := []num{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7}
+    f := 0.0
+    for j := 0; j < 7; j++ { f += x[j] * x[j] }
+    g := 0.0
+    i = 0
+    while i < 7 {
+      g += x[i] * x[i]
+      i++
+    }
+    expect(math.bits(f)).to_equal(math.bits(g))
+  })
+  it("use the loop variable as a value", fn() {
+    a := make([]int, 11)
+    for j := 0; j < 11; j++ { a[j] = j * j - 3 * j + 1 }
+    expect(a).to_equal([]int{1, -1, -1, 1, 5, 11, 19, 29, 41, 55, 71})
+  })
+  it("run loops that break or continue", fn() {
+    a := make([]int, 10)
+    for j := 0; j < 10; j++ {
+      if j == 7 { break }
+      if j % 2 == 0 { continue }
+      a[j] = j
+    }
+    expect(a).to_equal([]int{0, 1, 0, 3, 0, 5, 0, 0, 0, 0})
+  })
+  it("multiply matrices in nested loops", fn() {
+    n := 7
+    a := ramp(n * n, 3)
+    b := ramp(n * n, 5)
+    c := make([]int, n * n)
+    for i := 0; i < n; i++ {
+      for k := 0; k < n; k++ {
+        aik := a[i * n + k]
+        for j := 0; j < n; j++ { c[i * n + j] += aik * b[k * n + j] }
+      }
+    }
+    d := make([]int, n * n)
+    i := 0
+    while i < n {
+      k := 0
+      while k < n {
+        j := 0
+        while j < n {
+          d[i * n + j] += a[i * n + k] * b[k * n + j]
+          j++
+        }
+        k++
+      }
+      i++
+    }
+    expect(same(c, d)).to_be_true()
+  })
+  it("use many lists at once", fn() {
+    a := ramp(12, 1)
+    b := ramp(12, 2)
+    c := ramp(12, 3)
+    d := ramp(12, 4)
+    e := ramp(12, 5)
+    f := ramp(12, 6)
+    g := make([]int, 12)
+    h := make([]int, 12)
+    for j := 0; j < 10; j++ {
+      g[j] = a[j] + b[j + 1] * c[j + 2] - d[j] + (e[j + 1] ^ f[j]) * 3
+      h[j + 2] = g[j] - a[j + 2]
+    }
+    i := 0
+    while i < 10 {
+      expect(g[i]).to_equal(a[i] + b[i + 1] * c[i + 2] - d[i] + (e[i + 1] ^ f[i]) * 3)
+      expect(h[i + 2]).to_equal(g[i] - a[i + 2])
+      i++
+    }
+  })
+  it("run element-wise loops of every length", fn() {
+    ok := true
+    for n := 0; n < 12; n++ {
+      a := ramp(12, 5)
+      b := ramp(12, -3)
+      c1 := ramp(12, 1)
+      c2 := ramp(12, 1)
+      vadd(c1, a, b, 9, n)
+      vadd_ref(c2, a, b, 9, n)
+      if !same(c1, c2) { ok = false }
+      x := make([]num, 12)
+      y := make([]num, 12)
+      fa := []num{1.5, -2.0, math.nan(), math.inf(), -0.0, 3.25, 1e300, -1e300, 7.0, 0.1, 0.2, 0.3}
+      fb := []num{0.5, 2.0, 1.0, -math.inf(), 0.0, math.nan(), 1e300, 3.0, -7.0, 0.3, 0.2, 0.1}
+      vnum(x, fa, fb, -1.75, n)
+      vnum_ref(y, fa, fb, -1.75, n)
+      if !same_bits(x, y) { ok = false }
+    }
+    expect(ok).to_be_true()
+  })
+  it("give the sequential result when an element-wise loop overlaps itself", fn() {
+    ok := true
+    for x := -3; x <= 3; x++ {
+      for n := 0; n < 13; n++ {
+        a1 := ramp(24, 7)
+        a2 := ramp(24, 7)
+        vacc(a1[4:], a1[4 + x:], 0, n)
+        vacc_ref(a2[4:], a2[4 + x:], 0, n)
+        if !same(a1, a2) { ok = false }
+        b1 := ramp(24, 3)
+        b2 := ramp(24, 3)
+        vacc(b1, b1, x + 4, n)
+        vacc_ref(b2, b2, x + 4, n)
+        if !same(b1, b2) { ok = false }
+        c1 := ramp(24, 3)
+        c2 := ramp(24, 3)
+        vadd(c1[4:], c1[4 + x:], c1[3:], 1, n)
+        vadd_ref(c2[4:], c2[4 + x:], c2[3:], 1, n)
+        if !same(c1, c2) { ok = false }
+      }
+    }
+    expect(ok).to_be_true()
+  })
+  it("compute divisions by constants, bounds given by expressions and num products", fn() {
+    n := 6
+    a := make([]int, n * n)
+    for j := 0; j < n * n; j++ { a[j] = (j * 7 - 50) % 9 }
+    q := make([]int, n * n)
+    for j := 0; j < n * n - 1; j++ { q[j + 1] = (a[j] - 3) / 4 }
+    i := 0
+    while i < n * n {
+      expect(a[i]).to_equal((i * 7 - 50) % 9)
+      if i > 0 { expect(q[i]).to_equal((a[i - 1] - 3) / 4) }
+      i++
+    }
+    r := run_source("a := make([]int, 5)\nn := 3\nfor j := 0; j < n * n; j++ {\n  a[j] = j % 4\n}\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 4: Index 5 out of range (length 5).")
+    x := []num{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}
+    for j := 0; j < 7; j++ { x[j] *= x[6 - j] - 0.5 }
+    expect(x).to_equal([]num{6.5, 11.0, 13.5, 14.0, 65.0, 63.0, 42.0})
+  })
+})

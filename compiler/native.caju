@@ -5714,7 +5714,18 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     if f.vdepth == 0 { hoist = f.hoist_plan(n, covered) }
     if len(hoist) == 0 {
       added := f.enter_scache(ls)
-      f.for_c(n, f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body})))   # i++ itself does not count
+      ls2 := scan_loop(f.g, []*ast.Node{n.cond, n.body})                   # i++ itself does not count
+      vp := f.vloop_plan(n, ls2)
+      vdone := ""
+      if vp != nil {
+        # a copy without checks first (vloop); the normal loop when its checks fail
+        slow := A.label()
+        vdone = A.label()
+        f.vloop_emit(vp, slow, vdone)
+        A.bind(slow)
+      }
+      f.for_c(n, f.counted_loop(n, ls2))
+      if vdone != "" { A.bind(vdone) }
       f.exit_scache(added)
       return
     }
@@ -5901,6 +5912,1011 @@ fn (f: *Fn) stmt(n: *ast.Node) {
   nfail(n.kind + " is not supported yet", n)
 }
 # for i = a to b: hidden counter, end and step (+1 or -1), like the VM
+# ---- versioned counted loops (vloop) ----
+# for j := A; j < B; j++ { stmts } where each statement stores into a list element or a local
+# variable, every list index is base + j (base loop-invariant) and nothing can fail nor call:
+# before the loop, one check per (list, base) group proves that every index of the whole run is
+# in range; then a copy of the loop runs without checks, with the address of each group's
+# element 0 in a register (data + base*8), 4 iterations per turn. When a check fails (or the
+# range is empty) the normal loop runs instead: the same errors at the same iteration, after the
+# same effects. The statements run in order, so lists that overlap give the sequential result.
+
+struct VGroup {
+  c: *SCache
+  base: []*ast.Node        # the invariant terms of the index (added; neg: subtracted)
+  neg: []bool
+  key: str
+  reg: int                 # in the fast loop: data + base*8
+}
+struct VSum {
+  terms: []*ast.Node
+  neg: []bool
+  js: int
+  ok: bool
+}
+struct VPlan {
+  j: str
+  jv: *Var
+  jr: int                  # the register of j in the fast loop
+  lim: *ast.Node           # B: an int literal, a variable or len(list)
+  lim_c: *SCache
+  lim_h: *Var              # B as an invariant expression: computed once into this slot
+  lim_e: bool
+  groups: []*VGroup
+  accs: []*ast.Node        # the Index nodes and their group
+  acc_g: []int
+  stmts: []*ast.Node
+  refs: []int              # registers of the variables the fast loop uses
+  ls: *LoopScan
+  sc: []int                # integer scratch registers
+  nsc: int                 # integer registers the statements need
+  nx: int                  # XMM registers the statements need
+  lim4: *Var               # B - 3 (the unrolled turns run while j < B - 3)
+  bregs: []int             # registers borrowed by the fast loop (saved and restored)
+  simd: bool               # the fast loop also has a version with 2 elements per instruction
+  bc_keys: []str           # SIMD: invariant operands, broadcast to both halves of an XMM
+  bc_nodes: []*ast.Node
+  bc_x: []int
+  bc_num: []bool
+  vx: int                  # SIMD: XMM registers the statements need
+  boffs: []int
+}
+
+fn imax(a: int, b: int) -> int {
+  if a > b { return a }
+  return b
+}
+# an integer kind whose operations wrap at 64 bits
+fn v_int_t(t: str) -> bool {
+  k, ok := kind_code_of(types.dflt(t))
+  return ok && k <= 9 && !needs_wrap(k)
+}
+fn vkey(n: *ast.Node) -> str {
+  switch n.kind {
+  case "Var": return n.name
+  case "Number":
+    if n.raw != "" { return n.raw }
+    return str(int(n.num_value))
+  case "Paren": return vkey(n.expr)
+  case "Neg": return "-(" + vkey(n.arg) + ")"
+  case "Binary": return "(" + vkey(n.left) + n.op + vkey(n.right) + ")"
+  }
+  return "?"
+}
+fn has_reg(xs: []int, r: int) -> bool {
+  for _, x := range xs { if x == r { return true } }
+  return false
+}
+fn (p: *VPlan) ref(r: int) { if r != 0 { p.refs = append(p.refs, r) } }
+fn (p: *VPlan) group_of(ix: *ast.Node) -> *VGroup {
+  for i, a := range p.accs { if a == ix { return p.groups[p.acc_g[i]] } }
+  return nil
+}
+# a plain variable the fast loop reads
+fn (f: *Fn) v_var(p: *VPlan, e: *ast.Node) -> *Var {
+  if e.kind != "Var" || e.fn_ref || e.name == "_" { return nil }
+  v := f.lookup(e.name, e)
+  p.ref(v.reg)
+  return v
+}
+# a loop-invariant integer expression that cannot fail: computed once before the loop
+fn (f: *Fn) v_inv(p: *VPlan, e: *ast.Node) -> bool {
+  if !v_int_t(e.ty) { return false }
+  switch e.kind {
+  case "Number": return e.int
+  case "Var":
+    if e.name == p.j || p.ls.assigned[e.name] { return false }
+    v := f.v_var(p, e)
+    return v != nil && v_int_t(v.t) && v.xr == 0
+  case "Paren": return f.v_inv(p, e.expr)
+  case "Neg": return f.v_inv(p, e.arg)
+  case "Binary":
+    if !(e.op == "+" || e.op == "-" || e.op == "*" || e.op == "&" || e.op == "|" || e.op == "^") { return false }
+    return f.v_inv(p, e.left) && f.v_inv(p, e.right)
+  }
+  return false
+}
+# an index as a sum of terms: j once (added), the others invariant
+fn (f: *Fn) v_flat(p: *VPlan, e: *ast.Node, neg: bool, s: *VSum) {
+  if e.kind == "Paren" {
+    f.v_flat(p, e.expr, neg, s)
+    return
+  }
+  if e.kind == "Var" && e.name == p.j {
+    if neg { s.ok = false }
+    s.js++
+    return
+  }
+  if e.kind == "Binary" && (e.op == "+" || e.op == "-") && v_int_t(e.ty) && v_int_t(e.left.ty) && v_int_t(e.right.ty) {
+    f.v_flat(p, e.left, neg, s)
+    f.v_flat(p, e.right, neg != (e.op == "-"), s)
+    return
+  }
+  if !f.v_inv(p, e) {
+    s.ok = false
+    return
+  }
+  s.terms = append(s.terms, e)
+  s.neg = append(s.neg, neg)
+}
+# a[base + j] of a cached list of 8-byte elements: records the access in its group
+fn (f: *Fn) v_access(p: *VPlan, ix: *ast.Node) -> bool {
+  if ix.obj.kind != "Var" || types.dflt(ix.index.ty) != "int" { return false }
+  ot := types.dflt(ix.obj.ty)
+  if ot != strip_ptr(ot) || f.g.kind_of_t(ot) != "slice" || f.g.byte_elems(ot) { return false }
+  c := f.cached_list(ix.obj)
+  if c == nil { return false }
+  s := &VSum{terms: []*ast.Node{}, neg: []bool{}, js: 0, ok: true}
+  f.v_flat(p, ix.index, false, s)
+  if !s.ok || s.js != 1 { return false }
+  key := ix.obj.name + "|"
+  for i, t := range s.terms {
+    if s.neg[i] { key = key + "-" } else { key = key + "+" }
+    key = key + vkey(t)
+  }
+  gi := -1
+  for i, gr := range p.groups { if gr.key == key { gi = i } }
+  if gi < 0 {
+    gi = len(p.groups)
+    p.groups = append(p.groups, &VGroup{c: c, base: s.terms, neg: s.neg, key: key, reg: 0})
+  }
+  p.accs = append(p.accs, ix)
+  p.acc_g = append(p.acc_g, gi)
+  return true
+}
+# an integer expression of the fast loop
+fn (f: *Fn) v_iexpr(p: *VPlan, e: *ast.Node) -> bool {
+  if !v_int_t(e.ty) { return false }
+  switch e.kind {
+  case "Number": return e.int
+  case "Var":
+    v := f.v_var(p, e)
+    return v != nil && v_int_t(v.t) && v.xr == 0
+  case "Paren": return f.v_iexpr(p, e.expr)
+  case "Neg": return f.v_iexpr(p, e.arg)
+  case "Index": return f.v_access(p, e)
+  case "Binary":
+    if !(e.op == "+" || e.op == "-" || e.op == "*" || e.op == "&" || e.op == "|" || e.op == "^") { return false }
+    return f.v_iexpr(p, e.left) && f.v_iexpr(p, e.right)
+  }
+  return false
+}
+# x / c or x % c (c a constant other than 0): only as the whole value of a statement, computed
+# in RAX (const_div uses RAX, RCX and RDX)
+fn (f: *Fn) v_cdiv(p: *VPlan, e: *ast.Node) -> bool {
+  if e.kind != "Binary" || (e.op != "/" && e.op != "%") || !v_int_t(e.ty) || e.ik == ast.NONE || e.ik > 9 || needs_wrap(e.ik) { return false }
+  _, ok := f.const_divisor(e.right, e.ik)
+  return ok && f.v_iexpr(p, e.left)
+}
+fn v_comm(op: str) -> bool { return op == "+" || op == "*" || op == "&" || op == "|" || op == "^" }
+# an integer operand used in place by an instruction (u: the unrolled copy; j + u needs code)
+fn (f: *Fn) v_idirect(p: *VPlan, e: *ast.Node, u: int) -> bool {
+  if e.kind == "Paren" { return f.v_idirect(p, e.expr, u) }
+  _, is_imm := f.imm32(e)
+  if is_imm || e.kind == "Index" { return true }
+  if e.kind == "Var" {
+    if e.name == p.j { return u == 0 }
+    v := f.lookup(e.name, e)
+    return !v.celled && v.cap < 0
+  }
+  return false
+}
+# the registers an integer expression needs (any copy u)
+fn (f: *Fn) v_ineed(p: *VPlan, e: *ast.Node) -> int {
+  if e.kind == "Paren" { return f.v_ineed(p, e.expr) }
+  if e.kind == "Binary" && (e.op == "/" || e.op == "%") { return imax(3, f.v_ineed(p, e.left)) }
+  if e.kind == "Neg" { return f.v_ineed(p, e.arg) }
+  if e.kind != "Binary" { return 1 }
+  l := f.v_ineed(p, e.left)
+  r := f.v_ineed(p, e.right)
+  if f.v_idirect(p, e.right, 1) { r = 0 }
+  if l == r { return l + 1 }
+  return imax(l, r)
+}
+# a num expression of the fast loop: num variables, elements and constants with + - *, and / by
+# a constant other than 0 (nothing can fail)
+fn (f: *Fn) v_fexpr(p: *VPlan, e: *ast.Node) -> bool {
+  if e.kind == "Number" {
+    _, ok := f.fconst_of(e)
+    return ok
+  }
+  if types.dflt(e.ty) != "num" { return false }
+  switch e.kind {
+  case "Var":
+    v := f.v_var(p, e)
+    return v != nil && types.dflt(v.t) == "num"
+  case "Paren": return f.v_fexpr(p, e.expr)
+  case "Index": return f.v_access(p, e)
+  case "Binary":
+    if !f.is_fbin(e) { return false }
+    if e.op == "/" {
+      c, is_c := f.fconst_of(e.right)
+      if !is_c || (c << 1) == 0 { return false }
+    }
+    return f.v_fexpr(p, e.left) && f.v_fexpr(p, e.right)
+  }
+  return false
+}
+fn (f: *Fn) v_fdirect(e: *ast.Node) -> bool {
+  if e.kind == "Paren" { return f.v_fdirect(e.expr) }
+  _, is_c := f.fconst_of(e)
+  return is_c || e.kind == "Index" || f.xreg_of(e) >= 0 || f.fslot_of(e) != 0
+}
+# the XMM registers a num expression needs (left first into x, right into x+1)
+fn (f: *Fn) v_fneed(e: *ast.Node) -> int {
+  if e.kind == "Paren" { return f.v_fneed(e.expr) }
+  if e.kind != "Binary" { return 1 }
+  l := f.v_fneed(e.left)
+  if f.v_fdirect(e.right) { return l }
+  return imax(l, f.v_fneed(e.right) + 1)
+}
+# the variable a statement of the fast loop assigns: a local only this code can change
+fn (f: *Fn) v_target(p: *VPlan, name: str) -> *Var {
+  if name == p.j || name == "_" { return nil }
+  v, ok := f.locals[name]
+  if !ok || v.celled || v.cap >= 0 || v.sym != "" { return nil }
+  if _, captured := f.caps[name]; captured { return nil }
+  p.ref(v.reg)
+  return v
+}
+fn (f: *Fn) v_is_num(s: *ast.Node) -> bool {
+  switch s.kind {
+  case "MultiAssign": return types.dflt(s.targets[0].ty) == "num"
+  case "OpAssign": return types.dflt(s.target.ty) == "num"
+  case "Assign": return types.dflt(f.lookup(s.name, s).t) == "num"
+  }
+  return false
+}
+fn (f: *Fn) v_stmt(p: *VPlan, s: *ast.Node) -> bool {
+  switch s.kind {
+  case "MultiAssign":
+    if len(s.targets) != 1 || len(s.values) != 1 || s.targets[0].kind != "Index" { return false }
+    t := s.targets[0]
+    v := s.values[0]
+    if types.dflt(t.ty) == "num" {
+      if !f.v_access(p, t) || !f.v_fexpr(p, v) { return false }
+      p.nx = imax(p.nx, f.v_fneed(v))
+      return true
+    }
+    if !v_int_t(t.ty) || !f.v_access(p, t) || !(f.v_iexpr(p, v) || f.v_cdiv(p, v)) { return false }
+    p.nsc = imax(p.nsc, f.v_ineed(p, v))
+    return true
+  case "OpAssign":
+    t := s.target
+    if t.kind != "Index" && t.kind != "Var" { return false }
+    if types.dflt(t.ty) == "num" {
+      if s.fk != ast.NONE || s.ik != ast.NONE || !(s.op == "+" || s.op == "-" || s.op == "*") { return false }
+      if t.kind == "Index" {
+        if !f.v_access(p, t) { return false }
+      } else {
+        tv := f.v_target(p, t.name)
+        if tv == nil || types.dflt(tv.t) != "num" || tv.reg != 0 { return false }
+      }
+      if !f.v_fexpr(p, s.value) { return false }
+      p.nx = imax(p.nx, f.v_fneed(s.value) + 1)
+      return true
+    }
+    if !v_int_t(t.ty) || (alu_code_mr(s.op) < 0 && s.op != "*") { return false }
+    if s.ik == ast.NONE || s.ik > 9 || needs_wrap(s.ik) { return false }
+    if t.kind == "Index" {
+      if !f.v_access(p, t) { return false }
+    } else {
+      tv := f.v_target(p, t.name)
+      if tv == nil || !v_int_t(tv.t) || tv.xr != 0 { return false }
+    }
+    if !(f.v_iexpr(p, s.value) || s.op != "*" && f.v_cdiv(p, s.value)) { return false }
+    p.nsc = imax(p.nsc, f.v_ineed(p, s.value))
+    return true
+  case "Assign":
+    if s.decl != "" { return false }
+    tv := f.v_target(p, s.name)
+    if tv == nil { return false }
+    if types.dflt(tv.t) == "num" {
+      if tv.reg != 0 || !f.v_fexpr(p, s.value) { return false }
+      p.nx = imax(p.nx, f.v_fneed(s.value))
+      return true
+    }
+    if !v_int_t(tv.t) || tv.xr != 0 || !(f.v_iexpr(p, s.value) || f.v_cdiv(p, s.value)) { return false }
+    p.nsc = imax(p.nsc, f.v_ineed(p, s.value))
+    return true
+  }
+  return false
+}
+
+# the plan of a versioned loop for this ForC (ls: its condition and body), or nil
+fn (f: *Fn) vloop_plan(n: *ast.Node, ls: *LoopScan) -> *VPlan {
+  if f.u.is_runtime || n.cond == nil || n.post == nil || n.body == nil || n.body.kind != "Block" || len(n.body.stmts) == 0 { return nil }
+  c := n.cond
+  if c.kind != "Binary" || c.op != "<" || c.left.kind != "Var" || types.dflt(c.left.ty) != "int" { return nil }
+  j := c.left.name
+  jv, has := f.locals[j]
+  if !has || types.dflt(jv.t) != "int" || jv.celled || jv.cap >= 0 || jv.sym != "" || jv.xr != 0 { return nil }
+  if _, captured := f.caps[j]; captured { return nil }
+  pp := n.post
+  if pp.kind != "OpAssign" || pp.op != "+" || pp.target.kind != "Var" || pp.target.name != j { return nil }
+  one, ok1 := int_lit(pp.value)
+  if !ok1 || one != 1 || ls.assigned[j] { return nil }
+  p := &VPlan{j: j, jv: jv, jr: jv.reg, lim: c.right, lim_c: nil, lim_h: nil, lim_e: false, groups: []*VGroup{}, accs: []*ast.Node{}, acc_g: []int{}, stmts: n.body.stmts,
+    refs: []int{}, ls: ls, sc: []int{}, nsc: 1, nx: 0, lim4: nil, bregs: []int{}, boffs: []int{},
+    simd: false, bc_keys: []str{}, bc_nodes: []*ast.Node{}, bc_x: []int{}, bc_num: []bool{}, vx: 0}
+  p.ref(jv.reg)
+  r := c.right
+  if r.kind == "Call" && r.call_kind == "builtin" && r.name == "len" && len(r.args) == 1 && r.args[0].kind == "Var" {
+    a := r.args[0]
+    ot := types.dflt(a.ty)
+    if ot != strip_ptr(ot) || f.g.kind_of_t(ot) != "slice" { return nil }
+    p.lim_c = f.cached_list(a)
+    if p.lim_c == nil { return nil }
+    p.ref(p.lim_c.len.reg)
+  } else {
+    _, is_imm := f.imm32(r)
+    if !is_imm && r.kind == "Var" {
+      if r.name == j || ls.assigned[r.name] || types.dflt(r.ty) != "int" { return nil }
+      v := f.v_var(p, r)
+      if v == nil || v.celled || v.cap >= 0 || v.xr != 0 { return nil }
+    } else if !is_imm {
+      # (it cannot fail nor change: computing it once is the same as at every turn)
+      if types.dflt(r.ty) != "int" || !f.v_inv(p, r) { return nil }
+      p.lim_e = true
+    }
+  }
+  for _, s := range n.body.stmts { if !f.v_stmt(p, s) { return nil } }
+  if len(p.groups) == 0 || p.nx > f.xtop + 1 { return nil }
+  # registers: the free caller-saved ones, then the ones of variables and lists the fast loop
+  # does not use (borrowed: saved in their slots before it and restored after)
+  pool := []int{}
+  poff := []int{}
+  for _, r2 := range EXTRA_REGS {
+    if !has_reg(f.a.sv_regs, r2) {
+      pool = append(pool, r2)
+      poff = append(poff, 0)
+    }
+  }
+  nfree := len(pool)
+  for i, r2 := range f.a.sv_regs {
+    if !has_reg(p.refs, r2) {
+      pool = append(pool, r2)
+      poff = append(poff, f.a.sv_offs[i])
+    }
+  }
+  for _, r2 := range SAVED_REGS {
+    if has_reg(p.refs, r2) { continue }
+    for _, v := range f.locals {
+      if v.reg == r2 && v.sym == "" {
+        pool = append(pool, r2)
+        poff = append(poff, v.off)
+        break
+      }
+    }
+  }
+  need := len(p.groups)
+  if p.jr == 0 { need++ }
+  if need > len(pool) { return nil }
+  k := 0
+  for k < need {
+    if poff[k] != 0 {
+      p.bregs = append(p.bregs, pool[k])
+      p.boffs = append(p.boffs, poff[k])
+    }
+    k++
+  }
+  k = 0
+  if p.jr == 0 {
+    p.jr = pool[0]
+    k = 1
+  }
+  for _, gr := range p.groups {
+    gr.reg = pool[k]
+    k++
+  }
+  p.sc = []int{RAX, RCX, RDX}
+  while k < nfree {
+    p.sc = append(p.sc, pool[k])
+    k++
+  }
+  if p.nsc > len(p.sc) { return nil }
+  f.v_simd_plan(p)
+  return p
+}
+
+# op reg, [base + index*8 + disp] (pre: a 66/F2/F3 prefix or 0; w: REX.W)
+fn (f: *Fn) sibd(op: int, reg: int, base: int, index: int, disp: int, w: int, pre: int) {
+  A := f.a
+  if pre != 0 { A.byte(pre) }
+  rx := 0x40 | (w << 3) | (((reg >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1)
+  if rx != 0x40 { A.byte(rx) }
+  if op > 255 { A.byte(op >> 8) }
+  A.byte(op & 255)
+  sib := 0xC0 | ((index & 7) << 3) | (base & 7)
+  if disp == 0 && (base & 7) != 5 {
+    A.byte2(0x04 | ((reg & 7) << 3), sib)
+    return
+  }
+  if disp >= -128 && disp <= 127 {
+    A.byte3(0x44 | ((reg & 7) << 3), sib, disp & 255)
+    return
+  }
+  A.byte2(0x84 | ((reg & 7) << 3), sib)
+  A.d32(disp)
+}
+# the element of an access in the fast loop, copy u: [group + j*8 + 8u]
+fn (f: *Fn) v_mem(op: int, reg: int, p: *VPlan, ix: *ast.Node, u: int, w: int, pre: int) {
+  f.sibd(op, reg, p.group_of(ix).reg, p.jr, 8 * u, w, pre)
+}
+# B in register r / cmp r, B
+fn (f: *Fn) v_lim_to(p: *VPlan, r: int) {
+  if p.lim_h != nil {
+    f.load_slot_r(p.lim_h, r)
+    return
+  }
+  if p.lim_c != nil {
+    f.load_slot_r(p.lim_c.len, r)
+    return
+  }
+  f.simple_to(p.lim, r)
+}
+fn (f: *Fn) v_cmp_lim(p: *VPlan, r: int) {
+  if p.lim_h != nil {
+    f.slot_op(0x3B, r, p.lim_h)
+    return
+  }
+  if p.lim_c != nil {
+    f.slot_op(0x3B, r, p.lim_c.len)
+    return
+  }
+  imm, is_imm := f.imm32(p.lim)
+  if is_imm {
+    f.a.cmp_imm(r, imm)
+    return
+  }
+  f.slot_op(0x3B, r, f.lookup(p.lim.name, p.lim))
+}
+# RAX = the invariant part of a group's index
+fn (f: *Fn) v_base(gr: *VGroup) {
+  A := f.a
+  if len(gr.base) == 0 {
+    A.rr32(0x31, RAX, RAX)
+    return
+  }
+  for i, t := range gr.base {
+    if i == 0 {
+      f.expr(t)
+      if gr.neg[0] { A.unary(3, RAX) }
+      continue
+    }
+    A.push(RAX)
+    f.expr(t)
+    A.mov(RCX, RAX)
+    A.pop(RAX)
+    if gr.neg[i] { A.alu("sub", RAX, RCX) } else { A.alu("add", RAX, RCX) }
+  }
+}
+# d op= operand e (v_idirect)
+fn (f: *Fn) v_iop_direct(p: *VPlan, op: str, d: int, e: *ast.Node, u: int) {
+  A := f.a
+  if e.kind == "Paren" {
+    f.v_iop_direct(p, op, d, e.expr, u)
+    return
+  }
+  code, ext := alu_code(op)
+  imm, is_imm := f.imm32(e)
+  if is_imm {
+    if op == "*" { A.imul_imm(d, d, imm) } else { A.alu_imm(ext, d, imm) }
+    return
+  }
+  if e.kind == "Index" {
+    f.v_mem(code, d, p, e, u, 1, 0)
+    return
+  }
+  if e.name == p.j {
+    A.rr(code, d, p.jr)
+    return
+  }
+  v := f.lookup(e.name, e)
+  if v.reg != 0 {
+    A.rr(code, d, v.reg)
+    return
+  }
+  if v.sym != "" { A.rip(code, d, v.sym) } else { A.rmx(code, d, RBP, v.off, 1, 0) }
+}
+# register d = e (sc: the other registers it may use)
+fn (f: *Fn) v_iemit(p: *VPlan, e: *ast.Node, d: int, sc: []int, u: int) {
+  A := f.a
+  switch e.kind {
+  case "Paren":
+    f.v_iemit(p, e.expr, d, sc, u)
+    return
+  case "Neg":
+    f.v_iemit(p, e.arg, d, sc, u)
+    A.unary(3, d)
+    return
+  case "Binary":
+    if e.op == "/" || e.op == "%" {
+      # (v_cdiv: the whole value, d is RAX and RCX, RDX are free)
+      f.v_iemit(p, e.left, RAX, sc, u)
+      dv, _ := f.const_divisor(e.right, e.ik)
+      f.const_div(e.op, e.ik, dv)
+      return
+    }
+    if f.v_idirect(p, e.right, u) {
+      f.v_iemit(p, e.left, d, sc, u)
+      f.v_iop_direct(p, e.op, d, e.right, u)
+      return
+    }
+    if v_comm(e.op) && f.v_idirect(p, e.left, u) {
+      # (the operation is exact and the operands cannot change: the order does not matter)
+      f.v_iemit(p, e.right, d, sc, u)
+      f.v_iop_direct(p, e.op, d, e.left, u)
+      return
+    }
+    code, _ := alu_code(e.op)
+    t := sc[0]
+    if f.v_ineed(p, e.left) >= f.v_ineed(p, e.right) {
+      f.v_iemit(p, e.left, d, sc, u)
+      f.v_iemit(p, e.right, t, sc[1:], u)
+    } else {
+      rest := []int{d}
+      for _, x := range sc[1:] { rest = append(rest, x) }
+      f.v_iemit(p, e.right, t, rest, u)
+      f.v_iemit(p, e.left, d, sc[1:], u)
+    }
+    A.rr(code, d, t)
+    return
+  case "Index":
+    f.v_mem(0x8B, d, p, e, u, 1, 0)
+    return
+  case "Var":
+    if e.name == p.j {
+      if u == 0 { A.mov(d, p.jr) } else { A.rmx(0x8D, d, p.jr, u, 1, 0) }
+      return
+    }
+  }
+  f.simple_to(e, d)
+}
+fn (f: *Fn) v_istmt(p: *VPlan, s: *ast.Node, u: int) {
+  A := f.a
+  d := p.sc[0]
+  rest := p.sc[1:]
+  if s.kind == "MultiAssign" {
+    t := s.targets[0]
+    v := s.values[0]
+    imm, is_imm := f.imm32(v)
+    if is_imm {
+      f.v_mem(0xC7, 0, p, t, u, 1, 0)             # mov qword [elem], imm32
+      A.d32(imm)
+      return
+    }
+    f.v_iemit(p, v, d, rest, u)
+    f.v_mem(0x89, d, p, t, u, 1, 0)
+    return
+  }
+  if s.kind == "Assign" {
+    f.v_iemit(p, s.value, d, rest, u)
+    f.store_slot_r(f.lookup(s.name, s), d)
+    return
+  }
+  t := s.target
+  if s.op == "*" {
+    f.v_iemit(p, s.value, d, rest, u)
+    if t.kind == "Index" {
+      f.v_mem(0x0FAF, d, p, t, u, 1, 0)
+      f.v_mem(0x89, d, p, t, u, 1, 0)
+      return
+    }
+    tv := f.lookup(t.name, t)
+    if tv.reg != 0 {
+      A.rr(0x0FAF, d, tv.reg)
+      A.mov(tv.reg, d)
+      return
+    }
+    A.rmx(0x0FAF, d, RBP, tv.off, 1, 0)
+    A.store(RBP, tv.off, d)
+    return
+  }
+  code, ext := alu_code(s.op)
+  mr := alu_code_mr(s.op)
+  imm, is_imm := f.imm32(s.value)
+  if t.kind == "Index" {
+    if is_imm {
+      small := imm >= -128 && imm <= 127
+      if small { f.v_mem(0x83, ext, p, t, u, 1, 0) } else { f.v_mem(0x81, ext, p, t, u, 1, 0) }
+      if small { A.byte(imm) } else { A.d32(imm) }
+      return
+    }
+    r := 0
+    if s.value.kind == "Var" && s.value.name != p.j { r = f.reg_of(s.value) }
+    if r == 0 {
+      f.v_iemit(p, s.value, d, rest, u)
+      r = d
+    }
+    f.v_mem(mr, r, p, t, u, 1, 0)                 # op [elem], r
+    return
+  }
+  tv := f.lookup(t.name, t)
+  if tv.reg != 0 {
+    if is_imm {
+      A.alu_imm(ext, tv.reg, imm)
+      return
+    }
+    f.v_iemit(p, s.value, d, rest, u)
+    A.rr(code, tv.reg, d)
+    return
+  }
+  if is_imm {
+    small := imm >= -128 && imm <= 127
+    if small { A.rmx(0x83, ext, RBP, tv.off, 1, 0) } else { A.rmx(0x81, ext, RBP, tv.off, 1, 0) }
+    if small { A.byte(imm) } else { A.d32(imm) }
+    return
+  }
+  f.v_iemit(p, s.value, d, rest, u)
+  A.rmx(mr, d, RBP, tv.off, 1, 0)
+}
+fn v_fcode(op: str) -> int {
+  switch op {
+  case "+": return 0x0F58
+  case "-": return 0x0F5C
+  case "*": return 0x0F59
+  }
+  return 0x0F5E
+}
+# xmm x op= operand e (v_fdirect)
+fn (f: *Fn) v_fop_direct(p: *VPlan, op: str, x: int, e: *ast.Node, u: int) {
+  A := f.a
+  if e.kind == "Paren" {
+    f.v_fop_direct(p, op, x, e.expr, u)
+    return
+  }
+  code := v_fcode(op)
+  c, is_c := f.fconst_of(e)
+  if is_c {
+    A.ripx(code, x, f.g.fconst(c), 0, 0xF2, 0)
+    return
+  }
+  if e.kind == "Index" {
+    f.v_mem(code, x, p, e, u, 0, 0xF2)
+    return
+  }
+  xr := f.xreg_of(e)
+  if xr >= 0 {
+    A.sse(code & 255, x, xr)
+    return
+  }
+  A.rmx(code, x, RBP, f.fslot_of(e), 0, 0xF2)
+}
+# xmm x = e (xmm x+1... for the rest)
+fn (f: *Fn) v_femit(p: *VPlan, e: *ast.Node, x: int, u: int) {
+  A := f.a
+  if e.kind == "Paren" {
+    f.v_femit(p, e.expr, x, u)
+    return
+  }
+  if e.kind == "Binary" {
+    f.v_femit(p, e.left, x, u)
+    if f.v_fdirect(e.right) {
+      f.v_fop_direct(p, e.op, x, e.right, u)
+      return
+    }
+    f.v_femit(p, e.right, x + 1, u)
+    A.sse(v_fcode(e.op) & 255, x, x + 1)
+    return
+  }
+  c, is_c := f.fconst_of(e)
+  if is_c {
+    A.ripx(0x0F10, x, f.g.fconst(c), 0, 0xF2, 0)
+    return
+  }
+  if e.kind == "Index" {
+    f.v_mem(0x0F10, x, p, e, u, 0, 0xF2)
+    return
+  }
+  xr := f.xreg_of(e)
+  if xr >= 0 {
+    A.ssep(0x28, x, xr, 0x66)                     # movapd
+    return
+  }
+  off := f.fslot_of(e)
+  if off != 0 {
+    A.movsd_load(x, RBP, off)
+    return
+  }
+  f.simple_to(e, RAX)
+  A.movq_x(x, RAX)
+}
+fn (f: *Fn) v_fstmt(p: *VPlan, s: *ast.Node, u: int) {
+  A := f.a
+  if s.kind == "MultiAssign" {
+    f.v_femit(p, s.values[0], 0, u)
+    f.v_mem(0x0F11, 0, p, s.targets[0], u, 0, 0xF2)
+    return
+  }
+  if s.kind == "Assign" {
+    tv := f.lookup(s.name, s)
+    f.v_femit(p, s.value, 0, u)
+    if tv.xr != 0 { A.ssep(0x28, tv.xr, 0, 0x66) } else { A.movsd_store(RBP, tv.off, 0) }
+    return
+  }
+  t := s.target
+  code := v_fcode(s.op) & 255
+  if t.kind == "Var" {
+    tv := f.lookup(t.name, t)
+    if tv.xr != 0 {
+      f.v_femit(p, s.value, 0, u)
+      A.sse(code, tv.xr, 0)
+      return
+    }
+    f.v_femit(p, s.value, 1, u)
+    A.movsd_load(0, RBP, tv.off)
+    A.sse(code, 0, 1)
+    A.movsd_store(RBP, tv.off, 0)
+    return
+  }
+  f.v_femit(p, s.value, 1, u)
+  f.v_mem(0x0F10, 0, p, t, u, 0, 0xF2)
+  A.sse(code, 0, 1)
+  f.v_mem(0x0F11, 0, p, t, u, 0, 0xF2)
+}
+fn (f: *Fn) v_body(p: *VPlan, u: int) {
+  for _, s := range p.stmts {
+    if f.v_is_num(s) { f.v_fstmt(p, s, u) } else { f.v_istmt(p, s, u) }
+  }
+}
+
+# ---- vloop: 2 elements per instruction (SSE2) ----
+# when every statement stores into an element (no variable: a sum would be reassociated) and
+# uses + - & | ^ on integers or + - * (and / by a constant) on num, two consecutive iterations
+# run as one: each half of an XMM does the same operation as the scalar loop, so the results are
+# the same bits. Operands that do not change (variables, constants) are broadcast to both halves
+# before the loop. Elements are 8-byte aligned, so they are loaded and stored with movdqu/movupd.
+fn v_bkey(e: *ast.Node, fl: bool) -> str {
+  k := "i:"
+  if fl { k = "f:" }
+  return k + vkey(e)
+}
+fn (p: *VPlan) bc_of(e: *ast.Node, fl: bool) -> int {
+  if e.kind == "Paren" { return p.bc_of(e.expr, fl) }
+  if e.kind != "Var" && e.kind != "Number" { return -1 }
+  k := v_bkey(e, fl)
+  for i, x := range p.bc_keys { if x == k { return p.bc_x[i] } }
+  return -1
+}
+fn (f: *Fn) v_vok(p: *VPlan, e: *ast.Node, fl: bool) -> bool {
+  switch e.kind {
+  case "Paren": return f.v_vok(p, e.expr, fl)
+  case "Index": return true
+  case "Var", "Number":
+    if e.kind == "Var" && e.name == p.j { return false }
+    k := v_bkey(e, fl)
+    for _, x := range p.bc_keys { if x == k { return true } }
+    p.bc_keys = append(p.bc_keys, k)
+    p.bc_nodes = append(p.bc_nodes, e)
+    p.bc_num = append(p.bc_num, fl)
+    p.bc_x = append(p.bc_x, 0)
+    return true
+  case "Binary":
+    if fl {
+      if !(e.op == "+" || e.op == "-" || e.op == "*" || e.op == "/") { return false }
+    } else if !(e.op == "+" || e.op == "-" || e.op == "&" || e.op == "|" || e.op == "^") {
+      return false
+    }
+    return f.v_vok(p, e.left, fl) && f.v_vok(p, e.right, fl)
+  }
+  return false
+}
+fn (f: *Fn) v_vneed(p: *VPlan, e: *ast.Node, fl: bool) -> int {
+  if e.kind == "Paren" { return f.v_vneed(p, e.expr, fl) }
+  if e.kind != "Binary" { return 1 }
+  l := f.v_vneed(p, e.left, fl)
+  if e.right.kind == "Var" || e.right.kind == "Number" { return l }
+  return imax(l, f.v_vneed(p, e.right, fl) + 1)
+}
+fn (f: *Fn) v_simd_plan(p: *VPlan) {
+  vx := 0
+  for _, s := range p.stmts {
+    if s.kind != "MultiAssign" && !(s.kind == "OpAssign" && s.target.kind == "Index") { return }
+    fl := f.v_is_num(s)
+    v := s.value
+    if s.kind == "MultiAssign" { v = s.values[0] }
+    if s.kind == "OpAssign" && !fl && (s.op == "*" || alu_code_mr(s.op) < 0) { return }
+    if !f.v_vok(p, v, fl) { return }
+    need := f.v_vneed(p, v, fl)
+    if s.kind == "OpAssign" { need++ }
+    vx = imax(vx, need)
+  }
+  if vx + len(p.bc_keys) > f.xtop + 1 { return }
+  for i := range p.bc_x { p.bc_x[i] = f.xtop - i }
+  p.vx = vx
+  p.simd = true
+}
+fn v_vop(op: str, fl: bool) -> int {
+  if fl {
+    switch op {
+    case "+": return 0x58
+    case "-": return 0x5C
+    case "*": return 0x59
+    }
+    return 0x5E
+  }
+  switch op {
+  case "+": return 0xD4                           # paddq
+  case "-": return 0xFB                           # psubq
+  case "&": return 0xDB                           # pand
+  case "|": return 0xEB                           # por
+  }
+  return 0xEF                                     # pxor
+}
+# the two elements of an access, block blk (iterations j + 2blk and j + 2blk + 1)
+fn (f: *Fn) v_vload(p: *VPlan, x: int, ix: *ast.Node, blk: int, fl: bool) {
+  if fl { f.v_mem(0x0F10, x, p, ix, 2 * blk, 0, 0x66) } else { f.v_mem(0x0F6F, x, p, ix, 2 * blk, 0, 0xF3) }   # movupd / movdqu
+}
+fn (f: *Fn) v_vstore(p: *VPlan, x: int, ix: *ast.Node, blk: int, fl: bool) {
+  if fl { f.v_mem(0x0F11, x, p, ix, 2 * blk, 0, 0x66) } else { f.v_mem(0x0F7F, x, p, ix, 2 * blk, 0, 0xF3) }
+}
+fn (f: *Fn) v_vemit(p: *VPlan, e: *ast.Node, x: int, blk: int, fl: bool) {
+  A := f.a
+  if e.kind == "Paren" {
+    f.v_vemit(p, e.expr, x, blk, fl)
+    return
+  }
+  if e.kind == "Index" {
+    f.v_vload(p, x, e, blk, fl)
+    return
+  }
+  if e.kind == "Binary" {
+    f.v_vemit(p, e.left, x, blk, fl)
+    r := p.bc_of(e.right, fl)
+    if r < 0 {
+      f.v_vemit(p, e.right, x + 1, blk, fl)
+      r = x + 1
+    }
+    A.ssep(v_vop(e.op, fl), x, r, 0x66)
+    return
+  }
+  A.ssep(0x6F, x, p.bc_of(e, fl), 0x66)          # movdqa x, broadcast
+}
+fn (f: *Fn) v_vbody(p: *VPlan, blk: int) {
+  A := f.a
+  for _, s := range p.stmts {
+    fl := f.v_is_num(s)
+    if s.kind == "MultiAssign" {
+      f.v_vemit(p, s.values[0], 0, blk, fl)
+      f.v_vstore(p, 0, s.targets[0], blk, fl)
+      continue
+    }
+    f.v_vload(p, 0, s.target, blk, fl)
+    r := p.bc_of(s.value, fl)
+    if r < 0 {
+      f.v_vemit(p, s.value, 1, blk, fl)
+      r = 1
+    }
+    A.ssep(v_vop(s.op, fl), 0, r, 0x66)
+    f.v_vstore(p, 0, s.target, blk, fl)
+  }
+}
+fn (p: *VPlan) written(gi: int) -> bool {
+  for _, s := range p.stmts {
+    t := s.target
+    if s.kind == "MultiAssign" { t = s.targets[0] }
+    if t != nil && t.kind == "Index" && p.group_of(t) == p.groups[gi] { return true }
+  }
+  return false
+}
+# the SIMD loop (2 blocks of 2 iterations per turn) before the scalar one; it leaves j where the
+# scalar tail continues (tchk)
+fn (f: *Fn) v_simd_loop(p: *VPlan, tchk: str) {
+  A := f.a
+  scalar := A.label()
+  # an element written in iteration t and used by another access in iteration t + 1 or t - 1
+  # (groups 8 bytes apart) would be read before it is written, or the other way around
+  for wi, w := range p.groups {
+    if !p.written(wi) { continue }
+    for gi, gr := range p.groups {
+      if gi == wi || (gi < wi && p.written(gi)) { continue }
+      A.mov(RAX, gr.reg)
+      A.alu("sub", RAX, w.reg)
+      A.cmp_imm(RAX, 8)
+      A.jcc(CC_E, scalar)
+      A.cmp_imm(RAX, -8)
+      A.jcc(CC_E, scalar)
+    }
+  }
+  for i, e := range p.bc_nodes {
+    x := p.bc_x[i]
+    if p.bc_num[i] {
+      f.v_femit(p, e, x, 0)
+      A.ssep(0x14, x, x, 0x66)                    # unpcklpd
+    } else {
+      f.simple_to(e, RAX)
+      A.movq_x(x, RAX)
+      A.ssep(0x6C, x, x, 0x66)                    # punpcklqdq
+    }
+  }
+  vtop := A.label()
+  f.slot_op(0x3B, p.jr, p.lim4)
+  A.jcc(CC_GE, tchk)
+  A.bind(vtop)
+  f.v_vbody(p, 0)
+  f.v_vbody(p, 1)
+  A.add_imm(p.jr, 4)
+  f.slot_op(0x3B, p.jr, p.lim4)
+  A.jcc(CC_L, vtop)
+  A.jmp(tchk)
+  A.bind(scalar)
+}
+
+# the checks and the fast loop; jumps to slow when a check fails, to end after the fast loop
+fn (f: *Fn) vloop_emit(p: *VPlan, slow: str, end: str) {
+  A := f.a
+  if p.lim_e {
+    f.expr(p.lim)
+    p.lim_h = f.hidden()
+    f.store_slot(p.lim_h)
+  }
+  # the range is not empty (j < B), and B - 3 does not overflow
+  f.load_slot_r(p.jv, RCX)
+  f.v_cmp_lim(p, RCX)
+  A.jcc(CC_GE, slow)
+  f.v_lim_to(p, RAX)
+  A.sub_imm(RAX, 3)
+  A.jcc(0, slow)                                  # jo
+  p.lim4 = f.hidden()
+  f.store_slot(p.lim4)
+  # each group: base + j (the first index) and base + B - 1 (the last) in range, without
+  # overflow (then every index between them is); the address of element base is pushed
+  for gi, gr := range p.groups {
+    bail := slow
+    if gi > 0 { bail = A.label() }
+    f.v_base(gr)
+    f.load_slot_r(p.jv, RCX)
+    A.alu("add", RCX, RAX)
+    A.jcc(0, bail)
+    f.slot_op(0x3B, RCX, gr.c.len)
+    A.jcc(CC_AE, bail)
+    f.v_lim_to(p, RCX)
+    A.sub_imm(RCX, 1)
+    A.alu("add", RCX, RAX)
+    A.jcc(0, bail)
+    f.slot_op(0x3B, RCX, gr.c.len)
+    A.jcc(CC_AE, bail)
+    f.load_slot_r(gr.c.data, RCX)
+    A.rsib(0x8D, RAX, RCX, RAX, 3, 1)             # lea rax, [rcx + rax*8]
+    A.push(RAX)
+    if gi > 0 {
+      A.cold_begin()
+      A.bind(bail)
+      A.add_imm(RSP, 8 * gi)
+      A.jmp(slow)
+      A.cold_end()
+    }
+  }
+  for i, r := range p.bregs { A.store(RBP, p.boffs[i], r) }
+  for gi := len(p.groups) - 1; gi >= 0; gi-- { A.pop(p.groups[gi].reg) }
+  if p.jv.reg == 0 { f.load_slot_r(p.jv, p.jr) }
+  top4 := A.label()
+  tchk := A.label()
+  tail := A.label()
+  fin := A.label()
+  if p.simd { f.v_simd_loop(p, tchk) }
+  f.slot_op(0x3B, p.jr, p.lim4)
+  A.jcc(CC_GE, tchk)
+  A.bind(top4)
+  for u := 0; u < 4; u++ { f.v_body(p, u) }
+  A.add_imm(p.jr, 4)
+  f.slot_op(0x3B, p.jr, p.lim4)
+  A.jcc(CC_L, top4)
+  A.bind(tchk)
+  f.v_cmp_lim(p, p.jr)
+  A.jcc(CC_GE, fin)
+  A.bind(tail)
+  f.v_body(p, 0)
+  A.add_imm(p.jr, 1)
+  f.v_cmp_lim(p, p.jr)
+  A.jcc(CC_L, tail)
+  A.bind(fin)
+  if p.jv.reg == 0 { f.store_slot_r(p.jv, p.jr) }
+  for i, r := range p.bregs { A.load(r, RBP, p.boffs[i]) }
+  A.jmp(end)
+}
+
 fn (f: *Fn) for_to(n: *ast.Node) {
   A := f.a
   v := f.lookup(n.name, n)
