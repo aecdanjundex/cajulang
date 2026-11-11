@@ -1,0 +1,139 @@
+# Map storage (rt/values.caju): entries [key, value] in insertion order, deleted flags in a separate
+# byte array, and an index whose slots carry a tag of the hash, rebuilt from the old slots when it
+# grows. These tests check lookups, deletes and range order across many growths.
+import { describe, it, expect } from "std/testing"
+
+describe("map storage", fn() {
+  it("finds every key after many growths, and misses the absent ones", fn() {
+    m := map[int]int{}
+    for i := 0; i < 100000; i++ { m[i * 7919 % 1000003] = i }
+    expect(len(m)).to_equal(100000)
+    bad := 0
+    for i := 0; i < 100000; i++ {
+      v, ok := m[i * 7919 % 1000003]
+      if !ok or v != i { bad++ }
+    }
+    for i := 100000; i < 110000; i++ {
+      _, ok := m[i * 7919 % 1000003]
+      if ok { bad++ }
+    }
+    expect(bad).to_equal(0)
+  })
+  it("tells apart keys whose hashes may share low bits", fn() {
+    m := map[int]int{}
+    for i := 0; i < 2000; i++ {
+      m[i << 32] = i
+      m[(i << 32) + 1] = -i
+      m[-(i << 20)] = 3 * i
+    }
+    expect(len(m)).to_equal(5999)
+    bad := 0
+    for i := 1; i < 2000; i++ {
+      if m[i << 32] != i or m[(i << 32) + 1] != -i or m[-(i << 20)] != 3 * i { bad++ }
+    }
+    expect(bad).to_equal(0)
+    expect(m[0]).to_equal(0)
+  })
+  it("keeps finding the other keys while deleting during growth", fn() {
+    m := map[int]int{}
+    dead := []bool{}
+    for i := 0; i < 30000; i++ {
+      m[i] = i
+      dead = append(dead, false)
+      if i % 3 == 0 {
+        delete(m, i / 2)
+        dead[i / 2] = true
+      }
+    }
+    bad := 0
+    count := 0
+    for i := 0; i < 30000; i++ {
+      gone := dead[i]
+      v, ok := m[i]
+      if ok == gone { bad++ }
+      if ok {
+        count++
+        if v != i { bad++ }
+      }
+    }
+    expect(bad).to_equal(0)
+    expect(len(m)).to_equal(count)
+  })
+  it("ranges in insertion order after deletes and re-inserts", fn() {
+    m := map[int]str{}
+    for i := 0; i < 1000; i++ { m[i] = str(i) }
+    for i := 0; i < 1000; i += 2 { delete(m, i) }
+    m[4] = "four"
+    m[1001] = "x"
+    keys := []int{}
+    ok := true
+    for k, v := range m {
+      keys = append(keys, k)
+      if k < 1000 and k != 4 and v != str(k) { ok = false }
+    }
+    expect(ok).to_be_true()
+    expect(len(keys)).to_equal(502)
+    expect(keys[0]).to_equal(1)
+    expect(keys[499]).to_equal(999)
+    expect(keys[500]).to_equal(4)
+    expect(keys[501]).to_equal(1001)
+    expect(m[4]).to_equal("four")
+  })
+  it("skips keys deleted while ranging", fn() {
+    m := map[int]int{1: 1, 2: 2, 3: 3, 4: 4}
+    seen := []int{}
+    for k, _ := range m {
+      seen = append(seen, k)
+      if k == 2 { delete(m, 3) }
+    }
+    expect(seen).to_equal([]int{1, 2, 4})
+  })
+  it("survives deleting everything and filling it again", fn() {
+    m := map[int]int{}
+    for round := 0; round < 5; round++ {
+      for i := 0; i < 5000; i++ { m[i + round] = i }
+      for i := 0; i < 5000; i++ { delete(m, i + round) }
+      expect(len(m)).to_equal(0)
+    }
+    m[7] = 70
+    _, ok := m[8]
+    expect(m[7]).to_equal(70)
+    expect(ok).to_be_false()
+  })
+  it("handles many string keys, deletes and garbage between them", fn() {
+    m := map[str]int{}
+    junk := []str{}
+    for i := 0; i < 20000; i++ {
+      m["key" + str(i)] = i
+      junk = append(junk, "garbage" + str(i))
+      if i % 1000 == 0 { junk = []str{} }
+    }
+    for i := 0; i < 20000; i += 4 { delete(m, "key" + str(i)) }
+    bad := 0
+    for i := 0; i < 20000; i++ {
+      v, ok := m["key" + str(i)]
+      if ok != (i % 4 != 0) { bad++ }
+      if ok and v != i { bad++ }
+    }
+    expect(bad).to_equal(0)
+    expect(len(m)).to_equal(15000)
+    first := ""
+    for k, _ := range m {
+      first = k
+      break
+    }
+    expect(first).to_equal("key1")
+  })
+  it("keeps num and bool keys working", fn() {
+    m := map[num]int{}
+    for i := 0; i < 1000; i++ { m[num(i) / 4.0] = i }
+    m[-0.0] += 5
+    expect(len(m)).to_equal(1000)
+    expect(m[0.0]).to_equal(5)
+    expect(m[2.25]).to_equal(9)
+    b := map[bool]str{true: "t"}
+    b[false] = "f"
+    delete(b, true)
+    expect(str(b)).to_equal("map[false:\"f\"]")
+  })
+})

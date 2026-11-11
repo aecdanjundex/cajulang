@@ -502,22 +502,21 @@ fn rt_runes_str(s: int) -> str {
 }
 
 # ---------------------------------------------------------------- maps
-# [0] count, [8] entries, [16] entries used, [24] capacity, [32] index, [40] index size, [48] key kind
-# entry: [key, value, live]; index: 0 = empty, -1 = deleted, otherwise entry position + 1
+# [0] count, [8] entries, [16] entries used, [24] capacity, [32] index, [40] index size,
+# [48] key kind, [56] deleted flags (0 while nothing was deleted: one byte per entry, 1 = deleted)
+# entry: [key, value] (16 bytes, in insertion order: range walks this array)
+# index (no pointers, power-of-two size, at most half full): a slot is 0 = empty, -1 = deleted,
+# otherwise tag | (entry position + 1), where the tag is the low 31 bits of the hash in bits 32..62
+# (so a used slot is never 0 nor negative). A probe rejects the slot of another key by its tag,
+# without reading the entries array (one cache miss less), and since the home slot of a key is
+# hash & mask, growing the index needs neither the keys nor their hashes: only the old slots.
 fn rt_map_new(kk: int) -> int {
-  m := rt_alloc(56)
-  __store64(m, 0)
-  __store64(m + 8, rt_alloc(24 * 8))
-  __store64(m + 16, 0)
+  m := rt_alloc(64)
+  __store64(m + 8, rt_alloc(16 * 8))
   __store64(m + 24, 8)
-  __store64(m + 32, rt_alloc(8 * 16))
+  __store64(m + 32, rt_alloc_ns(8 * 16))
   __store64(m + 40, 16)
   __store64(m + 48, kk)
-  i := 0
-  while i < 16 {
-    __store64(__load64(m + 32) + 8 * i, 0)
-    i++
-  }
   return m
 }
 fn rt_mix(h: int) -> int {
@@ -547,6 +546,8 @@ fn rt_hash(k: int, kk: int) -> int {
   }
   return rt_mix(k)
 }
+# the tag of a hash, in place (a multiplication: cheaper than a shift here)
+fn rt_map_tag(h: int) -> int { return (h & 2147483647) * 4294967296 }
 fn rt_keq(a: int, b: int, kk: int) -> bool {
   if kk == 1 {
     x := __bitsf(a)
@@ -556,30 +557,46 @@ fn rt_keq(a: int, b: int, kk: int) -> bool {
   if kk == 2 { return rt_streq(__pstr(a), __pstr(b)) }
   return a == b
 }
+# the hash of the last key rt_map_find did not find (rt_map_set inserts it without hashing again)
+let rt_map_lh: int = 0
 fn rt_map_find(m: int, k: int) -> int {
   if m == 0 { return -1 }
   kk := __load64(m + 48)
   idx := __load64(m + 32)
   mask := __load64(m + 40) - 1
-  e := __load64(m + 8)
+  e := __load64(m + 8) - 16
+  hi := -4294967296
   if kk == 0 {
     # integer keys (the common case): the hash and the comparison without calls
     h0 := k ^ (k >> 33)
     h0 = h0 * -(49064778 * 1000000000 + 989728563)
-    h0 = (h0 ^ (h0 >> 33)) & mask
+    h0 = h0 ^ (h0 >> 33)
+    t0 := (h0 & 2147483647) * 4294967296
+    p0 := h0 & mask
     for {
-      s0 := __load64(idx + 8 * h0)
-      if s0 == 0 { return -1 }
-      if s0 > 0 and __load64(e + 24 * (s0 - 1)) == k { return s0 - 1 }
-      h0 = (h0 + 1) & mask
+      s0 := __load64(idx + 8 * p0)
+      if s0 == 0 {
+        rt_map_lh = h0
+        return -1
+      }
+      # same tag: the high half becomes 0 (never for a deleted slot, -1)
+      s0 = s0 ^ t0
+      if s0 & hi == 0 and __load64(e + 16 * s0) == k { return s0 - 1 }
+      p0 = (p0 + 1) & mask
     }
   }
-  h := rt_hash(k, kk) & mask
+  h := rt_hash(k, kk)
+  t := rt_map_tag(h)
+  p := h & mask
   for {
-    s := __load64(idx + 8 * h)
-    if s == 0 { return -1 }
-    if s > 0 and rt_keq(__load64(e + 24 * (s - 1)), k, kk) { return s - 1 }
-    h = (h + 1) & mask
+    s := __load64(idx + 8 * p)
+    if s == 0 {
+      rt_map_lh = h
+      return -1
+    }
+    s = s ^ t
+    if s & hi == 0 and rt_keq(__load64(e + 16 * s), k, kk) { return s - 1 }
+    p = (p + 1) & mask
   }
   return -1
 }
@@ -592,27 +609,23 @@ fn rt_map_get(m: int, k: int) -> int {
     return 0
   }
   rt_map_ok = true
-  return __load64(__load64(m + 8) + 24 * i + 8)
+  return __load64(__load64(m + 8) + 16 * i + 8)
 }
+# a new index of size slots with the used slots of the old one (deleted ones go away)
 fn rt_map_reindex(m: int, size: int) {
-  idx := rt_alloc(8 * size)
-  i := 0
-  while i < size {
-    __store64(idx + 8 * i, 0)
-    i++
-  }
-  kk := __load64(m + 48)
-  e := __load64(m + 8)
-  n := __load64(m + 16)
+  idx := rt_alloc_ns(8 * size)
+  old := __load64(m + 32)
+  on := __load64(m + 40)
   mask := size - 1
-  i = 0
-  while i < n {
-    if __load64(e + 24 * i + 16) != 0 {
-      h := rt_hash(__load64(e + 24 * i), kk) & mask
-      while __load64(idx + 8 * h) != 0 { h = (h + 1) & mask }
-      __store64(idx + 8 * h, i + 1)
+  j := 0
+  while j < on {
+    s := __load64(old + 8 * j)
+    if s > 0 {
+      p := (s >> 32) & mask
+      while __load64(idx + 8 * p) != 0 { p = (p + 1) & mask }
+      __store64(idx + 8 * p, s)
     }
-    i++
+    j++
   }
   __store64(m + 32, idx)
   __store64(m + 40, size)
@@ -622,55 +635,72 @@ fn rt_map_set(where: str, m: int, k: int, v: int) {
   i := rt_map_find(m, k)
   e := __load64(m + 8)
   if i >= 0 {
-    __store64(e + 24 * i + 8, v)
+    __store64(e + 16 * i + 8, v)
     return
   }
+  h := rt_map_lh
   n := __load64(m + 16)
   if n == __load64(m + 24) {
     nc := 2 * n
-    ne := rt_alloc(24 * nc)
-    rt_copy(ne, e, 24 * n)
+    ne := rt_alloc(16 * nc)
+    rt_copy(ne, e, 16 * n)
     __store64(m + 8, ne)
     __store64(m + 24, nc)
     e = ne
+    d := __load64(m + 56)
+    if d != 0 {
+      nd := rt_alloc_ns(nc)
+      rt_copy(nd, d, n)
+      __store64(m + 56, nd)
+    }
   }
-  __store64(e + 24 * n, k)
-  __store64(e + 24 * n + 8, v)
-  __store64(e + 24 * n + 16, 1)
+  __store64(e + 16 * n, k)
+  __store64(e + 16 * n + 8, v)
   __store64(m + 16, n + 1)
   __store64(m, __load64(m) + 1)
   size := __load64(m + 40)
   if 2 * (n + 1) >= size {
-    rt_map_reindex(m, 2 * size)
-  } else {
-    kk := __load64(m + 48)
-    idx := __load64(m + 32)
-    mask := size - 1
-    h := rt_hash(k, kk) & mask
-    while __load64(idx + 8 * h) > 0 { h = (h + 1) & mask }
-    __store64(idx + 8 * h, n + 1)
+    size = 2 * size
+    rt_map_reindex(m, size)
   }
+  idx := __load64(m + 32)
+  mask := size - 1
+  p := h & mask
+  while __load64(idx + 8 * p) > 0 { p = (p + 1) & mask }
+  __store64(idx + 8 * p, rt_map_tag(h) | (n + 1))
 }
 fn rt_map_del(m: int, k: int) {
   i := rt_map_find(m, k)
   if i < 0 { return }
   e := __load64(m + 8)
-  __store64(e + 24 * i + 16, 0)
+  d := __load64(m + 56)
+  if d == 0 {
+    d = rt_alloc_ns(__load64(m + 24))
+    __store64(m + 56, d)
+  }
+  __store8(d + i, 1)
+  # the dead entry no longer keeps its key and value alive
+  __store64(e + 16 * i, 0)
+  __store64(e + 16 * i + 8, 0)
   __store64(m, __load64(m) - 1)
-  kk := __load64(m + 48)
   idx := __load64(m + 32)
   mask := __load64(m + 40) - 1
-  h := rt_hash(k, kk) & mask
-  while __load64(idx + 8 * h) != i + 1 { h = (h + 1) & mask }
-  __store64(idx + 8 * h, -1)
+  h := rt_hash(k, __load64(m + 48))
+  s := rt_map_tag(h) | (i + 1)
+  p := h & mask
+  while __load64(idx + 8 * p) != s { p = (p + 1) & mask }
+  __store64(idx + 8 * p, -1)
 }
 fn rt_map_len(m: int) -> int {
   if m == 0 { return 0 }
   return __load64(m)
 }
-fn rt_map_val(m: int, i: int) -> int { return __load64(__load64(m + 8) + 24 * i + 8) }
-fn rt_map_key(m: int, i: int) -> int { return __load64(__load64(m + 8) + 24 * i) }
-fn rt_map_live(m: int, i: int) -> bool { return __load64(__load64(m + 8) + 24 * i + 16) != 0 }
+fn rt_map_val(m: int, i: int) -> int { return __load64(__load64(m + 8) + 16 * i + 8) }
+fn rt_map_key(m: int, i: int) -> int { return __load64(__load64(m + 8) + 16 * i) }
+fn rt_map_live(m: int, i: int) -> bool {
+  d := __load64(m + 56)
+  return d == 0 or __load8(d + i) == 0
+}
 fn rt_map_used(m: int) -> int {
   if m == 0 { return 0 }
   return __load64(m + 16)
