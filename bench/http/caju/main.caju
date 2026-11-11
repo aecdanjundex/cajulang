@@ -1,0 +1,26 @@
+import "web"
+import "std/strconv"
+import "std/os"
+
+struct User {
+  id: int
+  name: str
+  email: str
+  active: bool
+}
+
+let users = []User{}
+for i := 0; i < 50; i++ { users = append(users, User{id: i, name: "user " + str(i), email: "u" + str(i) + "@x.com", active: i % 2 == 0}) }
+
+r := web.new()
+r.get("/users/:id", fn(c: *web.Context) {
+  c.json(200, map[str]any{"id": c.param("id"), "name": "user"})
+})
+r.get("/users", fn(c: *web.Context) { c.json(200, users) })
+r.post("/users", fn(c: *web.Context) {
+  let u: User
+  if c.bind(&u) != nil { return }
+  c.json(201, u)
+})
+w, _ := strconv.atoi(os.getenv("WORKERS"))
+if w == 1 { r.run("127.0.0.1:" + os.getenv("PORT")) } else { r.run_workers("127.0.0.1:" + os.getenv("PORT"), w) }
