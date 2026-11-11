@@ -831,6 +831,9 @@ struct SCache {
 struct LoopScan {
   used: map[str]bool
   assigned: map[str]bool
+  calls: bool              # may run code of the program (a call that is not a builtin nor inlined)
+  fcalls: []*ast.Node      # calls to functions: pure only if try_inline turns them into an expression
+  deref_store: bool        # stores through a pointer (*p = v): could reassign a global list
 }
 
 fn (ls: *LoopScan) walk(n: *ast.Node) {
@@ -839,7 +842,7 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   switch n.kind {
   case "Assign": if n.name != "" { ls.assigned[n.name] = true }
   case "OpAssign": if n.target != nil && n.target.kind == "Var" { ls.assigned[n.target.name] = true }
-  case "MultiAssign": for _, t := range n.targets { if t.kind == "Var" { ls.assigned[t.name] = true } }
+  case "MultiAssign": for _, t := range n.targets { if t.kind == "Var" { ls.assigned[t.name] = true } else if t.kind != "Index" && t.kind != "Field" { ls.deref_store = true } }
   case "VarDecl": for _, nm := range n.names { ls.assigned[nm] = true }
   case "Range": for _, v := range n.vars { if v.kind == "Var" { ls.assigned[v.name] = true } }
   case "ForTo": ls.assigned[n.name] = true
@@ -847,7 +850,10 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   case "Index": if n.obj != nil && n.obj.kind == "Var" { ls.used[n.obj.name] = true }
   case "Call":
     if n.call_kind == "builtin" && (n.name == "len" || n.name == "cap") && len(n.args) == 1 && n.args[0].kind == "Var" { ls.used[n.args[0].name] = true }
+    if n.call_kind == "func" { ls.fcalls = append(ls.fcalls, n) } else if n.call_kind != "builtin" && n.call_kind != "conv" { ls.calls = true }
+  case "MethodCall", "CallValue", "Defer": ls.calls = true
   }
+  if n.kind == "OpAssign" && n.target != nil && n.target.kind != "Var" && n.target.kind != "Index" && n.target.kind != "Field" { ls.deref_store = true }
   ls.walk(n.value)
   ls.walk(n.left)
   ls.walk(n.right)
@@ -885,7 +891,7 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
 }
 
 fn scan_loop(parts: []*ast.Node) -> *LoopScan {
-  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}}
+  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false}
   for _, p := range parts { ls.walk(p) }
   return ls
 }
@@ -1631,8 +1637,30 @@ fn (f: *Fn) fexpr(n: *ast.Node, d: int) {
     A.movq_x(d, RAX)
     return
   }
+  if f.num_elem(n) {
+    f.elem_check(n, false)
+    f.movsd_elem(0x10, d)                         # movsd xmm d, [rax + rcx*8]
+    return
+  }
   f.expr_to(n, "num")
   A.movq_x(d, RAX)
+}
+
+# a[i] of a list or array of num (8-byte elements, address from elem_check)
+fn (f: *Fn) num_elem(n: *ast.Node) -> bool {
+  if n.kind != "Index" || n.ty != "num" { return false }
+  ot := types.dflt(n.obj.ty)
+  if ot == "str" { return false }
+  k := f.g.kind_of_t(strip_ptr(ot))
+  return (k == "slice" || k == "array") && !f.g.byte_elems(n.obj.ty)
+}
+# movsd xmm x, [rax + rcx*8] (op 0x10) or movsd [rax + rcx*8], xmm x (op 0x11)
+fn (f: *Fn) movsd_elem(op: int, x: int) {
+  A := f.a
+  A.byte(0xF2)
+  if x >= 8 { A.byte(0x44) }
+  A.byte3(0x0F, op, 0x04 | ((x & 7) << 3))
+  A.byte(0xC8)
 }
 
 # xmm d = left, xmm d+1 = right (left evaluated first); d <= 14
@@ -2210,9 +2238,16 @@ fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
   for _, name := range names {
     if ls.assigned[name] { continue }
     if _, has := f.scache[name]; has { continue }
-    v, ok := f.locals[name]
-    if !ok || v.celled || v.reg != 0 || v.cap >= 0 || v.sym != "" { continue }
     if _, captured := f.caps[name]; captured { continue }
+    v, ok := f.locals[name]
+    if !ok {
+      # a global: only in a loop that runs no code of the program (another function could
+      # reassign it) and stores through no pointer (&g could point to it)
+      gv, is_g := f.u.globals[name]
+      if !is_g || !f.loop_pure(ls) { continue }
+      v = gv
+    } else if v.sym != "" { continue }
+    if v.celled || v.reg != 0 || v.cap >= 0 { continue }
     if f.g.kind_of_t(types.dflt(v.t)) != "slice" { continue }
     c := &SCache{len: f.hidden(), data: f.hidden()}
     is_nil := A.label()
@@ -2232,6 +2267,12 @@ fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
     added = append(added, name)
   }
   return added
+}
+# the loop runs only its own code (builtins and inlined calls) and stores through no pointer
+fn (f: *Fn) loop_pure(ls: *LoopScan) -> bool {
+  if ls.calls || ls.deref_store { return false }
+  for _, c := range ls.fcalls { if f.try_inline(c) == nil { return false } }
+  return true
 }
 fn (f: *Fn) exit_scache(added: []str) { for _, name := range added { delete(f.scache, name) } }
 
@@ -2307,16 +2348,14 @@ fn (f: *Fn) elem_check(n: *ast.Node, write: bool) {
       f.load_slot(c.data)                         # always in range (counted_loop)
       return
     }
-    slow := A.label()
-    done := A.label()
+    ok := A.label()
     f.slot_op(0x3B, RCX, c.len)                   # cmp rcx, [length]
-    A.jcc(CC_AE, slow)
-    f.load_slot(c.data)
-    A.jmp(done)
-    A.bind(slow)
-    f.simple_to(n.obj, RAX)                       # the general checks report the error
+    A.jcc(CC_B, ok)
+    # out of range: the list is the cached one, so the general checks always report the error
+    f.simple_to(n.obj, RAX)
     f.elem_check_general(n, write, k, ot)
-    A.bind(done)
+    A.bind(ok)
+    f.load_slot(c.data)
     return
   }
   if is_simple(n.obj) && n.index.ty == "int" && !is_simple(n.index) && f.no_calls(n.index) {
@@ -3789,6 +3828,25 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
   tg := n.target
   if tg.kind != "Index" || g.kind_of_t(types.dflt(tg.obj.ty)) == "map" || types.dflt(tg.obj.ty) == "str" { return false }
   if g.is_value_type(tg.ty) || g.is_iface_t(tg.ty) || g.is_iface_t(n.value.ty) || types.dflt(tg.ty) == "bool" { return false }
+  if types.dflt(tg.ty) == "int" && (n.op == "+" || n.op == "-" || n.op == "&" || n.op == "|" || n.op == "^") && (is_simple(n.value) || f.no_calls(n.value)) {
+    # the value calls nothing (cannot change the element): op [address], value
+    f.elem_addr(tg, true)
+    if !f.simple_to(n.value, RCX) {
+      A.push(RAX)
+      f.expr(n.value)
+      A.mov(RCX, RAX)
+      A.pop(RAX)
+    }
+    op := 0x01                                    # add [rax], rcx
+    switch n.op {
+    case "-": op = 0x29
+    case "&": op = 0x21
+    case "|": op = 0x09
+    case "^": op = 0x31
+    }
+    A.rmx(op, RCX, RAX, 0, 1, 0)
+    return true
+  }
   if n.ik != ast.NONE && n.op != "**" && g.cls(tg.ty, n) == "i" {
     f.elem_addr(tg, true)
     A.push(RAX)                                   # the element's address
@@ -3805,6 +3863,19 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
     return true
   }
   if tg.ty == "num" && n.fk == ast.NONE && n.ik == ast.NONE && (n.op == "+" || n.op == "-" || n.op == "*" || n.op == "/") && f.fpure(n.value) {
+    c := f.cached_list(tg.obj)
+    if c != nil && f.num_elem(tg) && types.dflt(tg.obj.ty) == strip_ptr(types.dflt(tg.obj.ty)) && g.kind_of_t(types.dflt(tg.obj.ty)) == "slice" && is_simple(tg.index) && tg.index.ty == "int" {
+      # cached list, simple index: neither changes while the value is computed (fpure), so the
+      # address is computed again instead of being kept on the stack
+      f.elem_check(tg, true)
+      f.movsd_elem(0x10, 0)                       # the current value
+      f.fexpr(n.value, 1)
+      f.fop(n.op, 0, 1, n)
+      f.simple_to(tg.index, RCX)
+      f.load_slot(c.data)
+      f.movsd_elem(0x11, 0)
+      return true
+    }
     f.elem_addr(tg, true)
     A.push(RAX)
     A.load(RAX, RAX, 0)

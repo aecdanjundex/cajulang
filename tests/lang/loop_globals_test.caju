@@ -1,0 +1,94 @@
+# Inside a loop that runs no code of the program (no calls other than builtins and inlined
+# functions) and stores through no pointer, the native compiler also keeps the length and data
+# pointer of the global lists the loop indexes and never assigns (SCache). Any other way of
+# changing the global must still be seen by the loop.
+import { describe, it, expect, run_source } from "std/testing"
+
+fn out(src: str) -> str {
+  r := run_source(src)
+  return r.output
+}
+
+describe("global lists inside loops", fn() {
+  it("read and write elements of a global list in a loop without calls", fn() {
+    src := "let g = []num{1.0, 2.0, 3.0}\nlet w = []num{0.5, 0.5, 0.5}\nfn sq(x: num) -> num { return x * x }\nfn run() -> num {\n  s := 0.0\n  for i := 0; i < 3; i++ {\n    for j := i + 1; j < 3; j++ {\n      g[i] -= w[j] * sq(g[j])\n      g[j] += w[i]\n    }\n    s += g[i]\n  }\n  return s\n}\nprint(run())\nprint(g)\n"
+    expect(out(src)).to_equal("-5.125\n[-5.5 -3.625 4]")
+  })
+  it("see a global assigned directly inside the loop", fn() {
+    src := "let g = []int{1}\nfn run() -> int {\n  n := 0\n  for i := 0; i < 5; i++ {\n    if len(g) < 5 { g = append(g, i + 2) }\n    n += g[i]\n  }\n  return n\n}\nprint(run())\n"
+    expect(out(src)).to_equal("15")
+  })
+  it("see a global reassigned by a called function", fn() {
+    src := "let g = []int{1, 2}\nfn swap() { g = []int{10, 20, 30} }\nfn run() -> int {\n  s := 0\n  for i := 0; i < 3; i++ {\n    if i == 1 { swap() }\n    s += g[i]\n  }\n  return s\n}\nprint(run())\n"
+    expect(out(src)).to_equal("51")
+  })
+  it("see a global appended to by a called function", fn() {
+    src := "let g = []int{1}\nfn grow() { g = append(g, len(g) + 1) }\nfn run() -> int {\n  s := 0\n  i := 0\n  while i < len(g) {\n    if len(g) < 4 { grow() }\n    s += g[i]\n    i++\n  }\n  return s\n}\nprint(run())\n"
+    expect(out(src)).to_equal("10")
+  })
+  it("see a global reassigned by a closure", fn() {
+    src := "let g = []int{1, 2}\nfn run() -> int {\n  f := fn() { g = []int{5, 6, 7} }\n  s := 0\n  for i := 0; i < 3; i++ {\n    if i == 1 { f() }\n    s += g[i]\n  }\n  return s\n}\nprint(run())\n"
+    expect(out(src)).to_equal("14")
+  })
+  it("see a global reassigned by a method", fn() {
+    src := "let g = []int{1, 2}\nstruct T { n: int }\nfn (t: *T) reset() { g = []int{t.n, t.n, t.n} }\nfn run() -> int {\n  t := &T{n: 4}\n  s := 0\n  for i := 0; i < 3; i++ {\n    if i == 1 { t.reset() }\n    s += g[i]\n  }\n  return s\n}\nprint(run())\n"
+    expect(out(src)).to_equal("9")
+  })
+  it("see a global reassigned through a pointer", fn() {
+    src := "let g = []int{1, 2}\nlet p: *[]int\nfn run() -> int {\n  s := 0\n  for i := 0; i < 3; i++ {\n    if i == 1 { *p = []int{7, 8, 9} }\n    s += g[i]\n  }\n  return s\n}\np = &g\nprint(run())\n"
+    expect(out(src)).to_equal("18")
+  })
+  it("see a global reassigned between two runs of an inner loop", fn() {
+    src := "let g = []int{1, 2}\nfn swap() { g = []int{10, 20, 30} }\nfn run() -> int {\n  s := 0\n  for k := 0; k < 2; k++ {\n    for i := 0; i < len(g); i++ { s += g[i] }\n    swap()\n  }\n  return s\n}\nprint(run())\n"
+    expect(out(src)).to_equal("63")
+  })
+  it("cache globals in top-level loops too", fn() {
+    src := "let g = []int{1, 2, 3}\nfn total() -> int { return len(g) }\ns := 0\nfor i := 0; i < 3; i++ { s += g[i] * 2 }\ng = []int{4}\nfor i := 0; i < total(); i++ { s += g[i] }\nprint(s)\n"
+    expect(out(src)).to_equal("16")
+  })
+  it("report an index out of range with the same message and line", fn() {
+    src := "let g = []num{1.0, 2.0}\nfn run() -> num {\n  s := 0.0\n  for i := 0; i < 3; i++ {\n    s += g[i]\n  }\n  return s\n}\nprint(run())\n"
+    expect(out(src)).to_equal("Runtime error in main.caju, line 5: Index 2 out of range (length 2).")
+    src2 := "let g = []num{1.0, 2.0}\nfn run() {\n  for i := 0; i < 3; i++ {\n    g[i] += 1.0\n  }\n}\nrun()\n"
+    expect(out(src2)).to_equal("Runtime error in main.caju, line 4: Index 2 out of range (length 2).")
+    src3 := "let g = []int{1, 2}\nfn run() {\n  for i := 0; i < 3; i++ {\n    g[i] = 1\n  }\n}\nrun()\n"
+    expect(out(src3)).to_equal("Runtime error in main.caju, line 4: Index 2 out of range (length 2).")
+  })
+  it("report a nil global list", fn() {
+    src := "let g: []num\nfn run() -> num {\n  s := 0.0\n  for i := 0; i < 3; i++ {\n    s += g[i]\n  }\n  return s\n}\nprint(run())\n"
+    r := run_source(src)
+    expect(r.code).not_().to_equal(0)
+    expect(r.output).to_contain("line 5")
+  })
+})
+
+describe("num elements in float expressions", fn() {
+  it("read lists, arrays and pointers to arrays", fn() {
+    src := "fn run() -> num {\n  a := []num{1.5, 2.5}\n  b := [2]num{3.0, 4.0}\n  p := &b\n  s := 0.0\n  for i := 0; i < 2; i++ {\n    s += a[i] * b[i] + p[i] / 2.0\n    a[i] *= b[1 - i] + a[i]\n  }\n  return s + a[0] + a[1]\n}\nprint(run())\n"
+    expect(out(src)).to_equal("40")
+  })
+  it("report an out of range index in an operation on an element", fn() {
+    src := "fn run() {\n  a := []num{1.0}\n  for i := 0; i < 2; i++ {\n    a[i] -= 1.0 * a[0]\n  }\n}\nrun()\n"
+    expect(out(src)).to_equal("Runtime error in main.caju, line 4: Index 1 out of range (length 1).")
+  })
+})
+
+describe("integer operations on elements", fn() {
+  it("compute with the element itself and other elements", fn() {
+    a := []int{1, 2, 3, 4}
+    for i := 0; i < 4; i++ {
+      a[i] += a[i] * 2 + a[3 - i]
+      a[i] -= 1
+      a[i] ^= 8
+      a[i] |= 1
+      a[i] &= 63
+    }
+    expect(a).to_equal([]int{15, 1, 1, 19})
+  })
+  it("check the target index before evaluating the value", fn() {
+    src := "fn run(z: int) {\n  a := []int{1}\n  for i := 0; i < 2; i++ {\n    a[i] += 10 / z\n  }\n}\nrun(0)\n"
+    expect(out(src)).to_equal("Runtime error in main.caju, line 4: Integer division by zero.")
+    src2 := "fn run(z: int) {\n  a := []int{1}\n  b := []int{2}\n  for i := 0; i < 2; i++ {\n    a[i + 1] += b[i + 5]\n  }\n}\nrun(0)\n"
+    expect(out(src2)).to_equal("Runtime error in main.caju, line 5: Index 1 out of range (length 1).")
+  })
+})
