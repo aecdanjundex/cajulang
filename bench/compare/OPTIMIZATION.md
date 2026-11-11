@@ -38,6 +38,7 @@ garantida pela suíte de testes e pela autocompilação.
 | 12 | `[]bool` e `[N]bool` com 1 byte por elemento | 64 ms | 70 ms | 396 ms | 90 ms | 107 ms | 229 ms | 852 ms |
 | 13–16 | mapas com etiqueta; listas globais em laços; operações direto em registradores; `num` em XMM; RSI/RDI/R8–R11 | 62 ms | 29 ms | 175 ms | 37 ms | 35 ms | 184 ms | 605 ms |
 | 17–18 | laços com teste no fim, código frio, desvios curtos; divisão e resto por constante sem `idiv` | 57 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
+| 19 | guarda antes do prólogo; `leave`; profundidade contando para baixo | 41 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
 
 **Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
 matmul 1,8×, sort 2,2×, maps 2,1×.
@@ -390,6 +391,36 @@ sort −11%, fib −7%; a 18 deu sort −5% e matmul −15% sozinha, mas na comb
 Juntas, sobre a rodada 16: sieve 29 → 21 ms (−28%), sort 184 → 164 ms (−11%), fib 62 → 57 ms
 (−8%); o resto igual. A 18 vale mais fora destes desafios: −21% de ciclos num laço com `%`
 constante.
+
+## Rodada 19: o custo das chamadas (fib)
+
+**Hipótese:** depois das rodadas anteriores o fib era o único desafio ainda a 1,6× do Go. Pelo
+código de máquina (`tools/disasm.sh`), a Caju executava 12 instruções numa chamada-folha
+(`n < 2`) e 29 nas outras; o Go, 10 e 20 (`go tool objdump`). Três sobras:
+1. A folha montava o quadro inteiro (push rbp, sub rsp, guardar e carregar rbx) só para
+   comparar `n` e voltar.
+2. `mov rsp, rbp; pop rbp` em todo retorno.
+3. A profundidade de chamadas custava `cmp r15,10000; jge; inc r15` antes de cada chamada.
+
+**Mudança:**
+- `early_guard`: uma função cujo primeiro comando é `if p < K { return q }` (p parâmetro `int`;
+  K constante ou outro parâmetro; q parâmetro ou constante; qualquer comparação) faz o teste
+  antes do prólogo, lendo os argumentos acima do endereço de retorno (`[rsp+8+...]`), e volta
+  sem montar o quadro. Nada roda antes desse comando na função, então pular o prólogo não muda
+  nada; ficam fora funções com `defer`, funções anônimas, parâmetros em célula e resultados
+  com nome. A folha do fib: `mov rax,[rsp+8]; cmp rax,2; jge corpo; ret` (4 instruções).
+- `leave` no lugar de `mov rsp, rbp; pop rbp`.
+- R15 conta as chamadas que ainda cabem: começa em 10.000 e cada chamada faz
+  `dec r15; js erro` (e `inc r15` na volta). A 10.001ª chamada aninhada falha, como antes; o
+  runtime só guarda, restaura e compara o valor (`__depth`/`__set_depth`), então nada mais muda.
+- Testes novos: `tests/lang/calls_test.caju` (variações da guarda, métodos, exatamente 10.000
+  chamadas passam e 10.001 falham, a profundidade inteira de volta depois de um panic
+  recuperado); passam também no compilador anterior.
+
+**Resultado:** instruções do fib 32 de 144,7 M para 109,5 M (−24%; o Go faz 103 M); os outros
+desafios caíram de 0 a 1%. Tempo (5 passadas intercaladas): fib 35 de 58 para 41 ms (−30%);
+o Go faz 36,7 ms. O que sobra é a passagem de argumentos pela pilha (o Go usa registradores) e
+guardar/restaurar o RBX nas chamadas que não são folha.
 
 ## O que ficou para depois
 

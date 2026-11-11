@@ -1,0 +1,82 @@
+# The call sequence of the native compiler: the depth limit counted down in R15, functions that
+# start with `if p < K { return q }` testing it before building their frame (early_guard), and
+# the `leave` epilogue. Everything must behave as before.
+import { describe, it, expect, run_source } from "std/testing"
+
+fn fib(n: int) -> int {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+fn at_least_one(n: int) -> int {
+  if n <= 1 { return 1 }
+  return n * at_least_one(n - 1)
+}
+fn smaller(a: int, b: int) -> int {
+  if a > b { return b }
+  return a
+}
+fn other_param(a: int, b: int, c: int) -> int {
+  if b == c { return a }
+  return a + b + c
+}
+fn negative(n: int) -> int {
+  if n < -5 { return -1000000 }
+  return n * 2
+}
+fn guarded_with_locals(n: int, m: int) -> int {
+  if n >= m { return m }
+  s := 0
+  for i := n; i < m; i++ { s += i }
+  return s
+}
+fn depth(n: int) -> int {
+  if n == 0 { return 0 }
+  return depth(n - 1) + 1
+}
+fn boom(n: int) {
+  if n == 0 { panic("deep") }
+  boom(n - 1)
+}
+fn deep_then_recover(n: int) -> str {
+  defer fn() { recover() }()
+  boom(n)
+  return "not reached"
+}
+struct Counter { k: int }
+fn (c: *Counter) down(n: int) -> int {
+  if n < 1 { return c.k }
+  return c.down(n - 1) + 1
+}
+
+describe("calls", fn() {
+  it("return early before the frame when the first statement is a guard", fn() {
+    expect(fib(20)).to_equal(6765)
+    expect(fib(0)).to_equal(0)
+    expect(fib(1)).to_equal(1)
+    expect(at_least_one(10)).to_equal(3628800)
+    expect(at_least_one(-3)).to_equal(1)
+    expect(smaller(3, 9)).to_equal(3)
+    expect(smaller(9, 3)).to_equal(3)
+    expect(other_param(7, 2, 2)).to_equal(7)
+    expect(other_param(7, 2, 3)).to_equal(12)
+    expect(negative(-6)).to_equal(-1000000)
+    expect(negative(-5)).to_equal(-10)
+    expect(guarded_with_locals(10, 4)).to_equal(4)
+    expect(guarded_with_locals(2, 6)).to_equal(14)
+  })
+  it("keep methods and their receivers working", fn() {
+    c := &Counter{k: 100}
+    expect(c.down(5)).to_equal(105)
+  })
+  it("allow exactly 10,000 nested calls", fn() {
+    r := run_source("fn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return d(n - 1) + 1\n}\nprint(d(9999))\n")
+    expect(r.output).to_equal("9999")
+    r2 := run_source("fn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return d(n - 1) + 1\n}\nprint(d(10000))\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 3: Too much recursion: more than 10,000 nested function calls.")
+  })
+  it("give the whole depth back after a recovered panic deep down", fn() {
+    expect(deep_then_recover(5000)).to_equal("")
+    expect(deep_then_recover(5000)).to_equal("")
+    expect(depth(9900)).to_equal(9900)
+  })
+})

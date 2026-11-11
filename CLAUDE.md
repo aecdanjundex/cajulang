@@ -48,7 +48,7 @@ comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
 
-Resultado esperado hoje: **666 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+Resultado esperado hoje: **670 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
 receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
 confere a quantidade de argumentos).
@@ -66,7 +66,9 @@ o endereço de cada símbolo). Crash: `gdb -batch -ex run -ex 'info registers ri
 procure o endereço no arquivo do `CAJU_SYMS`.
 
 **Convenções do código gerado que as otimizações criaram** (respeite ao mexer no gerador):
-- R15 guarda a profundidade de chamadas (limite de 10.000); `__depth`/`__set_depth` no runtime.
+- R15 conta as chamadas que ainda cabem (começa em 10.000; `dec r15; js erro` antes de cada
+  chamada); `__depth`/`__set_depth` no runtime só guardam e comparam.
+- `early_guard`: `if p < K { return q }` no começo da função roda antes do prólogo.
 - RBX, R12, R13, R14 guardam até 4 variáveis por função que nunca são ponteiro (`alloc_regs`);
   funções com `defer` guardam os 4 e os restauram no `recover`.
 - xmm0..`xtop` seguram valores durante uma expressão `num` (`fexpr`); xmm15 é rascunho (`coerce`,

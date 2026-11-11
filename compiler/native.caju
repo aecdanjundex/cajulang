@@ -714,7 +714,7 @@ export fn compile_native(files: []*ast.SourceFile, rt_sources: []str, target: st
   # ---- program entry point ----
   A.bind("start")
   if target == "linux" { A.store_sym("g.argp", RSP) }
-  A.rr32(0x31, R15, R15)                         # call depth = 0
+  A.mov_imm(R15, 10000)                          # calls left before the depth limit (depth_in)
   A.byte4(0x48, 0x83, 0xE4, 0xF0)
   A.call("r.top")
   # the collector needs the stack top and the globals range
@@ -1301,6 +1301,8 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   f.decls_list(body)
 
   A.bind(label)
+  guarded := false
+  if !is_top && !is_lit && !has_defer_list(body) && len(body) > 1 { guarded = f.early_guard(body[0], params, ptypes) }
   A.push(RBP)
   A.mov(RBP, RSP)
   A.sub_imm32(RSP, 0)
@@ -1377,7 +1379,10 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   }
   if len(body) > 0 { f.last_stmt = body[len(body) - 1] }
 
-  for _, st := range body { f.stmt(st) }
+  for i, st := range body {
+    if i == 0 && guarded { continue }             # done before the prologue (early_guard)
+    f.stmt(st)
+  }
   if is_top { A.rr32(0x31, RAX, RAX) } else if f.has_rn { f.load_results() }
   land_at := -1
   if hd {
@@ -1431,8 +1436,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     A.bind(f.exit_l)
   }
   if !hd { for i, r := range regs { A.load(r, RBP, saved_regs[i].off) } }
-  A.mov(RSP, RBP)
-  A.pop(RBP)
+  A.leave()                                     # mov rsp, rbp; pop rbp
   A.ret()
   A.flush_cold()
   A.xs_reg = []int{}
@@ -1446,6 +1450,66 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
 
 # leaves the function with the result in RAX: the epilogue right here (no jump), or a jump to
 # the exit (functions with defer, and the last statement, which falls into the exit)
+# A function that starts with `if p < K { return q }` (p a parameter; K a constant or another
+# parameter; q a parameter or a constant; all int) tests that before the prologue, reading the
+# arguments above the return address: when it holds, the function returns without building its
+# frame (the leaves of a recursion: fib's `if n < 2 { return n }` goes from 12 instructions to 4).
+# Nothing else runs before the test in the function, so skipping the prologue changes nothing.
+# Returns true when the statement was emitted here (the body skips it).
+fn (f: *Fn) early_guard(st: *ast.Node, params: []str, ptypes: []str) -> bool {
+  if st.kind != "If" || st.init != nil || st.otherwise != nil || st.then == nil { return false }
+  th := st.then
+  if th.kind != "Block" || len(th.stmts) != 1 { return false }
+  r := th.stmts[0]
+  if r.kind != "Return" || len(r.values) != 1 || f.has_rn { return false }
+  rs := results_of_t(f.ret_t)
+  if len(rs) != 1 || types.dflt(rs[0]) != "int" { return false }
+  c := st.cond
+  if c == nil || c.kind != "Binary" || !f.int_compare(c) { return false }
+  li := f.int_param(c.left, params, ptypes)
+  if li < 0 { return false }
+  ri := f.int_param(c.right, params, ptypes)
+  rk, rconst := int_lit(c.right)
+  if ri < 0 && (!rconst || rk < -2147483648 || rk > 2147483647) { return false }
+  v := r.values[0]
+  vi := f.int_param(v, params, ptypes)
+  vk, vconst := int_lit(v)
+  if vi < 0 && !vconst { return false }
+  A := f.a
+  n := len(params)
+  A.load(RAX, RSP, 8 + 8 * (n - 1 - li))        # the arguments are above the return address
+  if ri >= 0 {
+    A.load(RCX, RSP, 8 + 8 * (n - 1 - ri))
+    A.alu("cmp", RAX, RCX)
+  } else {
+    A.cmp_imm(RAX, rk)
+  }
+  body := A.label()
+  A.jcc(cc_signed(c.op) ^ 1, body)
+  if vi == li {
+    # the tested parameter is already in RAX
+  } else if vi >= 0 {
+    A.load(RAX, RSP, 8 + 8 * (n - 1 - vi))
+  } else {
+    A.mov_imm(RAX, vk)
+  }
+  A.ret()
+  A.bind(body)
+  return true
+}
+# the position of n among the parameters when n is an int parameter read by value, or -1
+fn (f: *Fn) int_param(n: *ast.Node, params: []str, ptypes: []str) -> int {
+  if n == nil || n.kind != "Var" || n.fn_ref { return -1 }
+  for i, p := range params {
+    if p == n.name {
+      v := f.locals[p]
+      if v == nil || v.celled || types.dflt(ptypes[i]) != "int" { return -1 }
+      return i
+    }
+  }
+  return -1
+}
+
 fn (f: *Fn) ret_jump(n: *ast.Node) {
   A := f.a
   if !f.epi_here || n == f.last_stmt {
@@ -1453,8 +1517,7 @@ fn (f: *Fn) ret_jump(n: *ast.Node) {
     return
   }
   for i, r := range f.epi_regs { A.load(r, RBP, f.epi_saved[i].off) }
-  A.mov(RSP, RBP)
-  A.pop(RBP)
+  A.leave()                                     # mov rsp, rbp; pop rbp
   A.ret()
 }
 fn (f: *Fn) where_arg(n: *ast.Node) {
@@ -3416,16 +3479,18 @@ fn (f: *Fn) call_value(n: *ast.Node, mode: int, v: *Var, ft: str, args: []*ast.N
   f.depth_out()
   A.add_imm(RSP, 8 * (len(args) + 1))
 }
-# the depth of nested calls of the program (not of the runtime) lives in R15 (callee-saved in
-# both the System V and the Windows conventions, and never used otherwise by the generated code)
+# the nested calls of the program (not of the runtime) are counted in R15 (callee-saved in both
+# the System V and the Windows conventions, and never used otherwise by the generated code), as
+# the calls left: it starts at 10,000 and each call takes one (`dec r15; js`: the 10,001st nested
+# call fails, as with a count up to the limit, one instruction less). The runtime only saves,
+# restores and compares it (__depth, __set_depth).
 fn (f: *Fn) depth_in(n: *ast.Node) {
   if f.u.is_runtime { return }
   A := f.a
-  A.cmp_imm(R15, 10000)
-  f.fail_if(CC_GE, n, "Too much recursion: more than 10,000 nested function calls")
-  A.byte3(0x49, 0xFF, 0xC7)                       # inc r15
+  A.byte3(0x49, 0xFF, 0xCF)                       # dec r15
+  f.fail_if(CC_S, n, "Too much recursion: more than 10,000 nested function calls")
 }
-fn (f: *Fn) depth_out() { if !f.u.is_runtime { f.a.byte3(0x49, 0xFF, 0xCF) } }   # dec r15
+fn (f: *Fn) depth_out() { if !f.u.is_runtime { f.a.byte3(0x49, 0xFF, 0xC7) } }   # inc r15
 fn (f: *Fn) call_user(nm: str, n: *ast.Node, nargs: int) {
   A := f.a
   if !f.u.is_runtime {

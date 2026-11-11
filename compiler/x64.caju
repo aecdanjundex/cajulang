@@ -398,6 +398,7 @@ export fn (a: *X64) fill() {
   for i, r := range a.sv_regs { a.load(r, RBP, a.sv_offs[i]) }
 }
 export fn (a: *X64) ret() { a.b.byte(0xC3) }
+export fn (a: *X64) leave() { a.b.byte(0xC9) }
 export fn (a: *X64) mov_imm(r: int, x: int) {
   if x == 0 {
     a.rr32(0x31, r, r)              # xor r32, r32
