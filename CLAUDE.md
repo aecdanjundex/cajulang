@@ -82,6 +82,9 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   com as XMM), então um ponteiro de dados nelas está na pilha durante a chamada. `__syscall` também.
 - Variáveis do nível de cima que nenhuma função usa (nem `&x`) são locais do `u.top`.
 - Chamadas a funções `return E` pequenas viram a expressão (`try_inline`).
+- `return L op f(args)` / `return f(args) op L` / `return f(args)` (f a própria função, op + * & | ^
+  em int) viram laço com acumulador (`acc_plan`): cada volta gasta uma unidade de R15 e os
+  `return` devolvem o R15 da entrada (`acc_depth`); os outros `return q` dão `acc op q`.
 - Caminhos de erro vão para o código frio (`A.cold_begin`/`cold_end`, `f.fail_if`): o código vai
   para depois do `ret` da função (`flush_cold`) e o caminho quente segue reto. Código frio não
   volta sozinho: termina num erro que não retorna ou num `jmp` explícito.

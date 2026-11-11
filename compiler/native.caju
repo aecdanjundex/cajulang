@@ -833,6 +833,13 @@ struct Fn {
   epi_regs: []int             # right there (instead of jumping to the exit)
   epi_saved: []*Var
   last_stmt: *ast.Node        # the function's last statement: its return falls into the exit
+  acc_on: bool                # self-calls in return turned into a loop (acc_plan)
+  acc_op: str                 # the operation that combines the results ("": plain tail calls only)
+  acc: *Var                   # the accumulator (acc_op != "")
+  acc_depth: *Var             # R15 at the entry (each turn of the loop takes one call)
+  acc_head: str               # the start of the loop
+  acc_tails: []*ast.Node      # the returns that jump back to acc_head
+  acc_guard: *ast.Node        # the first statement when early_guard did it (tested at each turn)
 }
 
 # a list variable that no statement of the enclosing loop assigns: its header (data, length,
@@ -1378,6 +1385,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     f.epi_saved = saved_regs
   }
   if len(body) > 0 { f.last_stmt = body[len(body) - 1] }
+  if !is_top && !is_lit && !hd && !u.is_runtime && f.acc_plan(body) { f.acc_start(body, guarded) }
 
   for i, st := range body {
     if i == 0 && guarded { continue }             # done before the prologue (early_guard)
@@ -1434,6 +1442,7 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
     if f.has_rn { f.load_results() } else { f.load_slot(saved[0]) }
   } else {
     A.bind(f.exit_l)
+    if f.acc_on { A.load(R15, RBP, f.acc_depth.off) }
   }
   if !hd { for i, r := range regs { A.load(r, RBP, saved_regs[i].off) } }
   A.leave()                                     # mov rsp, rbp; pop rbp
@@ -1510,12 +1519,197 @@ fn (f: *Fn) int_param(n: *ast.Node, params: []str, ptypes: []str) -> int {
   return -1
 }
 
+# ---- self-calls in return as a loop (accumulator) ----
+# In a function whose returns have the form `return L op f(args)` (op: + * & | ^ on int, which
+# wrap around at 64 bits and so are exactly associative and commutative), `return f(args) op L`
+# (L a literal or a local variable: evaluating it before the arguments changes nothing) or
+# `return f(args)`, with f the function itself, the call becomes a jump back to its start:
+# acc = acc op L, the parameters take the arguments and every other `return q` gives acc op q.
+# fib(n - 1) + fib(n - 2) makes half the calls. The order of evaluation stays (L, the arguments,
+# then the code of the "call"), and each turn of the loop takes one unit of depth (dec r15; js:
+# the same check as the call it replaces, at the same node) and the returns give them all back
+# (R15 from the entry), so "Too much recursion" happens exactly where it did. Only returns
+# directly in the body or in if/else blocks jump (the stack is balanced there); functions with
+# defer, named results, captured or &-taken variables, methods and closures keep their calls.
+fn (f: *Fn) acc_plan(body: []*ast.Node) -> bool {
+  fd := f.fnode
+  if fd == nil || fd.recv != nil || f.has_rn || f.is_top { return false }
+  rs := results_of_t(f.ret_t)
+  if len(rs) != 1 || types.dflt(rs[0]) != "int" { return false }
+  for _, c := range f.celled_set { if c { return false } }
+  f.acc_op = ""
+  f.acc_tails = []*ast.Node{}
+  f.acc_scan(body)
+  if len(f.acc_tails) == 0 { return false }
+  f.acc_on = true
+  return true
+}
+fn (f: *Fn) acc_scan(xs: []*ast.Node) {
+  for _, s := range xs {
+    if s.kind == "Return" {
+      f.acc_check(s)
+    } else if s.kind == "If" {
+      f.acc_scan_if(s)
+    } else if s.kind == "Block" {
+      f.acc_scan(s.stmts)
+    }
+  }
+}
+fn (f: *Fn) acc_scan_if(s: *ast.Node) {
+  if s.then != nil && s.then.kind == "Block" { f.acc_scan(s.then.stmts) }
+  o := s.otherwise
+  if o == nil { return }
+  if o.kind == "If" { f.acc_scan_if(o) } else if o.kind == "Block" { f.acc_scan(o.stmts) }
+}
+fn unparen(n: *ast.Node) -> *ast.Node {
+  for n != nil && n.kind == "Paren" { n = n.expr }
+  return n
+}
+# n is a call of the function itself (by name, all the arguments given one by one)
+fn (f: *Fn) self_call(n: *ast.Node) -> bool {
+  n = unparen(n)
+  if n == nil || n.kind != "Call" || n.call_kind != "func" || n.args_spread || optional(n.unpack) { return false }
+  fd, ok := f.u.funcs[n.name]
+  if !ok || fd != f.fnode || len(n.args) != len(fd.params) { return false }
+  for _, a := range n.args { if optional(a.unpack) { return false } }
+  return true
+}
+fn acc_op_ok(op: str) -> bool { return op == "+" || op == "*" || op == "&" || op == "|" || op == "^" }
+# evaluating n has no effect, cannot fail and reads only locals that only assignments in this
+# function change (no &x, no closures: acc_plan)
+fn (f: *Fn) acc_pure(n: *ast.Node) -> bool {
+  n = unparen(n)
+  if n == nil { return false }
+  if n.kind == "Number" { return n.int }
+  if n.kind == "Var" {
+    if n.fn_ref || n.name == "_" { return false }
+    v, ok := f.locals[n.name]
+    return ok && !v.celled && v.cap < 0 && v.sym == "" && types.dflt(v.t) == "int"
+  }
+  return false
+}
+fn (f: *Fn) acc_check(r: *ast.Node) {
+  if len(r.values) != 1 { return }
+  v := unparen(r.values[0])
+  if f.self_call(v) {
+    f.acc_tails = append(f.acc_tails, r)
+    return
+  }
+  if v.kind != "Binary" || !acc_op_ok(v.op) || types.dflt(v.ty) != "int" { return }
+  if f.acc_op != "" && f.acc_op != v.op { return }
+  if !f.self_call(v.right) && !(f.self_call(v.left) && f.acc_pure(v.right)) { return }
+  f.acc_op = v.op
+  f.acc_tails = append(f.acc_tails, r)
+}
+# at the entry (after the prologue): acc = the identity of op, the depth kept, the loop's start
+# (before the first statement; after it when early_guard did it: acc_loop tests it at each turn)
+fn (f: *Fn) acc_start(body: []*ast.Node, guarded: bool) {
+  A := f.a
+  f.acc_depth = f.hidden()
+  A.store(RBP, f.acc_depth.off, R15)
+  if f.acc_op != "" {
+    f.acc = f.hidden()
+    id := 0
+    if f.acc_op == "*" { id = 1 }
+    if f.acc_op == "&" { id = -1 }
+    A.rm(0xC7, 0, RBP, f.acc.off)                # mov qword [acc], imm32
+    A.d32(id)
+  }
+  f.acc_head = A.label()
+  A.bind(f.acc_head)
+  f.acc_guard = nil
+  if guarded { f.acc_guard = body[0] }
+}
+fn (f: *Fn) acc_return(n: *ast.Node) {
+  A := f.a
+  for _, t := range f.acc_tails {
+    if t == n {
+      f.acc_loop(n)
+      return
+    }
+  }
+  f.bind_value(n.values[0], f.ret_t)
+  if f.acc_op != "" {
+    code, _ := alu_code(f.acc_op)
+    A.rm(code, RAX, RBP, f.acc.off)              # rax = rax op acc
+  }
+  f.ret_jump(n)
+}
+fn (f: *Fn) acc_loop(n: *ast.Node) {
+  A := f.a
+  v := unparen(n.values[0])
+  c := v
+  fd := f.fnode
+  pt := param_types(fd)
+  # the turn takes the depth of the call it replaces; when L is a call (made at that same depth)
+  # and the arguments call nothing, L's call keeps its unit instead of giving it back
+  keep := false
+  if v.kind == "Binary" {
+    l := v.left
+    c = unparen(v.right)
+    if !f.self_call(c) {
+      l = v.right
+      c = unparen(v.left)
+    }
+    lc := unparen(l)
+    if lc.kind == "Call" && lc.call_kind == "func" && !lc.args_spread && f.try_inline(lc) == nil && types.dflt(lc.ty) == "int" {
+      keep = true
+      for _, a := range c.args { if !f.no_calls(a) { keep = false } }
+    }
+    if keep {
+      lfd, ok := f.u.funcs[lc.name]
+      if !ok { nfail("function " + types.bare(lc.name) + " not found", lc) }
+      lpt := param_types(lfd)
+      for i, a := range lc.args {
+        f.bind_value(a, at_or(lpt, i))
+        A.push(RAX)
+      }
+      f.depth_in(lc)
+      A.call(f.u.p + ".f." + lc.name)            # no inc r15: the turn below keeps the unit
+      if len(lc.args) > 0 { A.add_imm(RSP, 8 * len(lc.args)) }
+    } else {
+      f.bind_value(l, v.ty)
+    }
+    if f.acc_op == "*" {
+      A.rm(0x0FAF, RAX, RBP, f.acc.off)          # imul rax, acc
+      A.store(RBP, f.acc.off, RAX)
+    } else {
+      A.rm(alu_code_mr(f.acc_op), RAX, RBP, f.acc.off)   # acc op= rax
+    }
+  }
+  if len(c.args) == 1 && !f.g.is_value_type(pt[0]) {
+    # (the parameter may change before the depth check: if it fails, nothing reads it again)
+    f.assign_var(fd.params[0], c.args[0], c, false)
+    if !keep { f.depth_in(c) }
+  } else {
+    for i, a := range c.args {
+      f.bind_value(a, pt[i])
+      A.push(RAX)
+    }
+    if !keep { f.depth_in(c) }
+    for i := len(c.args) - 1; i >= 0; i-- {
+      A.pop(RAX)
+      f.store_v(f.locals[fd.params[i]], false)
+    }
+  }
+  if f.acc_guard != nil {
+    # the first statement (done before the prologue at the entry) tested here: a turn that
+    # goes on jumps straight to the second
+    gd := f.acc_guard
+    f.cond_jump_false(gd.cond, f.acc_head)
+    f.stmt(gd.then)
+  } else {
+    A.jmp(f.acc_head)
+  }
+}
+
 fn (f: *Fn) ret_jump(n: *ast.Node) {
   A := f.a
   if !f.epi_here || n == f.last_stmt {
     A.jmp(f.exit_l)
     return
   }
+  if f.acc_on { A.load(R15, RBP, f.acc_depth.off) }
   for i, r := range f.epi_regs { A.load(r, RBP, f.epi_saved[i].off) }
   A.leave()                                     # mov rsp, rbp; pop rbp
   A.ret()
@@ -5067,6 +5261,10 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     return
   case "Return":
     if f.is_top { nfail("return outside a function", n) }
+    if f.acc_on {
+      f.acc_return(n)
+      return
+    }
     vals := n.values
     want := results_of_t(f.ret_t)
     if len(vals) == 0 && f.has_rn {

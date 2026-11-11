@@ -422,6 +422,30 @@ desafios caíram de 0 a 1%. Tempo (5 passadas intercaladas): fib 35 de 58 para 4
 o Go faz 36,7 ms. O que sobra é a passagem de argumentos pela pilha (o Go usa registradores) e
 guardar/restaurar o RBX nas chamadas que não são folha.
 
+## Rodada 20 (ângulo C): recursão como laço com acumulador
+
+**Hipótese:** o Rust transforma `fib(n - 1) + fib(n - 2)` num laço (`acc += fib(n - 1); n -= 2`):
+metade das chamadas. Com inteiros de 64 bits que dão a volta, + * & | ^ são exatamente
+associativas e comutativas, então vale para qualquer função assim.
+
+**Mudança (`acc_plan`, `acc_loop`, `acc_return` em native.caju):** numa função (não método, sem
+`defer`, sem resultados com nome, sem variáveis em célula, resultado `int`) cujos `return` diretos
+no corpo ou em blocos if/else são `L op f(args)`, `f(args) op L` (L literal ou variável local) ou
+`f(args)`, esses `return` fazem `acc = acc op L`, passam os argumentos aos parâmetros e voltam ao
+começo; os outros `return q` dão `acc op q`. A ordem de avaliação fica (L, os argumentos, depois a
+"chamada"). Cada volta faz o `dec r15; js` da chamada que substitui (no mesmo nó, mesma
+mensagem); quando L é ela mesma uma chamada e os argumentos não chamam nada, a unidade da chamada
+de L fica (sem `inc r15`/`dec r15`), porque a chamada substituída é da mesma profundidade. Na saída
+o R15 volta ao valor da entrada (guardado no quadro). Com `early_guard`, a guarda é testada de
+novo no fim de cada volta (o laço vai direto para o segundo comando). O laço do fib:
+`lea rax,[rbx-1]; push rax; dec r15; js; call fib; add rsp,8; add [acc],rax; sub rbx,2; cmp rbx,2; jge`.
+
+**Resultado:** fib 32 de 109,5 M para 75,7 M instruções (−31%; Go 102,8 M, Rust 69,4 M); ciclos
+42 M → 33 M (ruidoso). Os outros desafios não mudam. Testes: `tests/lang/self_calls_test.caju`
+(resultados, volta dos 64 bits, ordem dos efeitos, structs por valor, exatamente 10.000 chamadas
+em seis formas, profundidade das chamadas nos argumentos, recursão infinita, divisão por zero na
+mesma linha, panic recuperado); passam também no compilador anterior.
+
 ## O que ficou para depois
 
 Em ordem de ganho esperado:

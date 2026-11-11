@@ -1,0 +1,282 @@
+# Returns that combine a call of the function itself with + * & | ^ (or return it alone) become a
+# loop with an accumulator in the native compiler (acc_plan): same results (with the 64-bit
+# wraparound), same order of evaluation, the same depth limit and the same errors.
+import { describe, it, expect, run_source } from "std/testing"
+
+let log: []str = []str{}
+
+fn fib(n: int) -> int {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+fn fib_ref(n: int) -> int {
+  a := 0
+  b := 1
+  for i := 0; i < n; i++ {
+    t := a + b
+    a = b
+    b = t
+  }
+  return a
+}
+fn fact(n: int) -> int {
+  if n <= 1 { return 1 }
+  return n * fact(n - 1)
+}
+fn fact_right(n: int) -> int {
+  if n <= 1 { return 1 }
+  return fact_right(n - 1) * n
+}
+fn fact_ref(n: int) -> int {
+  p := 1
+  for i := 2; i <= n; i++ { p = p * i }
+  return p
+}
+fn sum(n: int) -> int {
+  if n == 0 { return 0 }
+  return n + sum(n - 1)
+}
+fn sum_right(n: int) -> int {
+  if n == 0 { return 0 }
+  return sum_right(n - 1) + n
+}
+fn big(n: int) -> int {
+  if n == 0 { return 0 }
+  return 4611686018427387 * 1000 + big(n - 1)
+}
+fn tick(n: int) -> int {
+  log = append(log, "t" + str(n))
+  return n
+}
+fn next(n: int) -> int {
+  log = append(log, "n" + str(n))
+  return n - 1
+}
+fn effects(n: int) -> int {
+  if n == 0 {
+    log = append(log, "end")
+    return 100
+  }
+  return tick(n) + effects(next(n))
+}
+fn effects_right(n: int) -> int {
+  if n == 0 { return 100 }
+  return effects_right(next(n)) + tick(n)
+}
+fn steps(n: int) -> int {
+  if n == 1 { return 0 }
+  if n % 2 == 0 {
+    return 1 + steps(n / 2)
+  } else if n % 3 == 0 {
+    return steps(n + 1) + 1
+  }
+  return 1 + steps(3 * n + 1)
+}
+fn mixed(n: int) -> int {
+  if n <= 0 { return 1 }
+  if n % 2 == 0 { return n + mixed(n - 1) }
+  return n * mixed(n - 1)
+}
+fn mixed_ref(n: int) -> int {
+  if n <= 0 { return 1 }
+  r := mixed_ref(n - 1)
+  if n % 2 == 0 { return n + r }
+  return n * r
+}
+fn xor_all(n: int) -> int {
+  if n == 0 { return 0 }
+  return n ^ xor_all(n - 1)
+}
+fn and_all(n: int) -> int {
+  if n == 0 { return -1 }
+  return (n | 1024) & and_all(n - 1)
+}
+fn or_all(n: int) -> int {
+  if n == 0 { return 0 }
+  return or_all(n - 1) | (1 << (n % 60))
+}
+fn gcd(a: int, b: int) -> int {
+  if b == 0 { return a }
+  return gcd(b, a % b)
+}
+fn swap(a: int, b: int, k: int) -> int {
+  if k == 0 { return a * 10 + b }
+  return swap(b, a, k - 1)
+}
+fn pairs(a: int, b: int) -> int {
+  if a <= 0 { return b }
+  return a * b + pairs(a - 1, b + a)
+}
+fn locals(n: int) -> int {
+  if n == 0 { return 0 }
+  x := n * 2
+  x = x + 1
+  return x + locals(n - 1)
+}
+fn halves(x: num, n: int) -> int {
+  if n == 0 { return 0 }
+  return int(x) + halves(x / 2, n - 1)
+}
+fn one(n: int) -> int {
+  if n < 0 { return 0 }
+  return 1
+}
+fn ones(n: int) -> int {
+  if n <= 0 { return 0 }
+  return one(n) + ones(n - 1)
+}
+fn no_guard(n: int) -> int {
+  s := 0
+  if n > 0 {
+    s = n
+    return s + no_guard(n - 1)
+  }
+  return 7
+}
+fn boom(n: int) -> int {
+  if n == 0 { panic("deep") }
+  return 1 + boom(n - 1)
+}
+fn deep_then_recover(n: int) -> int {
+  defer fn() { recover() }()
+  return boom(n)
+}
+fn with_defer(n: int) -> int {
+  defer fn() { log = append(log, "d" + str(n)) }()
+  if n == 0 { return 0 }
+  return n + with_defer(n - 1)
+}
+fn captured(n: int) -> int {
+  if n == 0 { return 0 }
+  get := fn() -> int { return n }
+  return get() + captured(n - 1)
+}
+struct P { x: int }
+let kept: []P = []P{}
+fn by_value(p: P) -> int {
+  kept = append(kept, p)
+  if p.x <= 0 { return 0 }
+  q := p
+  q.x = q.x - 1
+  return p.x + by_value(q)
+}
+fn by_value2(p: P, n: int) -> int {
+  if n == 0 { return p.x }
+  q := p
+  q.x = q.x + n
+  return p.x + by_value2(q, n - 1)
+}
+struct Acc { k: int }
+fn (a: *Acc) total(n: int) -> int {
+  if n == 0 { return a.k }
+  return n + a.total(n - 1)
+}
+
+describe("self calls in return", fn() {
+  it("give the same results as plain recursion", fn() {
+    for n := 0; n <= 30; n++ { expect(fib(n)).to_equal(fib_ref(n)) }
+    for n := -2; n <= 30; n++ {
+      expect(fact(n)).to_equal(fact_ref(n))
+      expect(fact_right(n)).to_equal(fact_ref(n))
+    }
+    expect(sum(5000)).to_equal(12502500)
+    expect(sum_right(5000)).to_equal(12502500)
+    expect(mixed(25)).to_equal(mixed_ref(25))
+    expect(steps(27)).to_equal(19)
+    expect(steps(9)).to_equal(7)
+    expect(xor_all(1000)).to_equal(1000)
+    expect(and_all(5)).to_equal(1024)
+    expect(or_all(70)).to_equal((1 << 60) - 1)
+    expect(gcd(1071, 462)).to_equal(21)
+    expect(swap(1, 2, 3)).to_equal(21)
+    expect(swap(1, 2, 4)).to_equal(12)
+    expect(pairs(4, 1)).to_equal(4 * 1 + 3 * 5 + 2 * 8 + 1 * 10 + 11)
+    expect(locals(3)).to_equal(7 + 5 + 3)
+    expect(halves(100.0, 4)).to_equal(100 + 50 + 25 + 12)
+    expect(ones(5000)).to_equal(5000)
+    expect(no_guard(3)).to_equal(13)
+  })
+  it("copy struct parameters like a call", fn() {
+    kept = []P{}
+    expect(by_value(P{x: 3})).to_equal(6)
+    xs := []int{}
+    for _, k := range kept { xs = append(xs, k.x) }
+    expect(xs).to_equal([]int{3, 2, 1, 0})
+    expect(by_value2(P{x: 1}, 3)).to_equal(1 + 4 + 6 + 7)
+  })
+  it("wrap around at 64 bits like before", fn() {
+    expect(fact(25)).to_equal(fact_ref(25))
+    expect(fact(66)).to_equal(0)
+    expect(big(3000)).to_equal(4611686018427387 * 1000 * 3000)
+  })
+  it("evaluate the operands and the arguments in the same order", fn() {
+    log = []str{}
+    expect(effects(3)).to_equal(106)
+    expect(log).to_equal([]str{"t3", "n3", "t2", "n2", "t1", "n1", "end"})
+    log = []str{}
+    expect(effects_right(3)).to_equal(106)
+    expect(log).to_equal([]str{"n3", "n2", "n1", "t1", "t2", "t3"})
+  })
+  it("keep the functions that cannot loop", fn() {
+    log = []str{}
+    expect(with_defer(2)).to_equal(3)
+    expect(log).to_equal([]str{"d0", "d1", "d2"})
+    expect(captured(4)).to_equal(10)
+    a := &Acc{k: 100}
+    expect(a.total(4)).to_equal(110)
+  })
+  it("allow exactly 10,000 nested calls", fn() {
+    pre := "fn one(n: int) -> int {\n  if n < 0 { return 0 }\n  return 1\n}\n"
+    srcs := []str{
+      "fn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return n + d(n - 1)\n}\n",
+      "fn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return d(n - 1) * 1\n}\n",
+      "fn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return one(n) + d(n - 1)\n}\n" + pre,
+      "fn d(n: int) -> int {\n  if n < 2 { return 0 }\n  return d(n - 1) + d(0)\n}\n",
+      "fn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return d(n - 1)\n}\n",
+      "fn d(n: int, m: int) -> int {\n  if n == 0 { return m }\n  return d(n - 1, m)\n}\n",
+    }
+    want := []str{"49995000", "0", "9999", "0", "0", "0"}
+    for i, s := range srcs {
+      call := "d(9999)"
+      over := "d(10000)"
+      if i == 3 {
+        call = "d(10000)"
+        over = "d(10001)"
+      }
+      if i == 5 {
+        call = "d(9999, 0)"
+        over = "d(10000, 0)"
+      }
+      r := run_source(s + "print(" + call + ")\n")
+      expect(r.output).to_equal(want[i])
+      r2 := run_source(s + "print(" + over + ")\n")
+      expect(r2.output).to_equal("Runtime error in main.caju, line 3: Too much recursion: more than 10,000 nested function calls.")
+    }
+  })
+  it("count the depth of calls made inside the loop", fn() {
+    # the calls in the arguments and in the other operand happen at the depth they had before
+    s := "fn one(n: int) -> int {\n  if n < 0 { return 0 }\n  return 1\n}\nfn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return d(n - 1) + one(n)\n}\n"
+    expect(run_source(s + "print(d(9999))\n").output).to_equal("9999")
+    expect(run_source(s + "print(d(10000))\n").output).to_equal("Runtime error in main.caju, line 7: Too much recursion: more than 10,000 nested function calls.")
+    s2 := "fn two(n: int) -> int {\n  if n < 0 { return 0 }\n  return n - n + 2\n}\nfn d(n: int) -> int {\n  if n == 0 { return 0 }\n  return 1 + d(two(n) + n - 3)\n}\n"
+    expect(run_source(s2 + "print(d(9999))\n").output).to_equal("9999")
+    expect(run_source(s2 + "print(d(10000))\n").output).to_equal("Runtime error in main.caju, line 7: Too much recursion: more than 10,000 nested function calls.")
+  })
+  it("fail an infinite recursion instead of looping forever", fn() {
+    r := run_source("fn inf(n: int) -> int {\n  return n + inf(n + 1)\n}\nprint(inf(0))\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 2: Too much recursion: more than 10,000 nested function calls.")
+    r2 := run_source("fn inf(n: int) -> int {\n  return inf(n + 1)\n}\nprint(inf(0))\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 2: Too much recursion: more than 10,000 nested function calls.")
+  })
+  it("report runtime errors at the same line", fn() {
+    s := "fn dz(n: int, d: int) -> int {\n  if n == 0 { return 0 }\n  return n / d + dz(n - 1, d - 1)\n}\nprint(dz(5, 3))\n"
+    expect(run_source(s).output).to_equal("Runtime error in main.caju, line 3: Integer division by zero.")
+    s2 := "fn dz(n: int, d: int) -> int {\n  if n == 0 { return 0 }\n  return dz(n - 1, d - 1) + n % d\n}\nprint(dz(5, 3))\n"
+    expect(run_source(s2).output).to_equal("Runtime error in main.caju, line 3: Remainder of integer division by zero.")
+  })
+  it("give the whole depth back after a recovered panic deep down", fn() {
+    expect(deep_then_recover(5000)).to_equal(0)
+    expect(deep_then_recover(5000)).to_equal(0)
+    expect(sum(9900)).to_equal(49009950)
+  })
+})
