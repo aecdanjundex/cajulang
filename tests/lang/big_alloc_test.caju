@@ -1,0 +1,88 @@
+# Large objects (over 16 KB) take whole 64 KB pages. Pages never used are not zeroed again (the
+# system gives them as 0); freed runs of 1 MB or more go back to the system (rt_os_release) and
+# a map frees its old arrays as soon as it grows (rt_free_big). Reused pages must still read as 0.
+import { describe, it, expect } from "std/testing"
+
+fn nonzero(a: []int) -> int {
+  c := 0
+  for _, x := range a { if x != 0 { c++ } }
+  return c
+}
+
+describe("large objects", fn() {
+  it("start zeroed when their pages are reused after a collection", fn() {
+    bad := 0
+    keep := [][]int{}
+    for round := 0; round < 40; round++ {
+      big := make([]int, 300000)                  # 2.4 MB: released when freed
+      mid := make([]int, 5000)                    # 40 KB: kept by the allocator when freed
+      bad += nonzero(big) + nonzero(mid)
+      for i := 0; i < len(big); i++ { big[i] = i + 1 }
+      for i := 0; i < len(mid); i++ { mid[i] = -1 }
+      if round % 10 == 0 { keep = append(keep, mid) }
+    }
+    expect(bad).to_equal(0)
+    total := 0
+    for _, k := range keep { total += len(k) - nonzero(k) }
+    expect(total).to_equal(0)
+  })
+  it("keep their contents while other big objects come and go", fn() {
+    a := make([]int, 200000)
+    for i := 0; i < len(a); i++ { a[i] = i * 3 }
+    for round := 0; round < 30; round++ {
+      t := make([]int, 250000)
+      t[len(t) - 1] = round
+    }
+    ok := true
+    for i := 0; i < len(a); i++ { if a[i] != i * 3 { ok = false } }
+    expect(ok).to_be_true()
+  })
+})
+
+describe("maps that grow", fn() {
+  it("keep every entry while their old arrays are freed", fn() {
+    ms := []map[int]int{}
+    for j := 0; j < 3; j++ { ms = append(ms, map[int]int{}) }
+    for i := 0; i < 200000; i++ {
+      for j := 0; j < 3; j++ { ms[j][i * (j + 1)] = i }
+    }
+    bad := 0
+    for j := 0; j < 3; j++ {
+      for i := 0; i < 200000; i++ { if ms[j][i * (j + 1)] != i { bad++ } }
+      if len(ms[j]) != 200000 { bad++ }
+    }
+    expect(bad).to_equal(0)
+  })
+  it("grow while being ranged over (the range sees the keys it started with)", fn() {
+    m := map[int]int{}
+    for i := 0; i < 1000; i++ { m[i] = i }
+    seen := 0
+    for k, v := range m {
+      if k != v { seen = -1000000 }
+      if k < 1000 { m[k + 100000] = k + 100000 }
+      seen++
+    }
+    expect(len(m)).to_equal(2000)
+    expect(seen).to_equal(1000)                   # the keys there when the range started
+    first := []int{}
+    for k, _ := range m { if len(first) < 2 || k == 100000 { first = append(first, k) } }
+    expect(first).to_equal([]int{0, 1, 100000})
+  })
+  it("keep string keys found after many growths with deletes", fn() {
+    m := map[str]int{}
+    for i := 0; i < 50000; i++ {
+      m["k" + str(i)] = i
+      if i % 3 == 0 { delete(m, "k" + str(i / 2)) }
+    }
+    bad := 0
+    count := 0
+    for k, v := range m {
+      if k != "k" + str(v) { bad++ }
+      count++
+    }
+    expect(bad).to_equal(0)
+    expect(count).to_equal(len(m))
+    _, gone := m["k0"]
+    expect(gone).to_be_false()
+  })
+})

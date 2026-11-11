@@ -22,6 +22,8 @@ fn rt_os_mem(n: int) -> int { return __syscall(9, 0, n, 3, 34, -1, 0) }
 # reserves addresses without using memory (MAP_NORESERVE); a page only exists once it is touched
 fn rt_os_reserve(n: int) -> int { return __syscall(9, 0, n, 3, 16418, -1, 0) }
 fn rt_os_commit(p: int, n: int) { }
+# gives the memory of free pages back to the system (MADV_DONTNEED): they read as 0 when touched again
+fn rt_os_release(p: int, n: int) { __syscall(28, p, n, 4, 0, 0, 0) }
 fn rt_os_exit(c: int) { __syscall(231, c, 0, 0, 0, 0, 0) }
 fn rt_os_sleep(s: num) {
   ts := rt_tmp + 64

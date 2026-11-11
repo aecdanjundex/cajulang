@@ -168,6 +168,25 @@ fn rt_alloc_x(n: int, noscan: bool) -> int {
   if !rt_fresh { rt_zero_mem(p, np << 16) }
   return p
 }
+# the np pages of the large object at page pi become free (big runs go back to the system)
+fn rt_free_run(pi: int, np: int) {
+  i := 0
+  while i < np {
+    __store8(rt_pg_kind + pi + i, 0)
+    i++
+  }
+  __store8(rt_pg_flag + pi, 0)
+  rt_free_pages += np
+  if np >= 16 { rt_os_release(rt_arena + (pi << 16), np << 16) }
+}
+# frees p now when it is a large object nothing else can point to (the old arrays of a map that
+# grew); other objects are left to the collector
+fn rt_free_big(p: int) {
+  if p < rt_arena or p & 65535 != 0 { return }
+  pi := (p - rt_arena) >> 16
+  if pi >= rt_top_page or __load8(rt_pg_kind + pi) != 2 { return }
+  rt_free_run(pi, __load64(rt_pg_info + 8 * pi))
+}
 fn rt_alloc(n: int) -> int { return rt_alloc_x(n, false) }
 fn rt_alloc_ns(n: int) -> int { return rt_alloc_x(n, true) }
 
@@ -268,13 +287,7 @@ fn rt_sweep() {
       f := __load8(rt_pg_flag + pi)
       np := __load64(rt_pg_info + 8 * pi)
       if f & 1 == 0 {
-        i := 0
-        while i < np {
-          __store8(rt_pg_kind + pi + i, 0)
-          i++
-        }
-        __store8(rt_pg_flag + pi, 0)
-        rt_free_pages += np
+        rt_free_run(pi, np)
       } else {
         __store8(rt_pg_flag + pi, f &^ 1)
       }

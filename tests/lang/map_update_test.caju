@@ -1,0 +1,200 @@
+# m[k] op= v and m[k] = m[k] op v probe the map once (rt_map_slot finds or inserts the key and
+# gives the address of its value) when nothing in v can call or fail; these tests check that the
+# result, the evaluation order and the errors are those of a read followed by a write.
+import { describe, it, expect, run_source } from "std/testing"
+import "std/math"
+
+fn safe(f: fn()) -> (err: error) {
+  defer fn() {
+    if r := recover(); r != nil { err = errors.New("recovered: " + str(r)) }
+  }()
+  f()
+  return nil
+}
+
+let calls: []str = []str{}
+fn key(k: str) -> str {
+  calls = append(calls, "key " + k)
+  return k
+}
+fn val(v: int) -> int {
+  calls = append(calls, "val " + str(v))
+  return v
+}
+
+struct Counter { m: map[str]int }
+
+let gm: map[int]int = map[int]int{}
+
+describe("updating a map element", fn() {
+  it("starts a missing key from the zero value", fn() {
+    mi := map[str]int{}
+    mu := map[str]uint{}
+    mn := map[str]num{}
+    mb := map[str]uint8{}
+    mi["a"] += 5
+    mi["b"] = mi["b"] + 7
+    mi["c"] -= 3
+    mu["a"] += 2
+    mn["a"] += 1.5
+    mn["b"] = mn["b"] - 0.25
+    mb["a"] |= 6
+    expect(mi).to_equal(map[str]int{"a": 5, "b": 7, "c": -3})
+    expect(mu["a"]).to_equal(uint(2))
+    expect(mn["a"]).to_equal(1.5)
+    expect(mn["b"]).to_equal(-0.25)
+    expect(int(mb["a"])).to_equal(6)
+  })
+  it("applies every operator to an existing value", fn() {
+    m := map[int]int{1: 12, 2: 12, 3: 12, 4: 12, 5: 12, 6: 12, 7: 12}
+    x := 10
+    m[1] += x
+    m[2] -= x
+    m[3] *= x
+    m[4] &= x
+    m[5] |= x
+    m[6] ^= x
+    m[7] &^= x
+    expect(m).to_equal(map[int]int{1: 22, 2: 2, 3: 120, 4: 8, 5: 14, 6: 6, 7: 4})
+    m[1] = m[1] + x * 2
+    m[2] = m[2] - (x + 1)
+    m[3] = x + m[3]
+    m[4] = x - m[4]
+    m[5] = m[5] * -1
+    m[6] = m[6] / 4
+    m[7] = m[7] % 3
+    expect(m).to_equal(map[int]int{1: 42, 2: -9, 3: 130, 4: 2, 5: -14, 6: 1, 7: 1})
+  })
+  it("computes num values like a read and a write", fn() {
+    m := map[str]num{"a": 3.0}
+    f := 2.0
+    m["a"] *= f
+    m["a"] /= 4.0
+    m["a"] = m["a"] + f * 0.5
+    m["b"] = 0.5 * m["b"]
+    expect(m["a"]).to_equal(2.5)
+    expect(m["b"]).to_equal(0.0)
+    expect(len(m)).to_equal(2)
+  })
+  it("wraps sized integers around", fn() {
+    m := map[int]int8{}
+    m[0] += 100
+    m[0] += 100
+    n := map[int]uint8{}
+    n[0] = n[0] - 1
+    expect(int(m[0])).to_equal(-56)
+    expect(int(n[0])).to_equal(255)
+  })
+  it("keeps concatenation and other types working", fn() {
+    m := map[str]str{}
+    m["a"] += "x"
+    m["a"] = m["a"] + "y"
+    m["b"] = "z" + m["b"]
+    expect(m).to_equal(map[str]str{"a": "xy", "b": "z"})
+  })
+  it("evaluates the key once for op= and twice for m[k] = m[k] + v, in order", fn() {
+    calls = []str{}
+    m := map[str]int{}
+    m[key("a")] += val(1)
+    m[key("a")] = m[key("b")] + val(2)
+    expect(calls).to_equal([]str{"key a", "val 1", "key a", "key b", "val 2"})
+    expect(m).to_equal(map[str]int{"a": 2})
+    _, has_b := m["b"]
+    expect(has_b).to_be_false()
+  })
+  it("sees a map changed by the value being computed", fn() {
+    m := map[int]int{}
+    grow := fn() -> int {
+      for i := 1; i <= 1000; i++ { m[i] = i }
+      return 1
+    }
+    m[0] += grow()
+    m[2000] = m[2000] + grow()
+    expect(len(m)).to_equal(1002)
+    expect(m[0]).to_equal(1)
+    expect(m[2000]).to_equal(1)
+    keys := []int{}
+    for k, _ := range m { if k == 0 || k > 999 { keys = append(keys, k) } }
+    expect(keys).to_equal([]int{1000, 0, 2000})
+  })
+  it("does not insert the key when the value fails", fn() {
+    m := map[str]int{}
+    z := 0
+    expect(safe(fn() { m["x"] += 10 / z })).to_be_error("recovered: Integer division by zero")
+    expect(safe(fn() { m["y"] = m["y"] + 10 % z })).to_be_error("recovered: Remainder of integer division by zero")
+    l := []int{1}
+    expect(safe(fn() { m["w"] += l[z + 3] })).to_be_error("recovered: Index 3 out of range (length 1)")
+    mn := map[str]num{}
+    fz := 0.0
+    expect(safe(fn() { mn["x"] /= fz })).to_be_error("recovered: Division by zero")
+    expect(safe(fn() { mn["y"] = mn["y"] + 1.0 / fz })).to_be_error("recovered: Division by zero")
+    expect(len(m) + len(mn)).to_equal(0)
+  })
+  it("fails on a nil map with the usual message", fn() {
+    let mm: map[str]int = nil
+    let mn: map[int]num = nil
+    expect(safe(fn() { mm["a"] += 1 })).to_be_error("recovered: Assignment to a nil map or slice")
+    expect(safe(fn() { mm["a"] = mm["a"] + 1 })).to_be_error("recovered: Assignment to a nil map or slice")
+    expect(safe(fn() { mn[1] *= 2.0 })).to_be_error("recovered: Assignment to a nil map or slice")
+    r := run_source("let m: map[str]int = nil\nx := 2\nm[\"k\"] = m[\"k\"] + x\n")
+    expect(r.output).to_equal("Runtime error in main.caju, line 3: Assignment to a nil map or slice.")
+    r2 := run_source("let m: map[str]int = nil\nm[\"k\"] += 1\n")
+    expect(r2.output).to_equal("Runtime error in main.caju, line 2: Assignment to a nil map or slice.")
+  })
+  it("keeps insertion order across growth, deletes and new keys", fn() {
+    m := map[int]int{}
+    for i := 0; i < 3000; i++ {
+      k := (i * 7) % 1000
+      m[k] = m[k] + i
+    }
+    delete(m, 7)
+    m[7] += 1
+    order := []int{}
+    total := 0
+    for k, v := range m {
+      if len(order) < 3 { order = append(order, k) }
+      total += v
+    }
+    expect(len(m)).to_equal(1000)
+    expect(order).to_equal([]int{0, 14, 21})
+    last := 0
+    for k, _ := range m { last = k }
+    expect(last).to_equal(7)
+    expect(m[7]).to_equal(1)
+    expect(total).to_equal(4498500 - (1 + 1001 + 2001) + 1)
+  })
+  it("treats 0.0 and -0.0, and NaN, as num keys like a plain write does", fn() {
+    m := map[num]int{}
+    m[0.0] += 1
+    m[-0.0] = m[-0.0] + 1
+    nan := math.nan()
+    m[nan] += 1
+    m[nan] = m[nan] + 1
+    expect(m[0.0]).to_equal(2)
+    expect(len(m)).to_equal(2)
+    expect(m[nan]).to_equal(2)
+  })
+  it("works on maps in fields, globals and closures", fn() {
+    c := &Counter{m: map[str]int{}}
+    c.m["a"] += 2
+    c.m["a"] = c.m["a"] + 3
+    gm[1] += 4
+    gm[1] = gm[1] * 2
+    local := map[int]int{}
+    bump := fn(k: int) { local[k] = local[k] + k }
+    bump(3)
+    bump(3)
+    expect(c.m["a"]).to_equal(5)
+    expect(gm[1]).to_equal(8)
+    expect(local[3]).to_equal(6)
+  })
+  it("handles keys that are expressions", fn() {
+    m := map[int]int{}
+    a := []int{4, 5}
+    for i := 0; i < 10; i++ {
+      m[i % 3] = m[i % 3] + 1
+      m[a[i % 2]] = m[a[i % 2]] + i
+    }
+    expect(m).to_equal(map[int]int{0: 4, 1: 3, 2: 3, 4: 20, 5: 25})
+  })
+})

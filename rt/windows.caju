@@ -19,5 +19,7 @@ fn rt_os_write(p: int, n: int) { WriteFile(rt_stdout, p, n, rt_tmp + 64, 0) }
 fn rt_os_mem(n: int) -> int { return VirtualAlloc(0, n, 12288, 4) }
 fn rt_os_reserve(n: int) -> int { return VirtualAlloc(0, n, 8192, 1) }
 fn rt_os_commit(p: int, n: int) { VirtualAlloc(p, n, 4096, 4) }
+# free pages keep their memory on Windows (rt_alloc_x zeroes reused pages anyway)
+fn rt_os_release(p: int, n: int) { }
 fn rt_os_exit(c: int) { ExitProcess(c) }
 fn rt_os_sleep(s: num) { Sleep(int(s * 1000.0)) }

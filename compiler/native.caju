@@ -421,6 +421,14 @@ fn (g: *Gen) key_kind(t: str, n: *ast.Node) -> int {
   if types.dflt(t) == "str" { return 2 }
   return 0
 }
+# the argument of rt_map_new: the key kind, plus 256 when neither keys nor values are pointers
+# (the entries array is then allocated without pointers: the collector does not scan it)
+fn (g: *Gen) map_kinds(ti: *types.TInfo) -> int {
+  kk := g.key_kind(ti.key, nil)
+  c := g.cls(ti.val, nil)
+  if kk != 2 && (c == "i" || c == "f") { kk += 256 }
+  return kk
+}
 
 # fits RAX to the size of integer kind k (int8 wraps around at 8 bits, etc.)
 fn (g: *Gen) wrap_kind(k: int) {
@@ -4297,7 +4305,7 @@ fn (f: *Fn) composite(n: *ast.Node) {
     return
   }
   if ti.k == "map" {
-    A.mov_imm(RAX, g.key_kind(ti.key, nil))
+    A.mov_imm(RAX, g.map_kinds(ti))
     A.push(RAX)
     f.rt("rt_map_new", 1)
     A.push(RAX)
@@ -4810,7 +4818,7 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     t := types.dflt(n.type_arg)
     ti := types.tinfo(t)
     if ti.k == "map" {
-      A.mov_imm(RAX, g.key_kind(ti.key, nil))
+      A.mov_imm(RAX, g.map_kinds(ti))
       A.push(RAX)
       f.rt("rt_map_new", 1)
       return
@@ -4866,6 +4874,14 @@ fn (f: *Fn) builtin(n: *ast.Node) {
   case "__load64":
     f.expr(args[0])
     A.byte3(0x48, 0x8B, 0x00)
+    return
+  case "__load32":
+    f.expr(args[0])
+    A.byte2(0x8B, 0x00)                           # mov eax, [rax] (zero-extended)
+    return
+  case "__store32":
+    f.two(args)
+    A.byte2(0x89, 0x08)                           # mov [rax], ecx
     return
   case "__store8":
     f.two(args)
@@ -4951,6 +4967,12 @@ fn (f: *Fn) builtin(n: *ast.Node) {
   nfail("the function " + nm + " is not supported yet", n)
 }
 fn (f: *Fn) two(args: []*ast.Node) {
+  if is_simple(args[1]) {
+    # a variable or a constant: straight to RCX, without the stack
+    f.expr(args[0])
+    f.simple_to(args[1], RCX)
+    return
+  }
   f.expr(args[0])
   f.a.push(RAX)
   f.expr(args[1])
@@ -5374,6 +5396,7 @@ fn (f: *Fn) unpack_call(v: *ast.Node) -> []*Var {
 # a, b = b, a and v, ok := m[k]: evaluates everything before storing, as in Go
 fn (f: *Fn) multi(targets: []*ast.Node, values: []*ast.Node, decl: bool, n: *ast.Node) {
   A := f.a
+  if len(targets) == 1 && len(values) == 1 && !decl && f.map_fused_assign(targets[0], values[0], n) { return }
   if len(targets) == 1 && len(values) == 1 && f.single_assign(targets[0], values[0], decl, n) { return }
   prep := []*Target{}
   for _, t := range targets { prep = append(prep, f.prep_target(t)) }
@@ -5685,6 +5708,131 @@ fn (f: *Fn) find_loop(n: *ast.Node) -> *Loop {
 fn (f: *Fn) push_loop(brk: str, cont: str, label: str) { f.loops = append(f.loops, &Loop{brk: brk, cont: cont, label: label}) }
 fn (f: *Fn) pop_loop() { f.loops = f.loops[:len(f.loops) - 1] }
 fn (f: *Fn) cond_jump_false(cond: *ast.Node, dest: str) { f.jump_if(cond, false, dest) }
+# ---- m[k] op= v and m[k] = m[k] op v in one probe (rt_map_slot: find or insert k, then the
+# address of its value) instead of a read and a write. The address is valid only until the next
+# insertion and a missing key is inserted before v is used, so v must call nothing (no allocation)
+# and fail in no way (else the key would stay with the value 0): variables, numbers, + - * & | ^.
+# The value type must have 0 as its zero value and fill the 8-byte slot (integers and num).
+fn (f: *Fn) map_fused_type(t: str) -> bool {
+  d := types.dflt(t)
+  if d == "num" { return true }
+  return f.g.cls(t, nil) == "i" && d != "bool" && !f.g.is_iface_t(t) && !f.g.is_value_type(t) && f.g.kind_of_t(d) != "map" && f.g.kind_of_t(d) != "slice"
+}
+fn map_fused_op(op: str, fl: bool) -> bool {
+  return op == "+" || op == "-" || op == "*" || (!fl && (op == "&" || op == "|" || op == "^" || op == "&^"))
+}
+fn (f: *Fn) map_fused_operand(n: *ast.Node, fl: bool) -> bool {
+  g := f.g
+  if n.ty == "" || g.is_iface_t(n.ty) { return false }
+  c := g.cls(n.ty, n)
+  if (fl && c != "f") || (!fl && c != "i") || types.dflt(n.ty) == "bool" { return false }
+  switch n.kind {
+  case "Number": return true
+  case "Var": return !n.fn_ref
+  case "Paren": return f.map_fused_operand(n.expr, fl)
+  case "Neg": return f.map_fused_operand(n.arg, fl)
+  case "Binary":
+    if n.fk != ast.NONE || !map_fused_op(n.op, fl) { return false }
+    return f.map_fused_operand(n.left, fl) && f.map_fused_operand(n.right, fl)
+  }
+  return false
+}
+# a and b are the same expression, without calls nor side effects (evaluating it once or twice
+# in a row gives the same value)
+fn (f: *Fn) same_pure(a: *ast.Node, b: *ast.Node) -> bool {
+  if a == nil || b == nil || a.kind != b.kind || types.dflt(a.ty) != types.dflt(b.ty) { return false }
+  switch a.kind {
+  case "Var": return a.name == b.name && !a.fn_ref && !b.fn_ref
+  case "Number": return a.raw == b.raw && a.num_value == b.num_value
+  case "String": return a.str_value == b.str_value
+  case "Bool": return a.bool_value == b.bool_value
+  case "Paren": return f.same_pure(a.expr, b.expr)
+  case "Neg", "Not", "BitNot": return f.same_pure(a.arg, b.arg) && f.no_calls(a)
+  case "Binary": return a.op == b.op && a.ik == b.ik && a.fk == b.fk && f.same_pure(a.left, b.left) && f.same_pure(a.right, b.right) && f.no_calls(a)
+  }
+  return false
+}
+# tg op= v (tg = m[k]); false when the pattern does not qualify (nothing emitted)
+fn (f: *Fn) map_fused(tg: *ast.Node, op: str, ik: int, fk: int, v: *ast.Node, n: *ast.Node) -> bool {
+  A := f.a
+  g := f.g
+  if tg.kind != "Index" || g.kind_of_t(types.dflt(tg.obj.ty)) != "map" || !f.map_fused_type(tg.ty) { return false }
+  fl := types.dflt(tg.ty) == "num"
+  if !map_fused_op(op, fl) || !f.map_fused_operand(v, fl) { return false }
+  if fl && (fk != ast.NONE || ik != ast.NONE || !f.fpure(v)) { return false }
+  if !fl && !f.no_calls(v) { return false }
+  f.where_arg(n)
+  f.expr(tg.obj)                                  # the map and the key, once and in this order
+  A.push(RAX)
+  f.expr_to(tg.index, types.tinfo(types.dflt(tg.obj.ty)).key)
+  A.push(RAX)
+  f.rt("rt_map_slot", 3)                          # rax = the value's address
+  mr := alu_code_mr(op)
+  if !fl && mr >= 0 && !needs_wrap(ik) && !needs_wrap(kind_code(tg.ty)) {
+    # op [rax], v
+    imm, is_imm := f.imm32(v)
+    if is_imm {
+      _, ext := alu_code(op)
+      if imm >= -128 && imm <= 127 {
+        A.rm(0x83, ext, RAX, 0)
+        A.byte(imm)
+      } else {
+        A.rm(0x81, ext, RAX, 0)
+        A.d32(imm)
+      }
+      return true
+    }
+    r := f.reg_of(v)
+    if r == 0 && f.simple_to(v, RCX) { r = RCX }
+    if r != 0 {
+      A.rm(mr, r, RAX, 0)
+      return true
+    }
+    A.push(RAX)
+    f.expr(v)
+    A.pop(RCX)
+    A.rm(mr, RAX, RCX, 0)                         # op [rcx], rax
+    return true
+  }
+  addr := f.hidden()
+  f.store_slot(addr)
+  A.load(RAX, RAX, 0)
+  cur := f.hidden()
+  f.store_slot(cur)
+  f.tmp_load = cur
+  tnode := ast.new_node("·tmp", 0, 0)
+  tnode.ty = tg.ty
+  fake := ast.new_node("Binary", n.line, n.col)
+  fake.op = op
+  fake.left = tnode
+  fake.right = v
+  fake.ik = ik
+  fake.fk = fk
+  fake.ty = tg.ty
+  f.expr(fake)
+  f.store_target(&Target{t: tg, addr: addr}, false, n)
+  return true
+}
+# m[k] = m[k] op v / m[k] = v op m[k] (op commutative), the same m and k written twice
+fn (f: *Fn) map_fused_assign(t: *ast.Node, v: *ast.Node, n: *ast.Node) -> bool {
+  if v.kind != "Binary" || t.kind != "Index" { return false }
+  if types.dflt(v.ty) != types.dflt(t.ty) { return false }
+  other := v.right
+  rd := v.left
+  if !f.map_read_of(rd, t) {
+    if v.op == "-" || v.op == "/" || v.op == "&^" || !f.map_read_of(v.right, t) { return false }
+    rd = v.right
+    other = v.left
+  }
+  if types.dflt(rd.ty) != types.dflt(t.ty) { return false }
+  return f.map_fused(t, v.op, v.ik, v.fk, other, n)
+}
+# r reads the same map element that t writes (m[k] and m[k], m and k without side effects)
+fn (f: *Fn) map_read_of(r: *ast.Node, t: *ast.Node) -> bool {
+  if r.kind != "Index" || r.comma_ok { return false }
+  if f.g.kind_of_t(types.dflt(r.obj.ty)) != "map" { return false }
+  return f.same_pure(r.obj, t.obj) && f.same_pure(r.index, t.index)
+}
 # a[i] op= v for a list or array element that is not a struct: the address is computed once,
 # the element is read before v is evaluated (like the general case) and written back
 fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
@@ -5859,6 +6007,7 @@ fn (f: *Fn) stmt0(n: *ast.Node) {
       f.store_v(v, false)
       return
     }
+    if tg.kind == "Index" && f.map_fused(tg, n.op, n.ik, n.fk, n.value, n) { return }
     if f.index_op_assign(n) { return }
     # compound target: prepare once, read, compute and store
     p := f.prep_target(tg)

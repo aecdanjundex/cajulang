@@ -279,7 +279,7 @@ let BUILTIN_SIG = map[str]*Sig{
 }
 # Low-level operations, only for the native compiler's runtime (written in Caju)
 let INTRINSIC_SIG = map[str]*Sig{
-  "__load8": &Sig{[]str{"int"}, "int"}, "__load64": &Sig{[]str{"int"}, "int"}, "__store8": &Sig{[]str{"int", "int"}, "void"}, "__store64": &Sig{[]str{"int", "int"}, "void"},
+  "__load8": &Sig{[]str{"int"}, "int"}, "__load32": &Sig{[]str{"int"}, "int"}, "__store32": &Sig{[]str{"int", "int"}, "void"}, "__load64": &Sig{[]str{"int"}, "int"}, "__store8": &Sig{[]str{"int", "int"}, "void"}, "__store64": &Sig{[]str{"int", "int"}, "void"},
   "__syscall": &Sig{[]str{"int", "int", "int", "int", "int", "int", "int"}, "int"}, "__argp": &Sig{[]str{}, "int"}, "__sp": &Sig{[]str{}, "int"}, "__calldefer": &Sig{[]str{"int"}, "void"}, "__jump": &Sig{[]str{"int", "int"}, "void"},
   "__strp": &Sig{[]str{"str"}, "int"}, "__pstr": &Sig{[]str{"int"}, "str"}, "__fbits": &Sig{[]str{"num"}, "int"}, "__bitsf": &Sig{[]str{"int"}, "num"},
   "__sqrt": &Sig{[]str{"num"}, "num"}, "__fmod": &Sig{[]str{"num", "num"}, "num"},
