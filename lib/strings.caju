@@ -14,25 +14,28 @@ fn (b: *Builder) grow(extra: int) {
   if c < 64 { c = 64 }
   while c < b.n + extra { c = c * 2 }
   m := __newstr(c)
-  i := 0
-  while i < b.n {
-    __store8(m + 8 + i, __load8(b.mem + 8 + i))
-    i++
-  }
+  copy_mem(m + 8, b.mem + 8, b.n)
   b.mem = m
   b.cap = c
+}
+
+# copies n bytes from s to d (8 at a time)
+fn copy_mem(d: int, s: int, n: int) {
+  i := 0
+  while i + 8 <= n {
+    __store64(d + i, __load64(s + i))
+    i += 8
+  }
+  while i < n {
+    __store8(d + i, __load8(s + i))
+    i++
+  }
 }
 export fn (b: *Builder) write(s: str) {
   n := len(s)
   if n == 0 { return }
   b.grow(n)
-  p := __strp(s) + 8
-  d := b.mem + 8 + b.n
-  i := 0
-  while i < n {
-    __store8(d + i, __load8(p + i))
-    i++
-  }
+  copy_mem(b.mem + 8 + b.n, __strp(s) + 8, n)
   b.n += n
 }
 export fn (b: *Builder) write_byte(c: int) {
@@ -64,11 +67,7 @@ export fn (b: *Builder) reset() { b.n = 0 }
 # the bytes written so far, as a new string (the builder can keep growing)
 export fn (b: *Builder) string() -> str {
   m := __newstr(b.n)
-  i := 0
-  while i < b.n {
-    __store8(m + 8 + i, __load8(b.mem + 8 + i))
-    i++
-  }
+  copy_mem(m + 8, b.mem + 8, b.n)
   return __pstr(m)
 }
 

@@ -4,7 +4,15 @@
 #   http.handle("/", fn(req: *http.Request, res: *http.Response) { res.write("hello world") })
 #   err := http.listen_and_serve("0.0.0.0", 3200)
 #
-# Connections are served one at a time, each request on its own connection (Connection: close).
+# listen_and_serve runs an event loop (epoll) in one process: many connections stay open at the
+# same time, each kept alive for more requests (HTTP/1.1 keep-alive, pipelined requests answered
+# in order) until the client asks to close, the connection is idle for idle_timeout or has served
+# max_requests. Handlers run one at a time, so a slow handler delays every connection.
+#
+# listen_and_serve_workers(host, port, n) runs n such processes (fork) on the same port
+# (SO_REUSEPORT: the kernel spreads the connections among them). Each process has its own copy
+# of the program's memory: globals changed by a handler (an in-memory list, a counter...) are NOT
+# shared between the processes. Use it for stateless handlers or state kept elsewhere.
 
 import "std/net"
 import "std/strings"
@@ -18,6 +26,7 @@ export struct Request {
   version: str
   headers: map[str]str    # names in lower case
   body: str
+  remote_addr: str        # "ip:port" of the client ("" when unknown)
 }
 
 export struct Response {
@@ -42,24 +51,40 @@ export fn handle(path: str, h: fn(*Request, *Response)) {
   routes[path] = h
 }
 
+let idle_timeout_ms: int = 5000
+let max_requests: int = 10000
+
+# how long a kept-alive connection may stay without traffic before the server closes it
+export fn set_idle_timeout(ms: int) { idle_timeout_ms = ms }
+# how many requests one connection may make before the server closes it (0: no limit)
+export fn set_max_requests(n: int) { max_requests = n }
+
 export fn status_text(code: int) -> str {
   switch code {
   case 200: return "OK"
   case 201: return "Created"
+  case 202: return "Accepted"
   case 204: return "No Content"
   case 301: return "Moved Permanently"
   case 302: return "Found"
+  case 303: return "See Other"
   case 304: return "Not Modified"
+  case 307: return "Temporary Redirect"
+  case 308: return "Permanent Redirect"
   case 400: return "Bad Request"
   case 401: return "Unauthorized"
   case 403: return "Forbidden"
   case 404: return "Not Found"
   case 405: return "Method Not Allowed"
+  case 408: return "Request Timeout"
   case 409: return "Conflict"
+  case 411: return "Length Required"
   case 413: return "Payload Too Large"
   case 422: return "Unprocessable Entity"
   case 429: return "Too Many Requests"
+  case 431: return "Request Header Fields Too Large"
   case 500: return "Internal Server Error"
+  case 501: return "Not Implemented"
   case 503: return "Service Unavailable"
   }
   return "Status " + str(code)
@@ -79,93 +104,484 @@ fn find_route(path: str) -> (fn(*Request, *Response), bool) {
 const MAX_HEADER = 65536
 const MAX_BODY = 16777216
 
-# reads one request from the connection; ok is false if the connection closed or the request is bad
-fn read_request(c: *net.Conn) -> (*Request, int) {
-  data := strings.Builder{}
+# ---------------------------------------------------------------- bytes in memory
+
+fn mcopy(d: int, s: int, n: int) {
+  i := 0
+  while i + 8 <= n {
+    __store64(d + i, __load64(s + i))
+    i += 8
+  }
+  while i < n {
+    __store8(d + i, __load8(s + i))
+    i++
+  }
+}
+
+# n bytes at p as a new string (bytes kept as they are)
+fn mem_str(p: int, n: int) -> str {
+  m := __newstr(n)
+  mcopy(m + 8, p, n)
+  return __pstr(m)
+}
+
+# the same, ASCII letters in lower case (header names)
+fn mem_lower(p: int, n: int) -> str {
+  m := __newstr(n)
+  for i := 0; i < n; i++ {
+    c := __load8(p + i)
+    if c >= 65 && c <= 90 { c += 32 }
+    __store8(m + 8 + i, c)
+  }
+  return __pstr(m)
+}
+
+# does s equal t ignoring the case of ASCII letters? (t in lower case)
+fn eq_fold(s: str, t: str) -> bool {
+  n := len(s)
+  if n != len(t) { return false }
+  ps := __strp(s) + 8
+  pt := __strp(t) + 8
+  for i := 0; i < n; i++ {
+    c := __load8(ps + i)
+    if c >= 65 && c <= 90 { c += 32 }
+    if c != __load8(pt + i) { return false }
+  }
+  return true
+}
+
+# does the comma-separated header value contain the token t (lower case), in any case?
+fn has_token(v: str, t: str) -> bool {
+  if v == "" { return false }
+  for _, part := range strings.split(v, ",") {
+    if eq_fold(strings.trim_space(part), t) { return true }
+  }
+  return false
+}
+
+# ---------------------------------------------------------------- connections
+
+# one client connection: what arrived and is not handled yet, and what is still to be sent
+struct Client {
+  conn: *net.Conn
+  inb: int        # input buffer memory
+  icap: int
+  start: int      # first byte not consumed
+  end: int        # bytes in the buffer
+  scanned: int    # the end of the headers was searched for up to here
+  outb: int       # output buffer memory
+  ocap: int
+  out_off: int    # first byte not sent yet
+  out_n: int      # bytes in the output buffer
+  last: int       # time of the last activity (ms)
+  served: int     # requests answered
+  closing: bool   # close once the output is sent
+  dead: bool
+  waiting_out: bool
+}
+
+# Buffers start small (they grow when needed) and closed connections give their Client back for
+# the next one, so a burst of short connections makes little garbage.
+const BUF = 4087          # with the string header, a 4 KB allocation
+let free_clients = []*Client{}
+
+fn new_client(c: *net.Conn) -> *Client {
+  n := len(free_clients)
+  if n > 0 {
+    cl := free_clients[n - 1]
+    free_clients = free_clients[0:n - 1]
+    cl.conn = c
+    return cl
+  }
+  return &Client{conn: c, inb: __newstr(BUF) + 8, icap: BUF, outb: __newstr(BUF) + 8, ocap: BUF}
+}
+
+# closes the connection and keeps the Client (with buffers of the starting size) for reuse
+fn release(cl: *Client) {
+  cl.conn.close()
+  cl.conn = nil
+  if len(free_clients) >= 1024 { return }
+  if cl.icap != BUF {
+    cl.inb = __newstr(BUF) + 8
+    cl.icap = BUF
+  }
+  if cl.ocap != BUF {
+    cl.outb = __newstr(BUF) + 8
+    cl.ocap = BUF
+  }
+  cl.start = 0
+  cl.end = 0
+  cl.scanned = 0
+  cl.out_off = 0
+  cl.out_n = 0
+  cl.last = 0
+  cl.served = 0
+  cl.closing = false
+  cl.dead = false
+  cl.waiting_out = false
+  free_clients = append(free_clients, cl)
+}
+
+# room for at least n more bytes of input (moves the unconsumed bytes to the front)
+fn (cl: *Client) in_room(n: int) {
+  if cl.start > 0 {
+    k := cl.end - cl.start
+    if k > 0 { mcopy(cl.inb, cl.inb + cl.start, k) }
+    cl.scanned -= cl.start
+    if cl.scanned < 0 { cl.scanned = 0 }
+    cl.end = k
+    cl.start = 0
+  }
+  if cl.icap - cl.end >= n { return }
+  c := cl.icap * 2
+  while c - cl.end < n { c = c * 2 }
+  m := __newstr(c) + 8
+  mcopy(m, cl.inb, cl.end)
+  cl.inb = m
+  cl.icap = c
+}
+
+fn (cl: *Client) out_room(n: int) {
+  if cl.ocap - cl.out_n >= n { return }
+  c := cl.ocap * 2
+  while c - cl.out_n < n { c = c * 2 }
+  m := __newstr(c) + 8
+  mcopy(m, cl.outb, cl.out_n)
+  cl.outb = m
+  cl.ocap = c
+}
+
+fn (cl: *Client) put(s: str) {
+  n := len(s)
+  cl.out_room(n)
+  mcopy(cl.outb + cl.out_n, __strp(s) + 8, n)
+  cl.out_n += n
+}
+
+fn (cl: *Client) put_mem(p: int, n: int) {
+  cl.out_room(n)
+  mcopy(cl.outb + cl.out_n, p, n)
+  cl.out_n += n
+}
+
+# Takes one complete request from the input buffer: (req, 0) when one is ready, (nil, 0) when
+# more bytes are needed, (nil, status) for a request that cannot be served.
+fn (cl: *Client) take_request() -> (*Request, int) {
+  p := cl.inb
+  i := cl.scanned
+  if i < cl.start { i = cl.start }
   head_end := -1
-  while head_end < 0 {
-    chunk, err := c.read(8192)
-    if err != nil || chunk == "" { return nil, 0 }
-    data.write(chunk)
-    s := data.string()
-    head_end = strings.index(s, "\r\n\r\n")
-    if head_end < 0 && data.len() > MAX_HEADER { return nil, 400 }
-  }
-  s := data.string()
-  lines := strings.split(s[0:head_end], "\r\n")
-  first := strings.split(lines[0], " ")
-  if len(first) != 3 { return nil, 400 }
-  req := &Request{method: first[0], version: first[2], headers: map[str]str{}}
-  target := first[1]
-  q := strings.index_byte(target, 63)
-  if q >= 0 {
-    req.path = target[0:q]
-    req.query = target[q + 1:]
-  } else { req.path = target }
-  for i := 1; i < len(lines); i++ {
-    colon := strings.index_byte(lines[i], 58)
-    if colon <= 0 { return nil, 400 }
-    req.headers[strings.to_lower(strings.trim_space(lines[i][0:colon]))] = strings.trim_space(lines[i][colon + 1:])
-  }
-  body := s[head_end + 4:]
-  if cl, ok := req.headers["content-length"]; ok {
-    n, err := strconv.atoi(cl)
-    if err != nil || n < 0 { return nil, 400 }
-    if n > MAX_BODY { return nil, 413 }
-    b := strings.Builder{}
-    b.write(body)
-    while b.len() < n {
-      chunk, err2 := c.read(65536)
-      if err2 != nil || chunk == "" { return nil, 0 }
-      b.write(chunk)
+  while i + 4 <= cl.end {
+    if __load8(p + i + 3) == 10 && __load8(p + i + 2) == 13 && __load8(p + i + 1) == 10 && __load8(p + i) == 13 {
+      head_end = i
+      break
     }
-    body = b.string()[0:n]
+    i++
   }
-  req.body = body
-  return req, 200
+  if head_end < 0 {
+    cl.scanned = i
+    if cl.end - cl.start > MAX_HEADER { return nil, 431 }
+    return nil, 0
+  }
+  # request line: METHOD SP target SP version
+  s := cl.start
+  le := s
+  while le < head_end && __load8(p + le) != 13 { le++ }
+  sp1 := s
+  while sp1 < le && __load8(p + sp1) != 32 { sp1++ }
+  sp2 := sp1 + 1
+  while sp2 < le && __load8(p + sp2) != 32 { sp2++ }
+  if sp1 >= le || sp2 >= le || sp1 == s || sp2 == sp1 + 1 { return nil, 400 }
+  req := &Request{method: mem_str(p + s, sp1 - s), version: mem_str(p + sp2 + 1, le - sp2 - 1), headers: map[str]str{}, remote_addr: cl.conn.remote_addr}
+  q := sp1 + 1
+  while q < sp2 && __load8(p + q) != 63 { q++ }
+  req.path = mem_str(p + sp1 + 1, q - sp1 - 1)
+  if q < sp2 { req.query = mem_str(p + q + 1, sp2 - q - 1) }
+  # headers
+  ls := le + 2
+  while ls < head_end + 2 {
+    e := ls
+    while e < head_end && __load8(p + e) != 13 { e++ }
+    colon := ls
+    while colon < e && __load8(p + colon) != 58 { colon++ }
+    if colon >= e || colon == ls { return nil, 400 }
+    ne := colon
+    while ne > ls && (__load8(p + ne - 1) == 32 || __load8(p + ne - 1) == 9) { ne-- }
+    vs := colon + 1
+    while vs < e && (__load8(p + vs) == 32 || __load8(p + vs) == 9) { vs++ }
+    ve := e
+    while ve > vs && (__load8(p + ve - 1) == 32 || __load8(p + ve - 1) == 9) { ve-- }
+    req.headers[mem_lower(p + ls, ne - ls)] = mem_str(p + vs, ve - vs)
+    ls = e + 2
+  }
+  body_start := head_end + 4
+  n := 0
+  if clen, ok := req.headers["content-length"]; ok {
+    v, err := strconv.atoi(clen)
+    if err != nil || v < 0 { return nil, 400 }
+    n = v
+  } else if _, chunked := req.headers["transfer-encoding"]; chunked {
+    return nil, 501
+  }
+  if n > MAX_BODY { return nil, 413 }
+  if cl.end - body_start < n {
+    # the body is still arriving: make room for it and wait
+    need := body_start + n - cl.start
+    keep := head_end - cl.start
+    cl.in_room(need - (cl.end - cl.start))
+    cl.scanned = cl.start + keep
+    return nil, 0
+  }
+  if n > 0 { req.body = mem_str(p + body_start, n) }
+  cl.start = body_start + n
+  cl.scanned = cl.start
+  if cl.start == cl.end {
+    cl.start = 0
+    cl.end = 0
+    cl.scanned = 0
+  }
+  return req, 0
 }
 
-fn send(c: *net.Conn, res: *Response, head_only: bool) {
-  body := res.body.string()
-  out := strings.Builder{}
-  out.write("HTTP/1.1 " + str(res.status) + " " + status_text(res.status) + "\r\n")
-  if _, ok := res.headers["Content-Type"]; !ok { res.headers["Content-Type"] = "text/plain; charset=utf-8" }
-  for k, v := range res.headers { out.write(k + ": " + v + "\r\n") }
-  out.write("Content-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n")
-  if !head_only { out.write(body) }
-  c.write(out.string())
+# should the connection stay open after answering req?
+fn keep_alive(req: *Request) -> bool {
+  c := req.headers["connection"]
+  if req.version == "HTTP/1.1" { return !has_token(c, "close") }
+  return has_token(c, "keep-alive")
 }
 
-# serves one connection
-export fn serve_conn(c: *net.Conn) {
-  req, code := read_request(c)
-  if req == nil {
-    if code != 0 {
-      res := &Response{status: code, headers: map[str]str{}}
-      res.write(status_text(code) + "\n")
-      send(c, res, false)
+# appends the response to the output buffer
+fn (cl: *Client) put_response(res: *Response, head_only: bool, keep: bool, http10: bool) {
+  cl.put("HTTP/1.1 " + str(res.status) + " " + status_text(res.status) + "\r\n")
+  typed := false
+  for k, v := range res.headers {
+    if eq_fold(k, "content-length") || eq_fold(k, "connection") { continue }
+    if !typed && eq_fold(k, "content-type") { typed = true }
+    cl.put(k)
+    cl.put(": ")
+    cl.put(v)
+    cl.put("\r\n")
+  }
+  if !typed { cl.put("Content-Type: text/plain; charset=utf-8\r\n") }
+  cl.put("Content-Length: ")
+  cl.put(str(res.body.n))
+  if !keep { cl.put("\r\nConnection: close\r\n\r\n") } else if http10 { cl.put("\r\nConnection: keep-alive\r\n\r\n") } else { cl.put("\r\n\r\n") }
+  if !head_only && res.body.n > 0 { cl.put_mem(res.body.mem + 8, res.body.n) }
+}
+
+fn error_response(code: int) -> *Response {
+  res := &Response{status: code, headers: map[str]str{}}
+  res.write(status_text(code) + "\n")
+  return res
+}
+
+# answers every complete request in the input buffer, in order
+fn (cl: *Client) handle_input() {
+  while !cl.closing {
+    req, code := cl.take_request()
+    if req == nil {
+      if code != 0 {
+        cl.put_response(error_response(code), false, false, false)
+        cl.closing = true
+      }
+      return
     }
-    c.close()
+    cl.served++
+    keep := keep_alive(req)
+    if max_requests > 0 && cl.served >= max_requests { keep = false }
+    res := &Response{status: 200, headers: map[str]str{}}
+    h, ok := find_route(req.path)
+    if !ok {
+      res.status = 404
+      res.write("404 page not found\n")
+    } else { h(req, res) }
+    cl.put_response(res, req.method == "HEAD", keep, req.version == "HTTP/1.0")
+    if !keep { cl.closing = true }
+  }
+}
+
+# sends what it can of the output; true when everything went out
+fn (cl: *Client) flush() -> bool {
+  while cl.out_off < cl.out_n {
+    w := cl.conn.write_from(cl.outb + cl.out_off, cl.out_n - cl.out_off)
+    if w == -11 { return false }
+    if w <= 0 {
+      cl.dead = true
+      return false
+    }
+    cl.out_off += w
+  }
+  cl.out_off = 0
+  cl.out_n = 0
+  if cl.closing { cl.dead = true }
+  return true
+}
+
+# reads what arrived and answers the complete requests
+fn (cl: *Client) on_readable() {
+  cl.in_room(4096)
+  r := cl.conn.read_into(cl.inb + cl.end, cl.icap - cl.end)
+  if r == -11 { return }
+  if r <= 0 {
+    # the client closed its side (or an error): nothing more will arrive
+    cl.handle_input()
+    cl.closing = true
+    if cl.out_n == 0 { cl.dead = true }
     return
   }
-  res := &Response{status: 200, headers: map[str]str{}}
-  h, ok := find_route(req.path)
-  if !ok {
-    res.status = 404
-    res.write("404 page not found\n")
-  } else { h(req, res) }
-  send(c, res, req.method == "HEAD")
-  c.close()
+  cl.end += r
+  cl.handle_input()
+}
+
+let ts_buf: int = 0
+fn now_ms() -> int {
+  if ts_buf == 0 { ts_buf = __newstr(16) + 8 }
+  __syscall(228, 1, ts_buf, 0, 0, 0, 0)          # clock_gettime(CLOCK_MONOTONIC)
+  return __load64(ts_buf) * 1000 + __load64(ts_buf + 8) / 1000000
+}
+
+const LISTENER = -1
+
+# the event loop: serves the connections of l until an error
+fn serve_loop(l: *net.Listener) -> error {
+  p, err := net.new_poller(512)
+  if err != nil { return err }
+  if p.add(l.fd, net.EV_IN, LISTENER) < 0 { return errors.New("epoll_ctl: cannot watch the listener") }
+  clients := map[int]*Client{}
+  last_sweep := now_ms()
+  while true {
+    tick := 1000
+    if idle_timeout_ms > 0 && idle_timeout_ms < 2000 { tick = idle_timeout_ms / 2 + 1 }
+    n := p.wait(tick)
+    if n < 0 { return errors.New("epoll_wait: error " + str(-n)) }
+    t := now_ms()
+    for i := 0; i < n; i++ {
+      d := p.event_data(i)
+      ev := p.event_flags(i)
+      if d == LISTENER {
+        while true {
+          c, _ := l.accept_nb()
+          if c == nil { break }
+          c.set_nodelay()
+          nc := new_client(c)
+          nc.last = t
+          clients[c.fd] = nc
+          p.add(c.fd, net.EV_IN | net.EV_RDHUP, c.fd)
+        }
+        continue
+      }
+      cl, ok := clients[d]
+      if !ok { continue }
+      cl.last = t
+      if cl.waiting_out {
+        if ev & (net.EV_ERR | net.EV_HUP) != 0 { cl.dead = true }
+        if !cl.dead && cl.flush() {
+          # everything went out: back to reading (and answer what arrived meanwhile)
+          cl.waiting_out = false
+          if !cl.dead {
+            p.modify(cl.conn.fd, net.EV_IN | net.EV_RDHUP, cl.conn.fd)
+            cl.handle_input()
+          }
+        }
+      } else {
+        cl.on_readable()
+      }
+      if !cl.dead && cl.out_n > 0 && !cl.waiting_out {
+        if !cl.flush() && !cl.dead {
+          # the socket is full: wait until it can take more, without reading meanwhile
+          cl.waiting_out = true
+          p.modify(cl.conn.fd, net.EV_OUT, cl.conn.fd)
+        }
+      }
+      if cl.dead {
+        p.remove(cl.conn.fd)
+        delete(clients, d)
+        release(cl)
+      }
+    }
+    if idle_timeout_ms > 0 && t - last_sweep >= tick {
+      last_sweep = t
+      idle := []int{}
+      for fd, ic := range clients { if t - ic.last >= idle_timeout_ms { idle = append(idle, fd) } }
+      for _, fd := range idle {
+        ic := clients[fd]
+        p.remove(fd)
+        delete(clients, fd)
+        release(ic)
+      }
+    }
+  }
+  return nil
+}
+
+# serves one connection, blocking: one request, then the connection is closed
+export fn serve_conn(c: *net.Conn) {
+  cl := new_client(c)
+  while true {
+    req, code := cl.take_request()
+    if req != nil || code != 0 {
+      if req == nil {
+        cl.put_response(error_response(code), false, false, false)
+      } else {
+        res := &Response{status: 200, headers: map[str]str{}}
+        h, ok := find_route(req.path)
+        if !ok {
+          res.status = 404
+          res.write("404 page not found\n")
+        } else { h(req, res) }
+        cl.put_response(res, req.method == "HEAD", false, false)
+      }
+      c.write(mem_str(cl.outb, cl.out_n))
+      c.close()
+      return
+    }
+    cl.in_room(4096)
+    r := c.read_into(cl.inb + cl.end, cl.icap - cl.end)
+    if r <= 0 {
+      c.close()
+      return
+    }
+    cl.end += r
+  }
 }
 
 # listens on host:port and serves requests forever (returns only on an error)
 export fn listen_and_serve(host: str, port: int) -> error {
-  l, err := net.listen(host, port)
+  l, err := net.listen_with(host, port, false, true)
   if err != nil { return err }
-  while true {
-    c, err2 := l.accept()
-    if err2 != nil { return err2 }
-    serve_conn(c)
+  return serve_loop(l)
+}
+
+# like listen_and_serve, in n processes sharing the port (n <= 0: one per CPU). The processes do
+# not share memory: see the top of this file. The extra processes end when this one ends.
+export fn listen_and_serve_workers(host: str, port: int, n: int) -> error {
+  if n <= 0 { n = net.num_cpus() }
+  # every socket of the SO_REUSEPORT group exists before any process accepts, so the kernel's
+  # spreading of connections does not change while they arrive
+  socks := []*net.Listener{}
+  for i := 0; i < n; i++ {
+    l, err := net.listen_with(host, port, true, true)
+    if err != nil {
+      for _, o := range socks { o.close() }
+      return err
+    }
+    socks = append(socks, l)
   }
-  return nil
+  if n == 1 { return serve_loop(socks[0]) }
+  __flush()
+  parent := os.getpid()
+  for i := 1; i < n; i++ {
+    pid := __syscall(57, 0, 0, 0, 0, 0, 0)                 # fork
+    if pid < 0 { return errors.New("fork: error " + str(-pid)) }
+    if pid == 0 {
+      __syscall(157, 1, 9, 0, 0, 0, 0)                     # prctl(PR_SET_PDEATHSIG, SIGKILL)
+      if __syscall(110, 0, 0, 0, 0, 0, 0) != parent { os.exit(0) }   # getppid: the parent already ended
+      for j, o := range socks { if j != i { o.close() } }
+      err3 := serve_loop(socks[i])
+      if err3 != nil { os.eprintln(err3.Error()) }
+      os.exit(1)
+    }
+  }
+  for j := 1; j < n; j++ { socks[j].close() }
+  return serve_loop(socks[0])
 }

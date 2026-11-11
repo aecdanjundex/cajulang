@@ -1,0 +1,21 @@
+# The server the tests of std/http talk to: PORT, IDLE_MS (idle timeout), WORKERS.
+import "std/http"
+import "std/os"
+import "std/strconv"
+
+http.handle("/", fn(req: *http.Request, res: *http.Response) {
+  res.set_header("content-type", "text/plain")
+  res.write(req.method + " " + req.path + " q=" + req.query + " body=" + str(len(req.body)) + " pid=" + str(os.getpid()))
+})
+http.handle("/echo", fn(req: *http.Request, res: *http.Response) { res.write(req.body) })
+http.handle("/from", fn(req: *http.Request, res: *http.Response) { res.write(req.remote_addr) })
+port, _ := strconv.atoi(os.getenv("PORT"))
+idle, _ := strconv.atoi(os.getenv("IDLE_MS"))
+if idle > 0 { http.set_idle_timeout(idle) }
+workers, _ := strconv.atoi(os.getenv("WORKERS"))
+let err: error
+if workers > 0 { err = http.listen_and_serve_workers("127.0.0.1", port, workers) } else { err = http.listen_and_serve("127.0.0.1", port) }
+if err != nil {
+  os.eprintln(err.Error())
+  os.exit(1)
+}

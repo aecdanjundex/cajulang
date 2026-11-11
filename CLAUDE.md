@@ -50,7 +50,7 @@ comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
 
-Resultado esperado hoje: **785 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+Resultado esperado hoje: **795 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
 receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
 confere a quantidade de argumentos).
@@ -133,6 +133,11 @@ procure o endereço no arquivo do `CAJU_SYMS`.
   `__pany(int) -> any` (o contrário), e `__alloc`, `__zero(desc)`, `__make_slice(ed, n, c)`,
   `__map_new(kk)`, `__map_set(m, k, v)`, que chamam as rotinas do runtime. O layout dos
   descritores está em `rt/values.caju`; mudou o layout? Atualize `lib/json.caju` também.
+- `std/http` é um laço de eventos (epoll, `net.Poller`) com keep-alive e pipelining; os handlers
+  rodam um por vez. `listen_and_serve_workers` faz fork de n processos com `SO_REUSEPORT` (sem
+  memória compartilhada; os filhos morrem com o pai via `PR_SET_PDEATHSIG`). Os buffers de cada
+  conexão são memória crua (`Client.inb`/`outb`, campos `int`): só vivem porque o coletor é
+  conservador e o `Client` os guarda. `lib/http_test.caju` sobe `testdata/http_server.caju` de verdade.
 - Nenhum ponteiro vivo pode ficar só num registrador durante uma chamada (o coletor só olha a
   pilha e as globais).
 - Objetos de array/slice são alocados com 8 bytes a mais; textos e buffers de bytes com

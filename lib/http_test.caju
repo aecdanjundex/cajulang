@@ -1,0 +1,197 @@
+# The event loop of std/http, against a real server (testdata/http_server.caju) in another process.
+import "std/net"
+import "std/os"
+import "std/strings"
+import "std/strconv"
+import { describe, it, expect, before_each } from "std/testing"
+
+let server_pid: str = ""
+let built: bool = false
+let port: int = 0
+let next_port: int = 30000 + os.getpid() % 20000
+
+fn bin() -> str {
+  tmp := os.getenv("TMPDIR")
+  if tmp == "" { tmp = "/tmp" }
+  return tmp + "/caju-http-test-" + str(os.getpid())
+}
+
+# starts the test server (in the background) and waits until it accepts connections
+fn start(env: str) {
+  if !built {
+    p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "-o", bin(), "testdata/http_server.caju"}, nil, true)
+    if err != nil || p.code != 0 { panic("cannot build the test server: " + p.output) }
+    built = true
+  }
+  next_port++
+  port = next_port
+  p, err := os.run([]str{"sh", "-c", "PORT=" + str(port) + " " + env + " " + bin() + " >/dev/null 2>&1 & echo $!"}, nil, false)
+  if err != nil { panic(err.Error()) }
+  server_pid = strings.trim_space(p.output)
+  for i := 0; i < 100000; i++ {
+    c, err2 := net.dial("127.0.0.1", port)
+    if err2 == nil {
+      c.close()
+      return
+    }
+  }
+  panic("the test server did not start")
+}
+
+fn stop() {
+  if server_pid != "" { os.run([]str{"kill", server_pid}, nil, true) }
+  server_pid = ""
+}
+
+fn connect() -> *net.Conn {
+  c, err := net.dial("127.0.0.1", port)
+  if err != nil { panic(err.Error()) }
+  return c
+}
+
+# reads exactly one response (headers and Content-Length bytes of body) from c; "" if it closed
+let pending = map[int]str{}
+fn read_response(c: *net.Conn) -> str {
+  buf := pending[c.fd]
+  while true {
+    he := strings.index(buf, "\r\n\r\n")
+    if he >= 0 {
+      n := 0
+      for _, line := range strings.split(buf[0:he], "\r\n") {
+        if strings.has_prefix(strings.to_lower(line), "content-length:") { n, _ = strconv.atoi(strings.trim_space(line[15:])) }
+      }
+      if len(buf) >= he + 4 + n {
+        pending[c.fd] = buf[he + 4 + n:]
+        return buf[0:he + 4 + n]
+      }
+    }
+    chunk, err := c.read(65536)
+    if err != nil || chunk == "" { return "" }
+    buf = buf + chunk
+  }
+  return ""
+}
+
+fn body(resp: str) -> str { return resp[strings.index(resp, "\r\n\r\n") + 4:] }
+
+describe("http server", fn() {
+  it("keeps an HTTP/1.1 connection open for more requests", fn() {
+    start("")
+    c := connect()
+    c.write("GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+    r1 := read_response(c)
+    c.write("POST /b?k=v HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc")
+    r2 := read_response(c)
+    stop()
+    expect(r1).to_start_with("HTTP/1.1 200 OK\r\n")
+    expect(strings.contains(r1, "Connection: close")).to_be_false()
+    expect(body(r1)).to_start_with("GET /a q= body=0")
+    expect(body(r2)).to_start_with("POST /b q=k=v body=3")
+  })
+  it("closes the connection when the client asks", fn() {
+    start("")
+    c := connect()
+    c.write("GET /a HTTP/1.1\r\nHost: x\r\nConnection: Close\r\n\r\n")
+    r := read_response(c)
+    after := read_response(c)
+    stop()
+    expect(strings.contains(r, "\r\nConnection: close\r\n")).to_be_true()
+    expect(after).to_equal("")
+  })
+  it("answers pipelined requests in order", fn() {
+    start("")
+    c := connect()
+    c.write("GET /1 HTTP/1.1\r\n\r\nGET /2 HTTP/1.1\r\n\r\nPOST /3 HTTP/1.1\r\nContent-Length: 2\r\n\r\nhiGET /4 HTTP/1.1\r\nConnection: close\r\n\r\n")
+    got := []str{}
+    for i := 0; i < 4; i++ { got = append(got, body(read_response(c))[0:9]) }
+    stop()
+    expect(got).to_equal([]str{"GET /1 q=", "GET /2 q=", "POST /3 q", "GET /4 q="})
+  })
+  it("waits for a body that arrives in pieces", fn() {
+    start("")
+    c := connect()
+    big := strings.repeat("0123456789", 100000)
+    c.write("POST /echo HTTP/1.1\r\nContent-Length: " + str(len(big)) + "\r\n\r\n")
+    c.write(big[0:5])
+    c.write(big[5:300000])
+    c.write(big[300000:])
+    r := read_response(c)
+    stop()
+    expect(len(body(r))).to_equal(len(big))
+    expect(body(r) == big).to_be_true()
+  })
+  it("serves other clients while one sends its request slowly", fn() {
+    start("")
+    slow := connect()
+    slow.write("GET /slow HTTP/1.1\r\nHo")
+    fast := connect()
+    fast.write("GET /fast HTTP/1.1\r\n\r\n")
+    rf := read_response(fast)
+    slow.write("st: x\r\n\r\n")
+    rs := read_response(slow)
+    stop()
+    expect(body(rf)).to_start_with("GET /fast")
+    expect(body(rs)).to_start_with("GET /slow")
+  })
+  it("closes a connection that stays idle", fn() {
+    start("IDLE_MS=200")
+    c := connect()
+    t0 := os.nanotime()
+    c.write("GET /a HTTP/1.1\r\n\r\n")
+    r := read_response(c)
+    closed := read_response(c)
+    ms := (os.nanotime() - t0) / 1000000
+    stop()
+    expect(body(r)).to_start_with("GET /a")
+    expect(closed).to_equal("")
+    expect(ms).to_be_at_least(150)
+    expect(ms).to_be_less_than(3000)
+  })
+  it("closes HTTP/1.0 connections unless asked to keep them", fn() {
+    start("")
+    c := connect()
+    c.write("GET /old HTTP/1.0\r\n\r\n")
+    r := read_response(c)
+    end := read_response(c)
+    k := connect()
+    k.write("GET /k1 HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    k1 := read_response(k)
+    k.write("GET /k2 HTTP/1.0\r\n\r\n")
+    k2 := read_response(k)
+    stop()
+    expect(strings.contains(r, "Connection: close")).to_be_true()
+    expect(end).to_equal("")
+    expect(strings.contains(k1, "Connection: keep-alive")).to_be_true()
+    expect(body(k2)).to_start_with("GET /k2")
+  })
+  it("answers bad requests with 400 and closes", fn() {
+    start("")
+    c := connect()
+    c.write("NONSENSE\r\n\r\n")
+    r := read_response(c)
+    stop()
+    expect(r).to_start_with("HTTP/1.1 400 Bad Request\r\n")
+  })
+  it("gives the handler the address of the client", fn() {
+    start("")
+    c := connect()
+    c.write("GET /from HTTP/1.1\r\n\r\n")
+    r := read_response(c)
+    stop()
+    expect(body(r)).to_start_with("127.0.0.1:")
+  })
+  it("spreads the connections over worker processes", fn() {
+    start("WORKERS=3")
+    pids := map[str]bool{}
+    for i := 0; i < 60; i++ {
+      c := connect()
+      c.write("GET /w HTTP/1.1\r\nConnection: close\r\n\r\n")
+      b := body(read_response(c))
+      pids[b[strings.index(b, "pid=") + 4:]] = true
+      c.close()
+    }
+    stop()
+    os.remove(bin())
+    expect(len(pids)).to_be_at_least(2)
+  })
+})

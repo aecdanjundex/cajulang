@@ -13,11 +13,22 @@ const SYS_SHUTDOWN = 48
 const SYS_BIND = 49
 const SYS_LISTEN = 50
 const SYS_SETSOCKOPT = 54
+const SYS_EPOLL_WAIT = 232
+const SYS_EPOLL_CTL = 233
+const SYS_ACCEPT4 = 288
+const SYS_EPOLL_CREATE1 = 291
+const SYS_SCHED_GETAFFINITY = 204
 
 const AF_INET = 2
 const SOCK_STREAM = 1
 const SOL_SOCKET = 1
 const SO_REUSEADDR = 2
+const SO_REUSEPORT = 15
+const SOCK_NONBLOCK = 2048
+const SOCK_CLOEXEC = 524288
+const IPPROTO_TCP = 6
+const TCP_NODELAY = 1
+const EAGAIN = 11
 const MSG_NOSIGNAL = 0x4000      # a write to a closed connection returns an error instead of killing the program
 
 fn sys_error(what: str, r: int) -> error {
@@ -65,23 +76,31 @@ export struct Listener {
 export struct Conn {
   fd: int
   closed: bool
+  remote_addr: str     # "ip:port" of the other side (connections from accept)
 }
 
 # listens for TCP connections on host:port ("0.0.0.0" for every interface)
-export fn listen(host: str, port: int) -> (*Listener, error) {
+export fn listen(host: str, port: int) -> (*Listener, error) { return listen_with(host, port, false, false) }
+
+# listen with options: reuse_port lets several processes listen on the same port (SO_REUSEPORT,
+# the kernel spreads the connections among them); nonblocking makes accept_nb possible
+export fn listen_with(host: str, port: int, reuse_port: bool, nonblocking: bool) -> (*Listener, error) {
   ip := parse_ipv4(host)
   if ip < 0 { return nil, errors.New("listen: invalid IPv4 address \"" + host + "\"") }
-  fd := __syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0, 0, 0, 0)
+  ty := SOCK_STREAM | SOCK_CLOEXEC
+  if nonblocking { ty = ty | SOCK_NONBLOCK }
+  fd := __syscall(SYS_SOCKET, AF_INET, ty, 0, 0, 0, 0)
   if fd < 0 { return nil, sys_error("socket", fd) }
   one := __newstr(8)
   __store64(one + 8, 1)
   __syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, one + 8, 4, 0)
+  if reuse_port { __syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEPORT, one + 8, 4, 0) }
   r := __syscall(SYS_BIND, fd, sockaddr(ip, port), 16, 0, 0, 0)
   if r < 0 {
     __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
     return nil, sys_error("listen on " + host + ":" + str(port), r)
   }
-  r = __syscall(SYS_LISTEN, fd, 128, 0, 0, 0, 0)
+  r = __syscall(SYS_LISTEN, fd, 4096, 0, 0, 0, 0)
   if r < 0 {
     __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
     return nil, sys_error("listen", r)
@@ -93,12 +112,28 @@ export fn listen(host: str, port: int) -> (*Listener, error) {
 export fn (l: *Listener) accept() -> (*Conn, error) {
   __flush()            # print's pending output goes out before the program waits
   while true {
-    fd := __syscall(SYS_ACCEPT, l.fd, 0, 0, 0, 0, 0)
-    if fd == -4 { continue }         # interrupted: try again
-    if fd < 0 { return nil, sys_error("accept", fd) }
-    return &Conn{fd: fd}, nil
+    c, r := l.accept_flags(SOCK_CLOEXEC)
+    if r == -4 { continue }          # interrupted: try again
+    if r < 0 { return nil, sys_error("accept", r) }
+    return c, nil
   }
   return nil, nil
+}
+
+# accepts a connection without waiting, as a non-blocking socket: (nil, -11) when none is
+# pending (EAGAIN), (nil, -errno) on other errors
+export fn (l: *Listener) accept_nb() -> (*Conn, int) { return l.accept_flags(SOCK_NONBLOCK | SOCK_CLOEXEC) }
+
+let addr_buf: int = 0
+fn (l: *Listener) accept_flags(flags: int) -> (*Conn, int) {
+  if addr_buf == 0 { addr_buf = __newstr(32) }
+  a := addr_buf + 8
+  __store64(a + 16, 16)               # addrlen
+  fd := __syscall(SYS_ACCEPT4, l.fd, a, a + 16, flags, 0, 0)
+  if fd < 0 { return nil, fd }
+  ip := str(__load8(a + 4)) + "." + str(__load8(a + 5)) + "." + str(__load8(a + 6)) + "." + str(__load8(a + 7))
+  port := (__load8(a + 2) << 8) | __load8(a + 3)
+  return &Conn{fd: fd, remote_addr: ip + ":" + str(port)}, 0
 }
 export fn (l: *Listener) close() { __syscall(SYS_CLOSE, l.fd, 0, 0, 0, 0, 0) }
 
@@ -149,4 +184,95 @@ export fn (c: *Conn) close() {
   if c.closed { return }
   c.closed = true
   __syscall(SYS_CLOSE, c.fd, 0, 0, 0, 0, 0)
+}
+
+# ---------------------------------------------------------------- non-blocking I/O
+
+# reads what is available into memory at p (up to max bytes): the count, 0 when the other side
+# closed, -11 (EAGAIN) when nothing is available yet, or another -errno
+export fn (c: *Conn) read_into(p: int, max: int) -> int {
+  while true {
+    r := __syscall(SYS_RECVFROM, c.fd, p, max, 0, 0, 0)
+    if r == -4 { continue }
+    return r
+  }
+  return 0
+}
+
+# writes n bytes from memory at p without waiting: the count written (maybe fewer), -11 (EAGAIN)
+# when the socket buffer is full, or another -errno
+export fn (c: *Conn) write_from(p: int, n: int) -> int {
+  while true {
+    w := __syscall(SYS_SENDTO, c.fd, p, n, MSG_NOSIGNAL, 0, 0)
+    if w == -4 { continue }
+    return w
+  }
+  return 0
+}
+
+# turns off Nagle's algorithm (small responses go out at once)
+export fn (c: *Conn) set_nodelay() {
+  one := __newstr(8)
+  __store64(one + 8, 1)
+  __syscall(SYS_SETSOCKOPT, c.fd, IPPROTO_TCP, TCP_NODELAY, one + 8, 4, 0)
+}
+
+# Poller: epoll. Each watched descriptor carries a number (data) given back with its events.
+export const EV_IN = 1
+export const EV_OUT = 4
+export const EV_ERR = 8
+export const EV_HUP = 16
+export const EV_RDHUP = 8192
+
+export struct Poller {
+  fd: int
+  events: int     # memory for up to max events (12 bytes each: u32 events, u64 data)
+  max: int
+  scratch: int    # one event for epoll_ctl
+}
+
+export fn new_poller(max: int) -> (*Poller, error) {
+  fd := __syscall(SYS_EPOLL_CREATE1, 524288, 0, 0, 0, 0, 0)      # EPOLL_CLOEXEC
+  if fd < 0 { return nil, sys_error("epoll_create1", fd) }
+  return &Poller{fd: fd, events: __newstr(12 * max) + 8, max: max, scratch: __newstr(16) + 8}, nil
+}
+
+fn (p: *Poller) ctl(op: int, fd: int, events: int, data: int) -> int {
+  ev := p.scratch
+  __store32(ev, events)
+  __store64(ev + 4, data)
+  return __syscall(SYS_EPOLL_CTL, p.fd, op, fd, ev, 0, 0)
+}
+export fn (p: *Poller) add(fd: int, events: int, data: int) -> int { return p.ctl(1, fd, events, data) }
+export fn (p: *Poller) modify(fd: int, events: int, data: int) -> int { return p.ctl(3, fd, events, data) }
+export fn (p: *Poller) remove(fd: int) -> int { return p.ctl(2, fd, 0, 0) }
+
+# waits up to timeout_ms (-1: forever) for events; returns how many (event i: event_flags(i), event_data(i))
+export fn (p: *Poller) wait(timeout_ms: int) -> int {
+  __flush()
+  while true {
+    n := __syscall(SYS_EPOLL_WAIT, p.fd, p.events, p.max, timeout_ms, 0, 0)
+    if n == -4 { continue }
+    return n
+  }
+  return 0
+}
+export fn (p: *Poller) event_flags(i: int) -> int { return __load32(p.events + 12 * i) }
+export fn (p: *Poller) event_data(i: int) -> int { return __load64(p.events + 12 * i + 4) }
+
+# how many CPUs this process may run on (sched_getaffinity), at least 1
+export fn num_cpus() -> int {
+  m := __newstr(128) + 8
+  r := __syscall(SYS_SCHED_GETAFFINITY, 0, 128, m, 0, 0, 0)
+  if r <= 0 { return 1 }
+  n := 0
+  for i := 0; i < r; i++ {
+    b := __load8(m + i)
+    while b != 0 {
+      n += b & 1
+      b = b >> 1
+    }
+  }
+  if n < 1 { return 1 }
+  return n
 }
