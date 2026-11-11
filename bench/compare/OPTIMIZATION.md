@@ -40,17 +40,17 @@ garantida pela suíte de testes e pela autocompilação.
 **Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
 matmul 1,8×, sort 2,2×, maps 2,1×.
 
-**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho):
+**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho, depois da rodada 12):
 
 | desafio | Caju antes | Caju depois | Go | Rust | Python | Caju ÷ Go antes → depois |
 |---|--:|--:|--:|--:|--:|--:|
-| fib 35 | 126 ms | 67 ms | 39 ms | 21 ms | 1.29 s | 3.2× → 1.7× |
-| sieve 10M | 435 ms | 207 ms | 33 ms | 44 ms | 2.11 s | 13× → 6.3× |
-| nbody 1M | 737 ms | 418 ms | 173 ms | 68 ms | 9.13 s | 4.3× → 2.4× |
-| mandelbrot 1k | 243 ms | 94 ms | 38 ms | 39 ms | 6.63 s | 6.4× → 2.5× |
-| matmul 300 | 256 ms | 145 ms | 32 ms | 12 ms | 5.91 s | 8.0× → 4.5× |
-| sort 2M | 637 ms | 287 ms | 140 ms | 136 ms | 7.65 s | 4.5× → 2.0× |
-| maps 3M | 2.00 s | 935 ms | 612 ms | 354 ms | 2.04 s | 3.3× → 1.5× |
+| fib 35 | 126 ms | 64 ms | 38 ms | 20 ms | 1.17 s | 3.2× → 1.7× |
+| sieve 10M | 435 ms | 68 ms | 19 ms | 19 ms | 2.00 s | 13× → 3.5× |
+| nbody 1M | 737 ms | 396 ms | 167 ms | 64 ms | 8.77 s | 4.3× → 2.4× |
+| mandelbrot 1k | 243 ms | 90 ms | 36 ms | 36 ms | 6.27 s | 6.4× → 2.5× |
+| matmul 300 | 256 ms | 107 ms | 31 ms | 11 ms | 5.79 s | 8.0× → 3.5× |
+| sort 2M | 637 ms | 229 ms | 136 ms | 130 ms | 6.42 s | 4.5× → 1.7× |
+| maps 3M | 2.00 s | 848 ms | 530 ms | 310 ms | 1.77 s | 3.3× → 1.6× |
 
 Contra Python, a Caju passou de 3 a 25 vezes mais rápida para 2 a 70 vezes (e nos mapas, de empate
 para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuções (o matmul variou de
