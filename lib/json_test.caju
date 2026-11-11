@@ -1,0 +1,263 @@
+import "std/json"
+import "std/math"
+import { describe, it, expect } from "std/testing"
+
+struct Addr {
+  city: str
+  zip: int
+}
+struct Base {
+  id: int
+}
+struct User {
+  Base
+  name: str
+  age: int
+  admin: bool
+  score: num
+  tags: []str
+  addr: Addr
+  next: *Addr
+  extra: map[str]int
+}
+struct Small {
+  a: int8
+  u: uint8
+  f: float32
+  arr: [3]int
+  flags: []bool
+  data: any
+  raw: *json.Value
+  err: error
+}
+struct Node {
+  v: int
+  kids: []*Node
+}
+
+fn enc(v: any) -> str {
+  s, err := json.marshal(v)
+  if err != nil { return "ERR " + err.Error() }
+  return s
+}
+
+describe("json.marshal", fn() {
+  it("writes structs with their fields in order, embedded fields promoted", fn() {
+    u := User{name: "Ana", age: 30, admin: true, score: 1.5, tags: []str{"a", "b"}, addr: Addr{city: "Rio", zip: 1}}
+    u.id = 7
+    expect(enc(u)).to_equal("{\"id\":7,\"name\":\"Ana\",\"age\":30,\"admin\":true,\"score\":1.5,\"tags\":[\"a\",\"b\"],\"addr\":{\"city\":\"Rio\",\"zip\":1},\"next\":null,\"extra\":null}")
+  })
+  it("follows pointers and writes nil ones as null", fn() {
+    u := &User{next: &Addr{city: "SP", zip: 2}}
+    expect(enc(u.next)).to_equal("{\"city\":\"SP\",\"zip\":2}")
+    let p: *Addr
+    expect(enc(p)).to_equal("null")
+    expect(enc(nil)).to_equal("null")
+  })
+  it("writes map keys in alphabetical order", fn() {
+    expect(enc(map[str]int{"b": 2, "a": 1, "c": 3})).to_equal("{\"a\":1,\"b\":2,\"c\":3}")
+    expect(enc(map[int]str{10: "x", 2: "y"})).to_equal("{\"10\":\"x\",\"2\":\"y\"}")
+    m := map[str]int{}
+    for i := 0; i < 100; i++ { m["k" + str(i)] = i }
+    delete(m, "k5")
+    s := enc(m)
+    expect(s[0:20]).to_equal("{\"k0\":0,\"k1\":1,\"k10\"")
+    expect(json.valid(s)).to_be_true()
+  })
+  it("writes map[str]any literals of mixed values (like gin.H)", fn() {
+    m := map[str]any{"id": 1, "name": "x", "tags": []str{"a"}, "ok": true, "none": nil, "f": 2.5}
+    expect(enc(m)).to_equal("{\"f\":2.5,\"id\":1,\"name\":\"x\",\"none\":null,\"ok\":true,\"tags\":[\"a\"]}")
+  })
+  it("writes small integers, float32, arrays, bool lists, any, raw trees and errors", fn() {
+    raw, _ := json.parse("{\"k\": [1, 2]}")
+    s := Small{a: -5, u: 200, f: 0.5, arr: [3]int{1, 2, 3}, flags: []bool{true, false, true}, data: []any{1, "x", nil}, raw: raw, err: errors.New("boom")}
+    expect(enc(s)).to_equal("{\"a\":-5,\"u\":200,\"f\":0.5,\"arr\":[1,2,3],\"flags\":[true,false,true],\"data\":[1,\"x\",null],\"raw\":{\"k\":[1,2]},\"err\":\"boom\"}")
+    expect(enc(errors.New("bad"))).to_equal("\"bad\"")
+  })
+  it("writes numbers in their shortest form", fn() {
+    expect(enc([]num{0.1, 100.0, 1e21, 1e-7, -2.5, 0.0, 1.0 / 3.0})).to_equal("[0.1,100,1e+21,1e-07,-2.5,0,0.3333333333333333]")
+    expect(enc([]int{-9223372036854775807 - 1, 0})).to_equal("[-9223372036854775808,0]")
+  })
+  it("escapes strings and keeps UTF-8", fn() {
+    expect(enc("a\"b\\c\nd\te\u0001é😀")).to_equal("\"a\\\"b\\\\c\\nd\\te\\u0001é😀\"")
+    expect(json.quote("")).to_equal("\"\"")
+  })
+  it("writes empty and nil lists differently", fn() {
+    let nl: []int
+    expect(enc(nl)).to_equal("null")
+    expect(enc([]int{})).to_equal("[]")
+    expect(enc(map[str]int{})).to_equal("{}")
+  })
+  it("indents with marshal_indent", fn() {
+    s, _ := json.marshal_indent(map[str]any{"a": []int{1, 2}, "b": map[str]any{}, "c": []int{}}, "  ")
+    expect(s).to_equal("{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {},\n  \"c\": []\n}")
+  })
+  it("refuses functions and NaN", fn() {
+    _, err := json.marshal(fn() {})
+    expect(err != nil).to_be_true()
+    _, err2 := json.marshal([]num{math.nan()})
+    expect(err2.Error()).to_contain("unsupported value")
+  })
+  it("writes recursive structures", fn() {
+    t := &Node{v: 1, kids: []*Node{&Node{v: 2}, &Node{v: 3, kids: []*Node{}}}}
+    expect(enc(t)).to_equal("{\"v\":1,\"kids\":[{\"v\":2,\"kids\":null},{\"v\":3,\"kids\":[]}]}")
+  })
+})
+
+describe("json.unmarshal", fn() {
+  it("fills structs, matching field names exactly or without case", fn() {
+    let u: User
+    err := json.unmarshal("{\"id\": 9, \"Name\": \"Bia\", \"age\": 41, \"admin\": true, \"score\": -0.25, \"tags\": [\"x\"], \"addr\": {\"city\": \"SP\"}, \"next\": {\"zip\": 5}, \"extra\": {\"k\": 3}, \"unknown\": [1, {}]}", &u)
+    expect(err).to_be_nil()
+    expect(u.id).to_equal(9)
+    expect(u.name).to_equal("Bia")
+    expect(u.age).to_equal(41)
+    expect(u.admin).to_be_true()
+    expect(u.score).to_equal(-0.25)
+    expect(u.tags).to_equal([]str{"x"})
+    expect(u.addr.city).to_equal("SP")
+    expect(u.next.zip).to_equal(5)
+    expect(u.extra["k"]).to_equal(3)
+  })
+  it("keeps the fields the text does not have, and null leaves values alone", fn() {
+    u := User{name: "keep", age: 3, tags: []str{"t"}}
+    expect(json.unmarshal("{\"age\": null, \"tags\": null}", &u)).to_be_nil()
+    expect(u.name).to_equal("keep")
+    expect(u.age).to_equal(3)
+    expect(len(u.tags)).to_equal(0)
+  })
+  it("round-trips nested values", fn() {
+    s := Small{a: -5, u: 200, f: 0.5, arr: [3]int{1, 2, 3}, flags: []bool{true, false, true}, data: map[str]any{"x": []any{1, 2.5}}}
+    text := enc(s)
+    let back: Small
+    expect(json.unmarshal(text, &back)).to_be_nil()
+    expect(enc(back)).to_equal(text)
+    expect(back.flags).to_equal([]bool{true, false, true})
+    expect(back.arr).to_equal([3]int{1, 2, 3})
+  })
+  it("reads lists of structs and pointers", fn() {
+    let us: []User
+    expect(json.unmarshal("[{\"name\": \"a\"}, {\"name\": \"b\", \"addr\": {\"zip\": 3}}]", &us)).to_be_nil()
+    expect(len(us)).to_equal(2)
+    expect(us[1].name).to_equal("b")
+    expect(us[1].addr.zip).to_equal(3)
+    let ps: []*Node
+    expect(json.unmarshal("[{\"v\": 1, \"kids\": [{\"v\": 2}]}, null]", &ps)).to_be_nil()
+    expect(ps[0].kids[0].v).to_equal(2)
+    expect(ps[1] == nil).to_be_true()
+  })
+  it("reads any as maps, lists, ints, nums, strings, bools and nil", fn() {
+    let a: any
+    expect(json.unmarshal("{\"n\": 1, \"f\": 1.5, \"e\": 2e3, \"l\": [true, null, \"s\"]}", &a)).to_be_nil()
+    m := a.(map[str]any)
+    expect(m["n"].(int)).to_equal(1)
+    expect(m["f"].(num)).to_equal(1.5)
+    expect(m["e"].(num)).to_equal(2000.0)
+    l := m["l"].([]any)
+    expect(l[0].(bool)).to_be_true()
+    expect(l[1] == nil).to_be_true()
+    expect(l[2].(str)).to_equal("s")
+  })
+  it("reads into simple values and maps", fn() {
+    let n: int
+    expect(json.unmarshal(" -42 ", &n)).to_be_nil()
+    expect(n).to_equal(-42)
+    let s: str
+    expect(json.unmarshal("\"a\\u00e9\\ud83d\\ude00\\n\"", &s)).to_be_nil()
+    expect(s).to_equal("aé😀\n")
+    let m: map[str][]int
+    expect(json.unmarshal("{\"a\": [1, 2], \"b\": []}", &m)).to_be_nil()
+    expect(m["a"]).to_equal([]int{1, 2})
+    expect(len(m["b"])).to_equal(0)
+    let mi: map[int]bool
+    expect(json.unmarshal("{\"3\": true}", &mi)).to_be_nil()
+    expect(mi[3]).to_be_true()
+  })
+  it("keeps a part of the document as a *json.Value", fn() {
+    let s: Small
+    expect(json.unmarshal("{\"raw\": {\"q\": [1, \"x\"]}}", &s)).to_be_nil()
+    expect(s.raw.get_str("q.1", "")).to_equal("x")
+    expect(s.raw.string()).to_equal("{\"q\":[1,\"x\"]}")
+  })
+  it("reports values of the wrong type", fn() {
+    let u: User
+    expect(json.unmarshal("{\"age\": \"x\"}", &u).Error()).to_equal("json: cannot unmarshal string into field User.age of type int")
+    expect(json.unmarshal("{\"addr\": {\"zip\": 1.5}}", &u).Error()).to_equal("json: cannot unmarshal number 1.5 into field User.addr.zip of type int")
+    let s: Small
+    expect(json.unmarshal("{\"a\": 300}", &s).Error()).to_equal("json: cannot unmarshal number 300 into field Small.a of type int8")
+    expect(json.unmarshal("{\"u\": -1}", &s).Error()).to_equal("json: cannot unmarshal number -1 into field Small.u of type uint8")
+    let n: int
+    expect(json.unmarshal("[1]", &n).Error()).to_equal("json: cannot unmarshal array into value of type int")
+  })
+  it("needs a non-nil pointer", fn() {
+    let u: User
+    expect(json.unmarshal("{}", u).Error()).to_contain("needs a non-nil pointer")
+    let p: *User
+    expect(json.unmarshal("{}", p).Error()).to_contain("needs a non-nil pointer")
+  })
+})
+
+describe("json.parse", fn() {
+  it("builds a tree with getters by path", fn() {
+    doc, err := json.parse("{\"user\": {\"name\": \"x\", \"list\": [10, 20.5]}, \"ok\": false}")
+    expect(err).to_be_nil()
+    expect(doc.get_str("user.name", "?")).to_equal("x")
+    expect(doc.get_int("user.list.0", 0)).to_equal(10)
+    expect(doc.get_float("user.list.1", 0.0)).to_equal(20.5)
+    expect(doc.get_bool("ok", true)).to_be_false()
+    expect(doc.get_str("user.missing", "def")).to_equal("def")
+    expect(len(doc.get_array("user.list"))).to_equal(2)
+    expect(doc.get_keys("user")).to_equal([]str{"name", "list"})
+    expect(doc.field("ok").kind).to_equal("bool")
+  })
+  it("keeps the key order and the last of repeated keys", fn() {
+    doc, _ := json.parse("{\"b\": 1, \"a\": 2, \"b\": 3}")
+    expect(doc.keys).to_equal([]str{"b", "a"})
+    expect(doc.get_int("b", 0)).to_equal(3)
+  })
+  it("reads numbers: negative, exponent, big", fn() {
+    doc, _ := json.parse("[-0, 1E2, -1.5e-3, 12345678901234567890, 9223372036854775807]")
+    xs := doc.items
+    expect(xs[0].is_int).to_be_true()
+    expect(xs[1].n).to_equal(100.0)
+    expect(xs[2].n).to_equal(-0.0015)
+    expect(xs[3].is_int).to_be_false()
+    expect(xs[3].n).to_equal(12345678901234567890.0)
+    expect(xs[4].i).to_equal(9223372036854775807)
+  })
+  it("decodes escapes and surrogate pairs", fn() {
+    doc, _ := json.parse("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0041\\u00e9\\u20ac\\ud83d\\ude00\\ud800x\"")
+    expect(doc.s).to_equal("\"\\/\u0008\u000c\n\r\tAé€😀\ufffdx")
+  })
+  it("reports syntax errors with line and column", fn() {
+    _, err := json.parse("{\n  \"a\": 1,\n  \"b\": tru\n}")
+    expect(err.Error()).to_equal("json: syntax error at line 3, column 8: invalid character 't' looking for the beginning of a value")
+    _, e2 := json.parse("[1, 2")
+    expect(e2.Error()).to_contain("end of input")
+    _, e3 := json.parse("01")
+    expect(e3.Error()).to_contain("after a leading zero")
+    _, e4 := json.parse("\"a\nb\"")
+    expect(e4.Error()).to_contain("control characters")
+    _, e5 := json.parse("{} x")
+    expect(e5.Error()).to_contain("after the value")
+  })
+  it("refuses nesting deeper than 1000 levels", fn() {
+    deep := ""
+    for i := 0; i < 1001; i++ { deep = deep + "[" }
+    _, err := json.parse(deep)
+    expect(err.Error()).to_contain("nesting deeper")
+  })
+  it("tells valid documents apart", fn() {
+    expect(json.valid(" {\"a\": [1, true, null, \"x\"]} ")).to_be_true()
+    expect(json.valid("")).to_be_false()
+    expect(json.valid("[1,]")).to_be_false()
+    expect(json.valid("{'a': 1}")).to_be_false()
+    expect(json.valid("NaN")).to_be_false()
+  })
+  it("converts to plain values and back to text", fn() {
+    doc, _ := json.parse("{\"a\": [1, 2.5, \"s\"], \"b\": null}")
+    m := doc.to_any().(map[str]any)
+    expect(len(m)).to_equal(2)
+    expect(doc.string()).to_equal("{\"a\":[1,2.5,\"s\"],\"b\":null}")
+  })
+})

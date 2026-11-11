@@ -4905,6 +4905,25 @@ fn (f: *Fn) builtin(n: *ast.Node) {
   case "__flush":
     f.rt("rt_flush", 0)
     return
+  case "__anyp":
+    f.expr_to(args[0], "any")
+    return
+  case "__pany":
+    f.expr(args[0])
+    return
+  case "__alloc", "__zero", "__map_new":
+    f.expr(args[0])
+    A.push(RAX)
+    if nm == "__alloc" { f.rt("rt_alloc", 1) } else if nm == "__zero" { f.rt("rt_zero", 1) } else { f.rt("rt_map_new", 1) }
+    return
+  case "__make_slice", "__map_set":
+    if nm == "__map_set" { f.where_arg(n) }
+    for _, a := range args {
+      f.expr(a)
+      A.push(RAX)
+    }
+    if nm == "__map_set" { f.rt("rt_map_set", 4) } else { f.rt("rt_make_slice", 3) }
+    return
   case "__exit":
     f.expr(args[0])
     A.push(RAX)

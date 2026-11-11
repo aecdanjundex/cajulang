@@ -1,0 +1,1076 @@
+# std/json: JSON (RFC 8259) in the style of Go's encoding/json.
+#
+#   s, err := json.marshal(v)                  # any value -> JSON text
+#   s, err := json.marshal_indent(v, "  ")     # the same, one item per line
+#   err := json.unmarshal(text, &v)            # JSON text -> the value v points to
+#   doc, err := json.parse(text)               # JSON text -> a *json.Value tree
+#   doc.get_str("user.name", "")               # getters with dotted paths, like std/toml
+#   json.valid(text), json.quote(s)
+#
+# Types (marshal and unmarshal):
+#   struct, *struct      object with the field names, in the order they are declared; an embedded
+#                        struct (a field named after its type) has its fields promoted
+#   []T, [N]T            array (a nil list is null)
+#   map[str]T, map[int]T object; marshal writes the keys in alphabetical order
+#   str, bool, int (all sizes), num, float32
+#   any, interfaces      the value inside; error values become their message (marshal only)
+#   *json.Value          the tree itself (a field of this type keeps that part of the document)
+#   nil, nil pointer, nil map -> null
+# Functions and other types are an error. map[str]any{"id": 1, "tags": []str{"a"}} works as an
+# ad hoc object (like gin.H).
+#
+# unmarshal into any gives map[str]any for objects, []any for arrays, int for numbers written
+# without fraction or exponent (that fit 64 bits) and num for the other numbers, str, bool, nil.
+# Keys without a matching field are ignored (a field also matches without regard to case), fields
+# missing from the text keep their value, and null leaves non-nullable values as they are.
+#
+# The reflection works on the runtime's type descriptors (see rt/values.caju): [0] kind, [8] count,
+# [16] element, [24] key, [32] name, [40] fields (name, descriptor, value?) and [48] integer kind.
+
+import "std/strings"
+import "std/strconv"
+import "std/math"
+import "std/toml"
+
+# ---------------------------------------------------------------- the tree
+
+# a JSON value; kind is "object", "array", "string", "number", "bool" or "null"
+export struct Value {
+  kind: str
+  s: str                       # string; for numbers, the text as written
+  n: num                       # number
+  i: int                       # number, when is_int
+  is_int: bool                 # a number without fraction or exponent that fits 64 bits
+  b: bool                      # bool
+  items: []*Value              # array
+  keys: []str                  # object: the keys in order (each once)
+  fields: map[str]*Value       # object
+}
+
+# the value of one key of an object, or nil
+export fn (v: *Value) field(key: str) -> *Value {
+  if v == nil || v.kind != "object" { return nil }
+  return v.fields[key]
+}
+
+# the value at a dotted path ("user.name"; "items.0.id" indexes arrays; "" is v itself), or nil
+export fn (v: *Value) get(path: str) -> *Value {
+  if path == "" { return v }
+  cur := v
+  for _, part := range strings.split(path, ".") {
+    if cur == nil { return nil }
+    if cur.kind == "object" {
+      cur = cur.fields[part]
+    } else if cur.kind == "array" {
+      k, err := strconv.atoi(part)
+      if err != nil || k < 0 || k >= len(cur.items) { return nil }
+      cur = cur.items[k]
+    } else { return nil }
+  }
+  return cur
+}
+
+export fn (v: *Value) get_str(path: str, def: str) -> str {
+  x := v.get(path)
+  if x == nil || x.kind != "string" { return def }
+  return x.s
+}
+# an integer (a number with a fraction is truncated)
+export fn (v: *Value) get_int(path: str, def: int) -> int {
+  x := v.get(path)
+  if x == nil || x.kind != "number" { return def }
+  if x.is_int { return x.i }
+  return int(x.n)
+}
+export fn (v: *Value) get_float(path: str, def: num) -> num {
+  x := v.get(path)
+  if x == nil || x.kind != "number" { return def }
+  return x.n
+}
+export fn (v: *Value) get_bool(path: str, def: bool) -> bool {
+  x := v.get(path)
+  if x == nil || x.kind != "bool" { return def }
+  return x.b
+}
+# the items of an array (nil if the path is not an array)
+export fn (v: *Value) get_array(path: str) -> []*Value {
+  x := v.get(path)
+  if x == nil || x.kind != "array" { return nil }
+  return x.items
+}
+# the keys of an object, in order (empty if the path is not an object)
+export fn (v: *Value) get_keys(path: str) -> []str {
+  x := v.get(path)
+  if x == nil || x.kind != "object" { return []str{} }
+  return x.keys
+}
+export fn (v: *Value) is_null() -> bool { return v == nil || v.kind == "null" }
+# the value as plain Caju values: map[str]any, []any, int, num, str, bool or nil
+export fn (v: *Value) to_any() -> any {
+  if v == nil { return nil }
+  switch v.kind {
+  case "object":
+    m := map[str]any{}
+    for _, k := range v.keys { m[k] = v.fields[k].to_any() }
+    return m
+  case "array":
+    l := make([]any, len(v.items))
+    for i, x := range v.items { l[i] = x.to_any() }
+    return l
+  case "string": return v.s
+  case "number":
+    if v.is_int { return v.i }
+    return v.n
+  case "bool": return v.b
+  }
+  return nil
+}
+# the value as JSON text
+export fn (v: *Value) string() -> str {
+  e := &Enc{indent: "", err: ""}
+  e.tree(v, 0)
+  return e.b.string()
+}
+
+# ---------------------------------------------------------------- parsing
+
+struct Parser {
+  s: str
+  i: int
+  depth: int
+  err: str
+}
+
+const MAX_DEPTH = 1000
+
+export fn parse(text: str) -> (*Value, error) {
+  p := &Parser{s: text, i: 0, depth: 0, err: ""}
+  p.space()
+  v := p.value()
+  if p.err == "" {
+    p.space()
+    if p.i < len(p.s) { p.fail("invalid character " + p.show() + " after the value") }
+  }
+  if p.err != "" { return nil, errors.New(p.err) }
+  return v, nil
+}
+
+export fn valid(text: str) -> bool {
+  _, err := parse(text)
+  return err == nil
+}
+
+# records the first error, with the line and column of the current position
+fn (p: *Parser) fail(msg: str) {
+  if p.err != "" { return }
+  line := 1
+  col := 1
+  for k := 0; k < p.i && k < len(p.s); k++ {
+    if p.s[k] == 10 {
+      line++
+      col = 1
+    } else if (int(p.s[k]) & 192) != 128 { col++ }
+  }
+  p.err = "json: syntax error at line " + str(line) + ", column " + str(col) + ": " + msg
+}
+
+# the character at the current position, for messages
+fn (p: *Parser) show() -> str {
+  if p.i >= len(p.s) { return "end of input" }
+  c := int(p.s[p.i])
+  if c < 32 { return "'\\x" + strconv.format_int(c, 16) + "'" }
+  k := p.i + 1
+  while k < len(p.s) && (int(p.s[k]) & 192) == 128 { k++ }
+  return "'" + p.s[p.i:k] + "'"
+}
+
+fn (p: *Parser) space() {
+  s := p.s
+  n := len(s)
+  i := p.i
+  while i < n {
+    c := s[i]
+    if c != 32 && c != 10 && c != 13 && c != 9 { break }
+    i++
+  }
+  p.i = i
+}
+
+fn (p: *Parser) value() -> *Value {
+  if p.i >= len(p.s) {
+    p.fail("unexpected end of input, expecting a value")
+    return nil
+  }
+  c := int(p.s[p.i])
+  if c == 123 { return p.object() }
+  if c == 91 { return p.array() }
+  if c == 34 {
+    s := p.string()
+    return &Value{kind: "string", s: s}
+  }
+  if c == 45 || (c >= 48 && c <= 57) { return p.number() }
+  if p.word("true") { return &Value{kind: "bool", b: true} }
+  if p.word("false") { return &Value{kind: "bool", b: false} }
+  if p.word("null") { return &Value{kind: "null"} }
+  p.fail("invalid character " + p.show() + " looking for the beginning of a value")
+  return nil
+}
+
+fn (p: *Parser) word(w: str) -> bool {
+  if strings.has_prefix(p.s[p.i:], w) {
+    p.i += len(w)
+    return true
+  }
+  return false
+}
+
+fn (p: *Parser) object() -> *Value {
+  p.depth++
+  if p.depth > MAX_DEPTH {
+    p.fail("nesting deeper than " + str(MAX_DEPTH) + " levels")
+    return nil
+  }
+  v := &Value{kind: "object", keys: []str{}, fields: map[str]*Value{}}
+  p.i++
+  p.space()
+  if p.i < len(p.s) && p.s[p.i] == 125 {
+    p.i++
+    p.depth--
+    return v
+  }
+  while p.err == "" {
+    p.space()
+    if p.i >= len(p.s) || p.s[p.i] != 34 {
+      p.fail("invalid character " + p.show() + " looking for the beginning of an object key")
+      return nil
+    }
+    k := p.string()
+    p.space()
+    if p.i >= len(p.s) || p.s[p.i] != 58 {
+      p.fail("invalid character " + p.show() + " after an object key (expecting ':')")
+      return nil
+    }
+    p.i++
+    p.space()
+    x := p.value()
+    if p.err != "" { return nil }
+    if _, seen := v.fields[k]; !seen { v.keys = append(v.keys, k) }
+    v.fields[k] = x
+    p.space()
+    if p.i < len(p.s) && p.s[p.i] == 44 {
+      p.i++
+      continue
+    }
+    if p.i < len(p.s) && p.s[p.i] == 125 {
+      p.i++
+      p.depth--
+      return v
+    }
+    p.fail("invalid character " + p.show() + " after an object value (expecting ',' or '}')")
+  }
+  return nil
+}
+
+fn (p: *Parser) array() -> *Value {
+  p.depth++
+  if p.depth > MAX_DEPTH {
+    p.fail("nesting deeper than " + str(MAX_DEPTH) + " levels")
+    return nil
+  }
+  v := &Value{kind: "array", items: []*Value{}}
+  p.i++
+  p.space()
+  if p.i < len(p.s) && p.s[p.i] == 93 {
+    p.i++
+    p.depth--
+    return v
+  }
+  while p.err == "" {
+    p.space()
+    x := p.value()
+    if p.err != "" { return nil }
+    v.items = append(v.items, x)
+    p.space()
+    if p.i < len(p.s) && p.s[p.i] == 44 {
+      p.i++
+      continue
+    }
+    if p.i < len(p.s) && p.s[p.i] == 93 {
+      p.i++
+      p.depth--
+      return v
+    }
+    p.fail("invalid character " + p.show() + " after an array item (expecting ',' or ']')")
+  }
+  return nil
+}
+
+fn is_digit(c: int) -> bool { return c >= 48 && c <= 57 }
+
+fn (p: *Parser) number() -> *Value {
+  s := p.s
+  n := len(s)
+  start := p.i
+  i := p.i
+  if s[i] == 45 { i++ }
+  if i >= n || !is_digit(int(s[i])) {
+    p.i = i
+    p.fail("invalid character " + p.show() + " in a number (expecting a digit)")
+    return nil
+  }
+  if s[i] == 48 {
+    i++
+    if i < n && is_digit(int(s[i])) {
+      p.i = i
+      p.fail("invalid character " + p.show() + " after a leading zero")
+      return nil
+    }
+  } else {
+    while i < n && is_digit(int(s[i])) { i++ }
+  }
+  integral := true
+  if i < n && s[i] == 46 {
+    integral = false
+    i++
+    if i >= n || !is_digit(int(s[i])) {
+      p.i = i
+      p.fail("invalid character " + p.show() + " after a decimal point (expecting a digit)")
+      return nil
+    }
+    while i < n && is_digit(int(s[i])) { i++ }
+  }
+  if i < n && (s[i] == 101 || s[i] == 69) {
+    integral = false
+    i++
+    if i < n && (s[i] == 43 || s[i] == 45) { i++ }
+    if i >= n || !is_digit(int(s[i])) {
+      p.i = i
+      p.fail("invalid character " + p.show() + " in an exponent (expecting a digit)")
+      return nil
+    }
+    while i < n && is_digit(int(s[i])) { i++ }
+  }
+  p.i = i
+  text := s[start:i]
+  v := &Value{kind: "number", s: text}
+  if integral {
+    k, err := strconv.parse_int(text, 10)
+    if err == nil {
+      v.is_int = true
+      v.i = k
+      v.n = num(k)
+      return v
+    }
+  }
+  f, err2 := strconv.parse_float(text)
+  if err2 != nil {
+    p.i = start
+    p.fail("number " + text + " out of range")
+    return nil
+  }
+  v.n = f
+  return v
+}
+
+fn hex_val(c: int) -> int {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return -1
+}
+
+# four hex digits at p.i (after "\u"), or -1
+fn (p: *Parser) hex4() -> int {
+  if p.i + 4 > len(p.s) { return -1 }
+  r := 0
+  for k := 0; k < 4; k++ {
+    h := hex_val(int(p.s[p.i + k]))
+    if h < 0 { return -1 }
+    r = r * 16 + h
+  }
+  p.i += 4
+  return r
+}
+
+# a string at p.i (the opening quote), without the quotes and with the escapes decoded
+fn (p: *Parser) string() -> str {
+  s := p.s
+  n := len(s)
+  p.i++
+  start := p.i
+  # fast path: no escapes
+  i := p.i
+  while i < n {
+    ch := s[i]
+    if ch == 34 || ch == 92 || ch < 32 { break }
+    i++
+  }
+  if i < n && s[i] == 34 {
+    p.i = i + 1
+    return s[start:i]
+  }
+  b := &strings.Builder{}
+  b.write(s[start:i])
+  p.i = i
+  while true {
+    if p.i >= n {
+      p.fail("unexpected end of input in a string")
+      return ""
+    }
+    c := int(s[p.i])
+    if c == 34 {
+      p.i++
+      return b.string()
+    }
+    if c < 32 {
+      p.fail("invalid character " + p.show() + " in a string (control characters must be escaped)")
+      return ""
+    }
+    if c != 92 {
+      j := p.i
+      while j < n && s[j] != 34 && s[j] != 92 && s[j] >= 32 { j++ }
+      b.write(s[p.i:j])
+      p.i = j
+      continue
+    }
+    p.i++
+    if p.i >= n {
+      p.fail("unexpected end of input in a string")
+      return ""
+    }
+    e := int(s[p.i])
+    p.i++
+    switch e {
+    case 34: b.write_byte(34)
+    case 92: b.write_byte(92)
+    case 47: b.write_byte(47)
+    case 98: b.write_byte(8)
+    case 102: b.write_byte(12)
+    case 110: b.write_byte(10)
+    case 114: b.write_byte(13)
+    case 116: b.write_byte(9)
+    case 117:
+      r := p.hex4()
+      if r < 0 {
+        p.fail("invalid \\u escape (expecting 4 hex digits)")
+        return ""
+      }
+      if r >= 0xD800 && r < 0xDC00 {
+        # a high surrogate: a low one must follow, else the character is invalid (U+FFFD)
+        lo := -1
+        if p.i + 6 <= n && s[p.i] == 92 && s[p.i + 1] == 117 {
+          save := p.i
+          p.i += 2
+          lo = p.hex4()
+          if lo < 0xDC00 || lo >= 0xE000 {
+            lo = -1
+            p.i = save
+          }
+        }
+        if lo < 0 { r = 0xFFFD } else { r = 0x10000 + ((r - 0xD800) << 10) + (lo - 0xDC00) }
+      } else if r >= 0xDC00 && r < 0xE000 { r = 0xFFFD }
+      b.write_rune(r)
+    default:
+      p.i--
+      p.fail("invalid escape " + p.show() + " in a string")
+      return ""
+    }
+  }
+  return ""
+}
+
+# ---------------------------------------------------------------- quoting
+
+const HEX = "0123456789abcdef"
+
+# s as a JSON string, with quotes and escapes (UTF-8 text is kept as it is)
+export fn quote(s: str) -> str {
+  b := &strings.Builder{}
+  quote_to(b, s)
+  return b.string()
+}
+
+fn quote_to(b: *strings.Builder, s: str) {
+  b.write_byte(34)
+  n := len(s)
+  start := 0
+  for i := 0; i < n; i++ {
+    c := int(s[i])
+    if c >= 32 && c != 34 && c != 92 { continue }
+    if start < i { b.write(s[start:i]) }
+    start = i + 1
+    switch c {
+    case 34: b.write("\\\"")
+    case 92: b.write("\\\\")
+    case 10: b.write("\\n")
+    case 13: b.write("\\r")
+    case 9: b.write("\\t")
+    case 8: b.write("\\b")
+    case 12: b.write("\\f")
+    default:
+      b.write("\\u00")
+      b.write_byte(int(HEX[c >> 4]))
+      b.write_byte(int(HEX[c & 15]))
+    }
+  }
+  if start < n { b.write(s[start:n]) }
+  b.write_byte(34)
+}
+
+# ---------------------------------------------------------------- descriptors
+
+fn dkind(d: int) -> int { return __load64(d) }
+fn dname(d: int) -> str { return __pstr(__load64(d + 32)) }
+fn delem(d: int) -> int { return __load64(d + 16) }
+fn dkey(d: int) -> int { return __load64(d + 24) }
+fn dcount(d: int) -> int { return __load64(d + 8) }
+fn field_name(d: int, i: int) -> str { return __pstr(__load64(__load64(d + 40) + 24 * i)) }
+fn field_desc(d: int, i: int) -> int { return __load64(__load64(d + 40) + 24 * i + 8) }
+
+# the descriptor of *Value (a field of this type holds a part of the tree)
+let value_desc: int = 0
+fn value_ptr_desc() -> int {
+  if value_desc == 0 { value_desc = __load64(__anyp(&Value{kind: "null"})) }
+  return value_desc
+}
+
+# an embedded struct: a field named after its own type (struct or pointer to struct)
+fn embedded(d: int, i: int) -> bool {
+  fd := field_desc(d, i)
+  if dkind(fd) == 9 { fd = delem(fd) }
+  if dkind(fd) != 8 { return false }
+  nm := dname(fd)
+  dot := strings.last_index(nm, ".")
+  if dot >= 0 { nm = nm[dot + 1:] }
+  return nm == field_name(d, i)
+}
+
+# a word of type d as an any (a new box)
+fn word_any(w: int, d: int) -> any {
+  b := __alloc(16)
+  __store64(b, d)
+  __store64(b + 8, w)
+  return __pany(b)
+}
+
+# element i of a list or array data block (bool elements take one byte)
+fn eload(data: int, i: int, ed: int) -> int {
+  if dkind(ed) == 4 { return __load8(data + i) }
+  return __load64(data + 8 * i)
+}
+fn estore(data: int, i: int, ed: int, w: int) {
+  if dkind(ed) == 4 {
+    __store8(data + i, w)
+    return
+  }
+  __store64(data + 8 * i, w)
+}
+
+# ---------------------------------------------------------------- marshal
+
+struct Enc {
+  b: strings.Builder
+  indent: str
+  err: str
+}
+
+export fn marshal(v: any) -> (str, error) { return encode(v, "") }
+
+export fn marshal_indent(v: any, indent: str) -> (str, error) { return encode(v, indent) }
+
+fn encode(v: any, indent: str) -> (str, error) {
+  e := &Enc{indent: indent, err: ""}
+  box := __anyp(v)
+  if box == 0 { e.b.write("null") } else { e.word(__load64(box + 8), __load64(box), 0) }
+  if e.err != "" { return "", errors.New(e.err) }
+  return e.b.string(), nil
+}
+
+fn (e: *Enc) newline(depth: int) {
+  if e.indent == "" { return }
+  e.b.write_byte(10)
+  for k := 0; k < depth; k++ { e.b.write(e.indent) }
+}
+
+fn (e: *Enc) colon() {
+  if e.indent == "" { e.b.write_byte(58) } else { e.b.write(": ") }
+}
+
+# a number as JSON: the shortest text that reads back the same, without ".0" for integers
+fn format_num(x: num) -> str {
+  if x == 0.0 { return "0" }
+  if x == math.trunc(x) && x < 1e21 && x > -1e21 {
+    if x < 9.2e18 && x > -9.2e18 { return str(int(x)) }
+  }
+  t := toml.format_float(x)
+  if strings.has_suffix(t, ".0") { t = t[0:len(t) - 2] }
+  return t
+}
+
+fn (e: *Enc) word(w: int, d: int, depth: int) {
+  if e.err != "" { return }
+  if depth > MAX_DEPTH {
+    e.err = "json: unsupported value: nesting deeper than " + str(MAX_DEPTH) + " levels (a cycle?)"
+    return
+  }
+  if d == value_ptr_desc() {
+    if w == 0 {
+      e.b.write("null")
+      return
+    }
+    t := word_any(w, d).(*Value)
+    e.tree(t, depth)
+    return
+  }
+  k := dkind(d)
+  switch k {
+  case 1:
+    e.b.write(str(w))
+  case 2:
+    e.b.write(str(uint64(w)))
+  case 3:
+    x := __bitsf(w)
+    if math.is_nan(x) || math.is_inf(x) {
+      e.err = "json: unsupported value: " + str(x)
+      return
+    }
+    e.b.write(format_num(x))
+  case 4:
+    if w != 0 { e.b.write("true") } else { e.b.write("false") }
+  case 5:
+    quote_to(&e.b, __pstr(w))
+  case 6:
+    if w == 0 {
+      e.b.write("null")
+      return
+    }
+    e.list(__load64(w), __load64(w + 8), delem(d), depth)
+  case 7:
+    e.list(w, dcount(d), delem(d), depth)
+  case 8:
+    e.b.write_byte(123)
+    first := true
+    e.fields(w, d, depth, &first)
+    if !first { e.newline(depth) }
+    e.b.write_byte(125)
+  case 9:
+    if w == 0 {
+      e.b.write("null")
+      return
+    }
+    ed := delem(d)
+    if dkind(ed) == 7 || dkind(ed) == 8 { e.word(w, ed, depth) } else { e.word(__load64(w), ed, depth) }
+  case 10:
+    if w == 0 {
+      e.b.write("null")
+      return
+    }
+    e.map_obj(w, d, depth)
+  case 11, 12, 13:
+    if w == 0 {
+      e.b.write("null")
+      return
+    }
+    bd := d
+    bw := w
+    if k != 13 {
+      bd = __load64(w)
+      bw = __load64(w + 8)
+    }
+    if dkind(bd) == 13 || (k == 12 && dname(d) == "error") {
+      a := word_any(bw, bd)
+      if er, ok := a.(error); ok {
+        quote_to(&e.b, er.Error())
+        return
+      }
+    }
+    e.word(bw, bd, depth)
+  default:
+    e.err = "json: unsupported type: " + dname(d)
+  }
+}
+
+# the fields of a struct object (embedded structs promoted), after "{" or a previous field
+fn (e: *Enc) fields(w: int, d: int, depth: int, first: *bool) {
+  n := dcount(d)
+  for i := 0; i < n; i++ {
+    fd := field_desc(d, i)
+    fw := __load64(w + 8 * i)
+    if embedded(d, i) {
+      if dkind(fd) == 9 {
+        if fw == 0 { continue }
+        fd = delem(fd)
+      }
+      e.fields(fw, fd, depth, first)
+      continue
+    }
+    if !*first { e.b.write_byte(44) }
+    *first = false
+    e.newline(depth + 1)
+    quote_to(&e.b, field_name(d, i))
+    e.colon()
+    e.word(fw, fd, depth + 1)
+    if e.err != "" { return }
+  }
+}
+
+fn (e: *Enc) list(data: int, n: int, ed: int, depth: int) {
+  e.b.write_byte(91)
+  for i := 0; i < n; i++ {
+    if i > 0 { e.b.write_byte(44) }
+    e.newline(depth + 1)
+    e.word(eload(data, i, ed), ed, depth + 1)
+    if e.err != "" { return }
+  }
+  if n > 0 { e.newline(depth) }
+  e.b.write_byte(93)
+}
+
+fn (e: *Enc) map_obj(m: int, d: int, depth: int) {
+  kd := dkey(d)
+  vd := delem(d)
+  kk := dkind(kd)
+  if kk != 5 && kk != 1 && kk != 2 {
+    e.err = "json: unsupported type: " + dname(d) + " (map keys must be strings or integers)"
+    return
+  }
+  used := __load64(m + 16)
+  entries := __load64(m + 8)
+  dead := __load64(m + 56)
+  keys := []str{}
+  vals := map[str]int{}
+  for i := 0; i < used; i++ {
+    if dead != 0 && __load8(dead + i) != 0 { continue }
+    kw := __load64(entries + 16 * i)
+    ks := ""
+    if kk == 5 { ks = __pstr(kw) } else if kk == 2 { ks = str(uint64(kw)) } else { ks = str(kw) }
+    keys = append(keys, ks)
+    vals[ks] = __load64(entries + 16 * i + 8)
+  }
+  sort_strs(keys)
+  e.b.write_byte(123)
+  for i, ks := range keys {
+    if i > 0 { e.b.write_byte(44) }
+    e.newline(depth + 1)
+    quote_to(&e.b, ks)
+    e.colon()
+    e.word(vals[ks], vd, depth + 1)
+    if e.err != "" { return }
+  }
+  if len(keys) > 0 { e.newline(depth) }
+  e.b.write_byte(125)
+}
+
+fn (e: *Enc) tree(v: *Value, depth: int) {
+  if v == nil {
+    e.b.write("null")
+    return
+  }
+  switch v.kind {
+  case "object":
+    e.b.write_byte(123)
+    for i, k := range v.keys {
+      if i > 0 { e.b.write_byte(44) }
+      e.newline(depth + 1)
+      quote_to(&e.b, k)
+      e.colon()
+      e.tree(v.fields[k], depth + 1)
+    }
+    if len(v.keys) > 0 { e.newline(depth) }
+    e.b.write_byte(125)
+  case "array":
+    e.b.write_byte(91)
+    for i, x := range v.items {
+      if i > 0 { e.b.write_byte(44) }
+      e.newline(depth + 1)
+      e.tree(x, depth + 1)
+    }
+    if len(v.items) > 0 { e.newline(depth) }
+    e.b.write_byte(93)
+  case "string": quote_to(&e.b, v.s)
+  case "number":
+    if v.s != "" { e.b.write(v.s) } else if v.is_int { e.b.write(str(v.i)) } else { e.b.write(format_num(v.n)) }
+  case "bool":
+    if v.b { e.b.write("true") } else { e.b.write("false") }
+  default: e.b.write("null")
+  }
+}
+
+# sorts in place (merge sort: maps can be large)
+fn sort_strs(a: []str) {
+  n := len(a)
+  if n < 2 { return }
+  if n <= 12 {
+    for i := 1; i < n; i++ {
+      x := a[i]
+      j := i - 1
+      while j >= 0 && a[j] > x {
+        a[j + 1] = a[j]
+        j--
+      }
+      a[j + 1] = x
+    }
+    return
+  }
+  mid := n / 2
+  left := make([]str, mid)
+  right := make([]str, n - mid)
+  copy(left, a[0:mid])
+  copy(right, a[mid:n])
+  sort_strs(left)
+  sort_strs(right)
+  i := 0
+  j := 0
+  k := 0
+  while i < len(left) && j < len(right) {
+    if right[j] < left[i] {
+      a[k] = right[j]
+      j++
+    } else {
+      a[k] = left[i]
+      i++
+    }
+    k++
+  }
+  while i < len(left) {
+    a[k] = left[i]
+    i++
+    k++
+  }
+  while j < len(right) {
+    a[k] = right[j]
+    j++
+    k++
+  }
+}
+
+# ---------------------------------------------------------------- unmarshal
+
+struct Dec {
+  err: str
+}
+
+export fn unmarshal(text: str, v: any) -> error {
+  box := __anyp(v)
+  if box == 0 { return errors.New("json: unmarshal needs a non-nil pointer (got nil)") }
+  d := __load64(box)
+  if dkind(d) != 9 { return errors.New("json: unmarshal needs a non-nil pointer (got " + dname(d) + ")") }
+  p := __load64(box + 8)
+  if p == 0 { return errors.New("json: unmarshal needs a non-nil pointer (got a nil " + dname(d) + ")") }
+  tree, err := parse(text)
+  if err != nil { return err }
+  dec := &Dec{err: ""}
+  ed := delem(d)
+  if dkind(ed) == 7 || dkind(ed) == 8 {
+    dec.word(tree, ed, p, "")
+  } else {
+    w := dec.word(tree, ed, __load64(p), "")
+    if dec.err == "" { __store64(p, w) }
+  }
+  if dec.err != "" { return errors.New(dec.err) }
+  return nil
+}
+
+fn json_kind(v: *Value) -> str {
+  if v.kind == "number" { return "number " + v.s }
+  return v.kind
+}
+
+fn (dec: *Dec) mismatch(v: *Value, d: int, ctx: str) {
+  if dec.err != "" { return }
+  where := "value"
+  if ctx != "" { where = "field " + ctx }
+  dec.err = "json: cannot unmarshal " + json_kind(v) + " into " + where + " of type " + dname(d)
+}
+
+# the range of an integer type by its name, or ok false for int/int64/uint64/uint
+fn int_range(name: str) -> (int, int, bool) {
+  switch name {
+  case "int8": return -128, 127, true
+  case "int16": return -32768, 32767, true
+  case "int32": return -2147483648, 2147483647, true
+  case "uint8": return 0, 255, true
+  case "uint16": return 0, 65535, true
+  case "uint32": return 0, 4294967295, true
+  }
+  return 0, 0, false
+}
+
+# the word for v decoded as type d; old is the current word (structs and arrays are filled in
+# place, and null keeps it for the types that cannot be nil)
+fn (dec: *Dec) word(v: *Value, d: int, old: int, ctx: str) -> int {
+  if dec.err != "" { return old }
+  if d == value_ptr_desc() { return __load64(__anyp(v) + 8) }
+  k := dkind(d)
+  if v.kind == "null" {
+    if k == 6 || k == 9 || k == 10 || k == 11 || k == 12 { return 0 }
+    return old
+  }
+  switch k {
+  case 1, 2:
+    if v.kind != "number" || !v.is_int {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    lo, hi, ranged := int_range(dname(d))
+    if (ranged && (v.i < lo || v.i > hi)) || (k == 2 && v.i < 0) {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    return v.i
+  case 3:
+    if v.kind != "number" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    if dname(d) == "float32" { return __fbits(num(float32(v.n))) }
+    return __fbits(v.n)
+  case 4:
+    if v.kind != "bool" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    if v.b { return 1 }
+    return 0
+  case 5:
+    if v.kind != "string" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    return __strp(v.s)
+  case 6:
+    if v.kind != "array" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    ed := delem(d)
+    n := len(v.items)
+    s := __make_slice(ed, n, n)
+    data := __load64(s)
+    for i := 0; i < n; i++ {
+      estore(data, i, ed, dec.word(v.items[i], ed, eload(data, i, ed), ctx))
+      if dec.err != "" { return old }
+    }
+    return s
+  case 7:
+    if v.kind != "array" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    ed := delem(d)
+    data := old
+    if data == 0 { data = __zero(d) }
+    n := dcount(d)
+    for i := 0; i < n; i++ {
+      if i < len(v.items) {
+        estore(data, i, ed, dec.word(v.items[i], ed, eload(data, i, ed), ctx))
+      } else {
+        estore(data, i, ed, __zero(ed))
+      }
+      if dec.err != "" { return old }
+    }
+    return data
+  case 8:
+    if v.kind != "object" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    obj := old
+    if obj == 0 { obj = __zero(d) }
+    dec.fields(v, d, obj, ctx)
+    return obj
+  case 9:
+    ed := delem(d)
+    if dkind(ed) == 7 || dkind(ed) == 8 {
+      obj := old
+      if obj == 0 { obj = __zero(ed) }
+      return dec.word(v, ed, obj, ctx)
+    }
+    cell := old
+    if cell == 0 {
+      cell = __alloc(8)
+      __store64(cell, __zero(ed))
+    }
+    w := dec.word(v, ed, __load64(cell), ctx)
+    __store64(cell, w)
+    return cell
+  case 10:
+    if v.kind != "object" {
+      dec.mismatch(v, d, ctx)
+      return old
+    }
+    kd := dkey(d)
+    vd := delem(d)
+    kk := dkind(kd)
+    if kk != 5 && kk != 1 && kk != 2 {
+      dec.err = "json: cannot unmarshal into " + dname(d) + " (map keys must be strings or integers)"
+      return old
+    }
+    m := old
+    if m == 0 {
+      if kk == 5 { m = __map_new(2) } else { m = __map_new(0) }
+    }
+    for _, key := range v.keys {
+      kw := 0
+      if kk == 5 {
+        kw = __strp(key)
+      } else {
+        x, err := strconv.parse_int(key, 10)
+        if err != nil {
+          dec.err = "json: cannot unmarshal key " + quote(key) + " into a map key of type " + dname(kd)
+          return old
+        }
+        kw = x
+      }
+      w := dec.word(v.fields[key], vd, __zero(vd), ctx)
+      if dec.err != "" { return old }
+      __map_set(m, kw, w)
+    }
+    return m
+  case 11:
+    return __anyp(v.to_any())
+  }
+  dec.mismatch(v, d, ctx)
+  return old
+}
+
+# the fields of a struct object, from a JSON object (embedded structs promoted)
+fn (dec: *Dec) fields(v: *Value, d: int, obj: int, ctx: str) {
+  sname := dname(d)
+  dot := strings.last_index(sname, ".")
+  if dot >= 0 { sname = sname[dot + 1:] }
+  n := dcount(d)
+  for i := 0; i < n; i++ {
+    fd := field_desc(d, i)
+    if embedded(d, i) {
+      inner := __load64(obj + 8 * i)
+      if dkind(fd) == 9 {
+        if inner == 0 {
+          inner = __zero(delem(fd))
+          __store64(obj + 8 * i, inner)
+        }
+        fd = delem(fd)
+      }
+      dec.fields(v, fd, inner, ctx)
+      if dec.err != "" { return }
+      continue
+    }
+    name := field_name(d, i)
+    x := v.fields[name]
+    if x == nil {
+      low := strings.to_lower(name)
+      for _, key := range v.keys {
+        if strings.to_lower(key) == low {
+          x = v.fields[key]
+          break
+        }
+      }
+    }
+    if x == nil { continue }
+    c2 := sname + "." + name
+    if ctx != "" { c2 = ctx + "." + name }
+    w := dec.word(x, fd, __load64(obj + 8 * i), c2)
+    if dec.err != "" { return }
+    __store64(obj + 8 * i, w)
+  }
+}

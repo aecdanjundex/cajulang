@@ -20,7 +20,7 @@ compiler/*.caju      o compilador, em Caju (ver docs/compiler-port.md, tabela de
   testdata/            programas auxiliares desses testes
 rt/*.caju            runtime dos programas: core, gc, values, dynamic, panic, linux, windows
 lib/*.caju           biblioteca padrão (import "std/x"): strings, strconv, math, bytes, os, fs, path,
-                     net, http, toml, crypto, hash, hex, base64, testing; cada uma com seu _test.caju
+                     net, http, toml, json, crypto, hash, hex, base64, testing; cada uma com seu _test.caju
 bootstrap/*.js       o compilador original em JavaScript (léxico, parser, tipos, ligador, VM, native.js)
 tests/lang/          testes da linguagem (*_test.caju + testdata/)
 examples/            exemplos da linguagem; examples_test.caju roda cada um e confere a saída
@@ -50,7 +50,7 @@ comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
 
-Resultado esperado hoje: **757 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
+Resultado esperado hoje: **785 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
 receber valor dá lixo; chamada dinâmica de método em `any` não converte argumento sem tipo nem
 confere a quantidade de argumentos).
@@ -128,6 +128,11 @@ procure o endereço no arquivo do `CAJU_SYMS`.
 - Uma função que chama `ast.fail`/`rt_fail` e tem resultado ainda precisa de um `return` depois.
 - Funções `__load8`, `__store64`, `__syscall` etc. só existem no runtime (`rt/`), com
   `typecheck(..., intrinsics)`.
+  A biblioteca padrão (`std/`) também pode usá-las (chamadas `privileged`). Para o `std/json` há
+  intrínsecos de reflexão: `__anyp(any) -> int` (a caixa [descritor, valor] de um any) e
+  `__pany(int) -> any` (o contrário), e `__alloc`, `__zero(desc)`, `__make_slice(ed, n, c)`,
+  `__map_new(kk)`, `__map_set(m, k, v)`, que chamam as rotinas do runtime. O layout dos
+  descritores está em `rt/values.caju`; mudou o layout? Atualize `lib/json.caju` também.
 - Nenhum ponteiro vivo pode ficar só num registrador durante uma chamada (o coletor só olha a
   pilha e as globais).
 - Objetos de array/slice são alocados com 8 bytes a mais; textos e buffers de bytes com
