@@ -838,6 +838,7 @@ struct Fn {
 struct SCache {
   len: *Var
   data: *Var
+  prev: *SCache               # the copy of an outer loop that this one (in registers) shadows
 }
 
 # names a loop assigns (any statement inside it) and lists it indexes (a[i], len(a))
@@ -847,10 +848,13 @@ struct LoopScan {
   calls: bool              # may run code of the program (a call that is not a builtin nor inlined)
   fcalls: []*ast.Node      # calls to functions: pure only if try_inline turns them into an expression
   deref_store: bool        # stores through a pointer (*p = v): could reassign a global list
+  g: *Gen
+  rcalls: bool             # surely calls a function, runtime included (estimate: Gen.calls_here)
 }
 
 fn (ls: *LoopScan) walk(n: *ast.Node) {
   if n == nil { return }
+  if !ls.rcalls && ls.g.calls_here(n) { ls.rcalls = true }
   if n.kind == "FuncLit" || n.kind == "Func" { return }
   switch n.kind {
   case "Assign": if n.name != "" { ls.assigned[n.name] = true }
@@ -903,8 +907,8 @@ fn (ls: *LoopScan) walk(n: *ast.Node) {
   for _, x := range n.sfields { ls.walk(x) }
 }
 
-fn scan_loop(parts: []*ast.Node) -> *LoopScan {
-  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false}
+fn scan_loop(g: *Gen, parts: []*ast.Node) -> *LoopScan {
+  ls := &LoopScan{used: map[str]bool{}, assigned: map[str]bool{}, calls: false, fcalls: []*ast.Node{}, deref_store: false, g: g, rcalls: false}
   for _, p := range parts { ls.walk(p) }
   return ls
 }
@@ -1097,14 +1101,21 @@ fn (f: *Fn) rec_addr(r: int) {
 # Pointers never live only in a register: the collector looks for them on the stack.
 let SAVED_REGS = []int{RBX, R12, R13, R14}
 
+# Up to 6 more go to the caller-saved RSI, RDI, R8..R11 when they are used more than the calls
+# of the function cost: every call stores them in their frame slot before and reloads them
+# after (x64 spill/fill), so across a call they are on the stack.
+let EXTRA_REGS = []int{RSI, RDI, R8, R9, R10, R11}
+
 struct UseCount {
   n: map[str]int
   in_lit: map[str]bool        # used inside a function (or its address is taken): stays in memory
   f: *Fn                      # nil: calls are not counted
-  calls: int                  # weighted count of the calls (each one saves and reloads the XMM variables)
+  calls: int                  # weighted count of the calls (each one saves and reloads the
+                              # variables in caller-saved registers, XMM and RSI, RDI, R8..R11)
 }
 
-# a node whose code calls a function that returns (a guess: it only weighs XMM variables)
+# a node whose code calls a function that returns (a guess: it only weighs the variables in
+# caller-saved registers)
 fn (uc: *UseCount) is_call(n: *ast.Node) -> bool {
   switch n.kind {
   case "MethodCall", "CallValue", "StructLit", "CompositeLit", "FuncLit": return true
@@ -1113,6 +1124,28 @@ fn (uc: *UseCount) is_call(n: *ast.Node) -> bool {
     if n.call_kind == "builtin" { return !(n.name == "len" || n.name == "cap" || n.name == "__sqrt") }
     if n.call_kind == "func" && uc.f.try_inline(n) != nil { return false }
     return true
+  }
+  return uc.f.g.calls_here(n)
+}
+
+# n itself (not its children) surely calls a function: a call that is not inlined, a map
+# access, an operation on texts or on any (an estimate: it decides whether a loop's lists go to
+# caller-saved registers)
+fn (g: *Gen) calls_here(n: *ast.Node) -> bool {
+  switch n.kind {
+  case "CallValue", "MethodCall", "FuncLit", "StructLit", "SliceExpr", "TypeAssert", "TypeSwitch", "Defer", "Select": return true
+  case "Call":
+    if n.call_kind == "builtin" && (n.name == "len" || n.name == "cap") { return false }
+    if strings.has_prefix(n.name, "__") { return false }
+    return true
+  case "Index":
+    if n.obj == nil || n.obj.ty == "" { return false }
+    ot := types.dflt(n.obj.ty)
+    return types.loose(ot) || g.kind_of_t(ot) == "map"
+  case "Binary":
+    if n.left == nil || n.right == nil || n.left.ty == "" || n.right.ty == "" { return false }
+    if g.is_iface_t(n.left.ty) || g.is_iface_t(n.right.ty) { return true }
+    return g.cls(n.left.ty, n) == "s" || n.op == "**"
   }
   return false
 }
@@ -1221,6 +1254,14 @@ fn (f: *Fn) alloc_regs(body: []*ast.Node) -> []int {
     f.locals[name].reg = SAVED_REGS[i]
     used = append(used, SAVED_REGS[i])
   }
+  for i := len(SAVED_REGS); i < len(rest); i++ {
+    k := i - len(SAVED_REGS)
+    if k >= len(EXTRA_REGS) || uc.n[rest[i]] <= 2 * uc.calls { break }
+    v := f.locals[rest[i]]
+    v.reg = EXTRA_REGS[k]
+    f.a.sv_regs = append(f.a.sv_regs, v.reg)
+    f.a.sv_offs = append(f.a.sv_offs, v.off)
+  }
   return used
 }
 const XMM_VARS = 7
@@ -1275,6 +1316,10 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   # registers: a function with defer keeps none, but saves them all so that a recovered panic
   # (which jumps over the frames that saved them) gives its caller the right values back
   regs := []int{}
+  outer_sv_regs := A.sv_regs
+  outer_sv_offs := A.sv_offs
+  A.sv_regs = []int{}
+  A.sv_offs = []int{}
   if (!is_top || f.top_frame) && !hd { regs = f.alloc_regs(body) }
   if !is_top && hd { regs = SAVED_REGS }
   saved_regs := []*Var{}
@@ -1381,6 +1426,8 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   A.ret()
   A.xs_reg = []int{}
   A.xs_off = []int{}
+  A.sv_regs = outer_sv_regs
+  A.sv_offs = outer_sv_offs
   size := (8 * f.nloc + 15) / 16 * 16
   A.b.set_u32(frame_at, size)
   if land_at >= 0 { A.b.set_u32(land_at, size) }
@@ -1400,8 +1447,8 @@ fn (f: *Fn) fail_here(n: *ast.Node, msg: str) {
 # calls a runtime function with the arguments already pushed
 fn (f: *Fn) rt(name: str, nargs: int) {
   # the runtime errors never return (a recovered panic resumes in the deferring function): no
-  # need to save the XMM variables around them
-  if name == "rt_index_fail" || name == "rt_nil_index" || name == "rt_nil_call" || name == "rt_panic_val" {
+  # need to save the variables in caller-saved registers around them
+  if name == "rt_fail" || name == "rt_index_fail" || name == "rt_nil_index" || name == "rt_slice_fail" || name == "rt_nil_call" || name == "rt_panic_val" {
     f.a.call_noret(f.g.rt_call(name))
   } else {
     f.a.call(f.g.rt_call(name))
@@ -2557,6 +2604,10 @@ fn (f: *Fn) nil_check(n: *ast.Node, msg: str) {
 # ---- lists inside loops (SCache) ----
 # reads (or writes) a hidden variable with an ALU instruction: reg op [slot]
 fn (f: *Fn) slot_op(op: int, reg: int, v: *Var) {
+  if v.reg != 0 {
+    f.a.rr(op, reg, v.reg)
+    return
+  }
   if v.sym != "" { f.a.rip(op, reg, v.sym) } else { f.a.rmx(op, reg, RBP, v.off, 1, 0) }
 }
 
@@ -2571,7 +2622,19 @@ fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
   added := []str{}
   for _, name := range names {
     if ls.assigned[name] { continue }
-    if _, has := f.scache[name]; has { continue }
+    if outer, has := f.scache[name]; has {
+      # an outer loop keeps it in memory: a loop without calls copies it to registers
+      if ls.rcalls || outer.len.reg != 0 || f.free_extras() < 2 { continue }
+      d := f.scache_slot(ls)                    # the data first: [reg + rcx*8] saves a load
+      c := &SCache{len: f.scache_slot(ls), data: d, prev: outer}
+      f.load_slot(outer.data)
+      f.store_slot(c.data)
+      f.load_slot(outer.len)
+      f.store_slot(c.len)
+      f.scache[name] = c
+      added = append(added, name)
+      continue
+    }
     if _, captured := f.caps[name]; captured { continue }
     v, ok := f.locals[name]
     if !ok {
@@ -2583,7 +2646,8 @@ fn (f: *Fn) enter_scache(ls: *LoopScan) -> []str {
     } else if v.sym != "" { continue }
     if v.celled || v.reg != 0 || v.cap >= 0 { continue }
     if f.g.kind_of_t(types.dflt(v.t)) != "slice" { continue }
-    c := &SCache{len: f.hidden(), data: f.hidden()}
+    d := f.scache_slot(ls)
+    c := &SCache{len: f.scache_slot(ls), data: d, prev: nil}
     is_nil := A.label()
     put := A.label()
     f.load_v(v)
@@ -2608,7 +2672,45 @@ fn (f: *Fn) loop_pure(ls: *LoopScan) -> bool {
   for _, c := range ls.fcalls { if f.try_inline(c) == nil { return false } }
   return true
 }
-fn (f: *Fn) exit_scache(added: []str) { for _, name := range added { delete(f.scache, name) } }
+fn (f: *Fn) exit_scache(added: []str) {
+  for _, name := range added {
+    c := f.scache[name]
+    f.free_extra(c.len)
+    f.free_extra(c.data)
+    if c.prev != nil { f.scache[name] = c.prev } else { delete(f.scache, name) }
+  }
+}
+fn (f: *Fn) free_extras() -> int { return len(EXTRA_REGS) - len(f.a.sv_regs) }
+# a hidden variable of the SCache: in a loop that calls no function, a free caller-saved register
+# (with a frame slot for the spills around the calls of slow paths; the data pointer is there
+# during any call, so the collector sees it); otherwise memory
+fn (f: *Fn) scache_slot(ls: *LoopScan) -> *Var {
+  if !ls.rcalls {
+    for _, r := range EXTRA_REGS {
+      taken := false
+      for _, x := range f.a.sv_regs { if x == r { taken = true } }
+      if taken { continue }
+      v := &Var{off: f.new_slot(), cap: -1, reg: r}
+      f.a.sv_regs = append(f.a.sv_regs, r)
+      f.a.sv_offs = append(f.a.sv_offs, v.off)
+      return v
+    }
+  }
+  return f.hidden()
+}
+fn (f: *Fn) free_extra(v: *Var) {
+  if v.reg == 0 { return }
+  rs := []int{}
+  os := []int{}
+  for i, r := range f.a.sv_regs {
+    if r != v.reg {
+      rs = append(rs, r)
+      os = append(os, f.a.sv_offs[i])
+    }
+  }
+  f.a.sv_regs = rs
+  f.a.sv_offs = os
+}
 
 fn sort_names(xs: []str) {
   for i := 1; i < len(xs); i++ {
@@ -2664,14 +2766,21 @@ fn (f: *Fn) counted_loop(n: *ast.Node, ls: *LoopScan) -> str {
 }
 
 fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
-  idx := f.elem_check(n, write)
+  b, idx := f.elem_check_b(n, write)
   scale := 3
   if f.g.byte_elems(n.obj.ty) { scale = 0 }
-  f.a.rsib(0x8D, RAX, RAX, idx, scale, 1)         # lea rax, [rax + idx(*8)]
+  f.a.rsib(0x8D, RAX, b, idx, scale, 1)           # lea rax, [b + idx(*8)]
 }
 # RAX = the elements (array object or the slice's data), the index checked in the register
 # returned: RCX, or the register variable that is the index
 fn (f: *Fn) elem_check(n: *ast.Node, write: bool) -> int {
+  b, idx := f.elem_check_b(n, write)
+  if b != RAX { f.a.mov(RAX, b) }
+  return idx
+}
+# the same, but the elements may stay in the register of a list kept by the loop (SCache):
+# returns that register (or RAX) and the index register
+fn (f: *Fn) elem_check_b(n: *ast.Node, write: bool) -> (int, int) {
   A := f.a
   ot := strip_ptr(types.dflt(n.obj.ty))
   k := f.g.kind_of_t(ot)
@@ -2686,20 +2795,20 @@ fn (f: *Fn) elem_check(n: *ast.Node, write: bool) -> int {
         A.mov(RCX, RAX)
       }
     }
-    if n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name {
-      f.load_slot(c.data)                         # always in range (counted_loop)
-      return idx
+    if !(n.index.kind == "Var" && f.safe_idx != nil && f.safe_idx[n.index.name] == n.obj.name) {
+      # (with counted_loop the index is always in range)
+      ok := A.label()
+      f.slot_op(0x3B, idx, c.len)                 # cmp idx, [length]
+      A.jcc(CC_B, ok)
+      # out of range: the list is the cached one, so the general checks always report the error
+      if idx != RCX { A.mov(RCX, idx) }
+      f.simple_to(n.obj, RAX)
+      f.elem_check_general(n, write, k, ot)
+      A.bind(ok)
     }
-    ok := A.label()
-    f.slot_op(0x3B, idx, c.len)                   # cmp idx, [length]
-    A.jcc(CC_B, ok)
-    # out of range: the list is the cached one, so the general checks always report the error
-    if idx != RCX { A.mov(RCX, idx) }
-    f.simple_to(n.obj, RAX)
-    f.elem_check_general(n, write, k, ot)
-    A.bind(ok)
+    if c.data.reg != 0 { return c.data.reg, idx }
     f.load_slot(c.data)
-    return idx
+    return RAX, idx
   }
   if is_simple(n.obj) && n.index.ty == "int" && !is_simple(n.index) && f.no_calls(n.index) {
     f.expr(n.index)
@@ -2715,7 +2824,7 @@ fn (f: *Fn) elem_check(n: *ast.Node, write: bool) -> int {
     }
   }
   f.elem_check_general(n, write, k, ot)
-  return RCX
+  return RAX, RCX
 }
 # RAX = the list (or array), RCX = the index: checks them; RAX = the elements
 fn (f: *Fn) elem_check_general(n: *ast.Node, write: bool, k: str, ot: str) {
@@ -2798,8 +2907,8 @@ fn (f: *Fn) index(n: *ast.Node) {
     }
     return                                        # rax = value, rcx = found
   }
-  idx := f.elem_check(n, false)
-  if f.g.byte_elems(n.obj.ty) { A.rsib(0x0FB6, RAX, RAX, idx, 0, 0) } else { A.rsib(0x8B, RAX, RAX, idx, 3, 1) }   # movzx eax, byte [rax+idx] / mov rax, [rax+idx*8]
+  b, idx := f.elem_check_b(n, false)
+  if f.g.byte_elems(n.obj.ty) { A.rsib(0x0FB6, RAX, b, idx, 0, 0) } else { A.rsib(0x8B, RAX, b, idx, 3, 1) }   # movzx eax, byte [b+idx] / mov rax, [b+idx*8]
 }
 # address of a target (&x, &s.f, &a[i]) in RAX
 fn (f: *Fn) address(a: *ast.Node, n: *ast.Node) {
@@ -3559,6 +3668,7 @@ fn (f: *Fn) builtin(n: *ast.Node) {
       f.expr(a)
       A.push(RAX)
     }
+    A.spill()                                     # the syscall uses (and clobbers) caller-saved registers
     A.pop(R9)
     A.pop(R8)
     A.pop(R10)
@@ -3567,6 +3677,7 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     A.pop(RDI)
     A.pop(RAX)
     A.byte2(0x0F, 0x05)
+    A.fill()
     return
   }
   nfail("the function " + nm + " is not supported yet", n)
@@ -4023,7 +4134,7 @@ fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) 
     # the index operands are evaluated before the value, as in multi
     if is_simple(v) && types.dflt(v.ty) == types.dflt(t.ty) {
       # a simple value goes straight to [elements + index]
-      idx := f.elem_check(t, true)
+      b, idx := f.elem_check_b(t, true)
       byte_e := g.byte_elems(t.obj.ty)
       scale := 3
       w := 1
@@ -4039,10 +4150,10 @@ fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) 
       }
       if is_imm {
         if byte_e {
-          A.rsib(0xC6, 0, RAX, idx, 0, 0)            # mov byte [rax + idx], imm8
+          A.rsib(0xC6, 0, b, idx, 0, 0)            # mov byte [b + idx], imm8
           A.byte(imm)
         } else {
-          A.rsib(0xC7, 0, RAX, idx, 3, 1)            # mov qword [rax + idx*8], imm32
+          A.rsib(0xC7, 0, b, idx, 3, 1)            # mov qword [b + idx*8], imm32
           A.d32(imm)
         }
         return true
@@ -4052,7 +4163,7 @@ fn (f: *Fn) single_assign(t: *ast.Node, v: *ast.Node, decl: bool, n: *ast.Node) 
         f.simple_to(v, RDX)
         r = RDX
       }
-      if byte_e { A.rsib(0x88, r, RAX, idx, scale, w) } else { A.rsib(0x89, r, RAX, idx, scale, w) }
+      if byte_e { A.rsib(0x88, r, b, idx, scale, w) } else { A.rsib(0x89, r, b, idx, scale, w) }
       return true
     }
     f.elem_addr(t, true)
@@ -4266,12 +4377,12 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
     if mr >= 0 && !needs_wrap(n.ik) && !needs_wrap(kind_code(tg.ty)) {
       # a[i] op= v on the element in memory
       if is_simple(n.value) {
-        idx := f.elem_check(tg, true)
+        b, idx := f.elem_check_b(tg, true)
         imm, is_imm := f.imm32(n.value)
         if is_imm {
           _, ext := alu_code(n.op)
           small := imm >= -128 && imm <= 127
-          if small { A.rsib(0x83, ext, RAX, idx, 3, 1) } else { A.rsib(0x81, ext, RAX, idx, 3, 1) }
+          if small { A.rsib(0x83, ext, b, idx, 3, 1) } else { A.rsib(0x81, ext, b, idx, 3, 1) }
           if small { A.byte(imm) } else { A.d32(imm) }
           return true
         }
@@ -4280,7 +4391,7 @@ fn (f: *Fn) index_op_assign(n: *ast.Node) -> bool {
           f.simple_to(n.value, RDX)
           r = RDX
         }
-        A.rsib(mr, r, RAX, idx, 3, 1)              # op [rax + idx*8], r
+        A.rsib(mr, r, b, idx, 3, 1)              # op [b + idx*8], r
         return true
       }
       if f.no_calls(n.value) {
@@ -4461,7 +4572,7 @@ fn (f: *Fn) stmt(n: *ast.Node) {
   case "While":
     top := A.label()
     end := A.label()
-    added := f.enter_scache(scan_loop([]*ast.Node{n.cond, n.body}))
+    added := f.enter_scache(scan_loop(f.g, []*ast.Node{n.cond, n.body}))
     f.push_loop(end, top, n.label)
     A.bind(top)
     f.cond_jump_false(n.cond, end)
@@ -4476,9 +4587,9 @@ fn (f: *Fn) stmt(n: *ast.Node) {
     next := A.label()
     end := A.label()
     if n.init != nil { f.stmt(n.init) }
-    ls := scan_loop([]*ast.Node{n.cond, n.post, n.body})
+    ls := scan_loop(f.g, []*ast.Node{n.cond, n.post, n.body})
     added := f.enter_scache(ls)
-    iv := f.counted_loop(n, scan_loop([]*ast.Node{n.cond, n.body}))   # i++ itself does not count
+    iv := f.counted_loop(n, scan_loop(f.g, []*ast.Node{n.cond, n.body}))   # i++ itself does not count
     f.push_loop(end, next, n.label)
     A.bind(top)
     if n.cond != nil { f.cond_jump_false(n.cond, end) }
@@ -4699,7 +4810,7 @@ fn (f: *Fn) for_to(n: *ast.Node) {
   end := A.label()
   down := A.label()
   body := A.label()
-  added := f.enter_scache(scan_loop([]*ast.Node{n}))      # the ForTo node: its variable is assigned every turn
+  added := f.enter_scache(scan_loop(f.g, []*ast.Node{n}))      # the ForTo node: its variable is assigned every turn
   f.push_loop(end, next, n.label)
   A.bind(top)
   f.load_slot_r(s, RDX)
@@ -4837,7 +4948,7 @@ fn (f: *Fn) range_(n: *ast.Node) {
   } else if rk != "int" {
     v_t = types.tinfo(st).elem
   }
-  added := f.enter_scache(scan_loop([]*ast.Node{n}))      # the Range node: its variables are assigned every turn
+  added := f.enter_scache(scan_loop(f.g, []*ast.Node{n}))      # the Range node: its variables are assigned every turn
   f.push_loop(end, next, n.label)
   A.bind(top)
   f.load_slot(i)

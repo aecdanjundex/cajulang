@@ -53,10 +53,14 @@ export struct X64 {
   # slot before and reloads them after
   xs_reg: []int
   xs_off: []int
+  # the same for integer variables kept in RSI, RDI, R8..R11
+  sv_regs: []int
+  sv_offs: []int
 }
 
 export fn new_x64() -> *X64 {
-  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0, xs_reg: []int{}, xs_off: []int{}}
+  return &X64{b: bytes.new_buffer(1 << 16), syms: map[str]int{}, fix_at: []int{}, fix_sym: []str{}, fix_end: []int{}, nlab: 0, xs_reg: []int{}, xs_off: []int{},
+    sv_regs: []int{}, sv_offs: []int{}}
 }
 
 export fn (a: *X64) pos() -> int { return a.b.n }
@@ -160,24 +164,34 @@ export fn (a: *X64) jcc(cc: int, sym: str) {
   a.add_fix(at, sym, at + 4)
 }
 export fn (a: *X64) call(sym: str) {
-  for i, x := range a.xs_reg { a.movsd_store(RBP, a.xs_off[i], x) }
+  a.spill()
   a.b.byte(0xE8)
   at := a.b.n
   a.b.u32(0)
   a.add_fix(at, sym, at + 4)
-  for i, x := range a.xs_reg { a.movsd_load(x, RBP, a.xs_off[i]) }
+  a.fill()
 }
-# a call that never returns (a runtime error)
+# a call that never returns (a runtime error): nothing to keep
 export fn (a: *X64) call_noret(sym: str) {
   a.b.byte(0xE8)
   at := a.b.n
   a.b.u32(0)
   a.add_fix(at, sym, at + 4)
 }
+# call rax
 export fn (a: *X64) call_rax() {
-  for i, x := range a.xs_reg { a.movsd_store(RBP, a.xs_off[i], x) }
+  a.spill()
   a.byte2(0xFF, 0xD0)
+  a.fill()
+}
+# caller-saved registers that hold variables: to their frame slots before a call, back after
+export fn (a: *X64) spill() {
+  for i, x := range a.xs_reg { a.movsd_store(RBP, a.xs_off[i], x) }
+  for i, r := range a.sv_regs { a.store(RBP, a.sv_offs[i], r) }
+}
+export fn (a: *X64) fill() {
   for i, x := range a.xs_reg { a.movsd_load(x, RBP, a.xs_off[i]) }
+  for i, r := range a.sv_regs { a.load(r, RBP, a.sv_offs[i]) }
 }
 export fn (a: *X64) ret() { a.b.byte(0xC3) }
 export fn (a: *X64) mov_imm(r: int, x: int) {
