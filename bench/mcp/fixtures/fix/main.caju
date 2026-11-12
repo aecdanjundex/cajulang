@@ -1,0 +1,28 @@
+package main
+
+import "fmt"
+import "strings"
+
+type Item struct {
+	Name  string
+	Price float64
+	Qty   int
+}
+
+func total(items []Item) float64 {
+	var sum float64 = 0
+	for _, it := range items {
+		sum += it.Price * float64(it.Qty)
+	}
+	return sum
+}
+
+func main() {
+	items := []Item{{"cashew", 2.5, 4}, {"mango", 3, 2}}
+	names := []string{}
+	for _, it := range items {
+		names = append(names, strings.ToUpper(it.Name))
+	}
+	fmt.Println(strings.Join(names, ", "))
+	fmt.Printf("total: %.2f\n", total(items))
+}

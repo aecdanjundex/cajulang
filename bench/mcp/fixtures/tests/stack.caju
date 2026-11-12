@@ -1,0 +1,23 @@
+# A stack of ints.
+export struct Stack {
+  items: []int
+}
+
+export fn new_stack() -> *Stack { return &Stack{items: []int{}} }
+
+export fn (s: *Stack) push(v: int) { s.items = append(s.items, v) }
+
+# the top value and true, or 0 and false when the stack is empty
+export fn (s: *Stack) pop() -> (int, bool) {
+  n := len(s.items)
+  v := s.items[n - 1]
+  s.items = s.items[0:n - 1]
+  return v, true
+}
+
+export fn (s: *Stack) peek() -> (int, bool) {
+  if len(s.items) == 0 { return 0, false }
+  return s.items[len(s.items) - 1], true
+}
+
+export fn (s: *Stack) size() -> int { return len(s.items) }
