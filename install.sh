@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs Caju from the GitHub releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/aecdanjundex/cajulang/main/install.sh | sh
 #
 # Environment:
 #   CAJU_VERSION=0.1.0     a given version (default: the latest release)
@@ -10,7 +10,7 @@
 #   CAJU_PACKAGE=file.tar.gz    install from a local package instead of downloading
 set -eu
 
-repo="aecdanjundex/caju"
+repo="aecdanjundex/cajulang"
 home="${CAJU_HOME:-$HOME/.caju}"
 bin_dir="${CAJU_BIN_DIR:-$HOME/.local/bin}"
 asset="caju-linux-x86_64.tar.gz"

@@ -17,13 +17,13 @@ print(greet("world"))
 Linux x86-64 (no Windows, use o WSL; o `caju` do Linux também gera `.exe` com `--target windows`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aecdanjundex/caju/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aecdanjundex/cajulang/main/install.sh | sh
 ```
 
 O instalador baixa a última release, confere o SHA-256, instala em `~/.caju` e cria o comando
 `~/.local/bin/caju`. Variáveis: `CAJU_VERSION=0.1.0` (uma versão específica), `CAJU_HOME`,
 `CAJU_BIN_DIR`. Para instalar à mão, baixe `caju-linux-x86_64.tar.gz` em
-[Releases](https://github.com/aecdanjundex/caju/releases), extraia e ponha `caju-<versão>/bin` no
+[Releases](https://github.com/aecdanjundex/cajulang/releases), extraia e ponha `caju-<versão>/bin` no
 `PATH`. Para desinstalar: `rm -rf ~/.caju ~/.local/bin/caju`.
 
 ```sh
