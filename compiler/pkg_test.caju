@@ -197,7 +197,11 @@ fn publish_all() {
 
 # runs caju (or another program) inside app/; the output with W written as $W, and the exit code
 fn in_app(argv: []str) -> (out: str, code: int) {
-  args := []str{"sh", "-c", "cd \"$1\" && shift && exec \"$@\"", "sh", W + "/app"}
+  o, c := in_dir("app", argv)
+  return o, c
+}
+fn in_dir(dir: str, argv: []str) -> (out: str, code: int) {
+  args := []str{"sh", "-c", "cd \"$1\" && shift && exec \"$@\"", "sh", W + "/" + dir}
   for _, a := range argv { args = append(args, a) }
   p, err := os.run(args, env, true)
   expect(err).to_be_nil()
@@ -260,7 +264,7 @@ describe("caju pkg, step by step", fn() {
   })
   it("update moves a dependency to its latest release", fn() {
     out, _ := caju([]str{"pkg", "update", "github.com/acme/greet"})
-    expect(out).to_equal("github.com/acme/greet 0.2.0 -> 0.3.0\ndownloading github.com/acme/greet@0.3.0\n2 packages ok")
+    expect(out).to_equal("downloading github.com/acme/greet@0.3.0\ngithub.com/acme/greet 0.2.0 -> 0.3.0\n2 packages ok")
     expect(read_app("caju.toml")).to_contain("[dependencies]\n\"github.com/acme/greet\" = \"0.3.0\"\n\"github.com/acme/strutil\" = \"1.1.0\"\n")
     out2, _ := caju([]str{"pkg", "tree"})
     expect(out2).to_equal("github.com/me/app@0.1.0\n├── github.com/acme/greet@0.3.0\n│   └── github.com/acme/strutil@1.1.0\n└── github.com/acme/strutil@1.1.0")
@@ -290,6 +294,58 @@ describe("caju pkg, step by step", fn() {
     expect(code).to_equal(0)
     out2, _ := caju([]str{"run", "main.caju"})
     expect(out2).to_equal("hi cajuhi caju!!")
+  })
+  it("install replaces a cached copy whose files were changed with a new download", fn() {
+    os.write_file(W + "/home/pkg/github.com/acme/strutil@1.1.0/strutil.caju", "export fn shout(s: str) -> str { return \"pwned\" }\n", 0o644)
+    out, code := caju([]str{"pkg", "install"})
+    expect(out).to_equal("the cached copy of github.com/acme/strutil@1.1.0 was changed; downloading it again\ndownloading github.com/acme/strutil@1.1.0\n2 packages ok")
+    expect(code).to_equal(0)
+    out2, _ := caju([]str{"run", "main.caju"})
+    expect(out2).to_equal("hi cajuhi caju!!")
+  })
+  it("another project reuses the cached packages without downloading them", fn() {
+    fs.mkdir_all(W + "/app2", 0o755)
+    os.write_file(W + "/app2/caju.toml", "[package]\nname = \"github.com/me/app2\"\nversion = \"0.1.0\"\n\n[dependencies]\n", 0o644)
+    out, code := in_dir("app2", []str{os.getenv("CAJU_BIN"), "pkg", "add", "github.com/acme/greet@0.3.0"})
+    expect(out).to_equal("added github.com/acme/greet@0.3.0; 2 packages ok")
+    expect(code).to_equal(0)
+    # the same hashes as the first project
+    l1 := read_app("caju.lock")
+    l2, _ := os.read_file(W + "/app2/caju.lock")
+    expect(strings.split(l2, "hash = ")[1]).to_equal(strings.split(l1, "hash = ")[1])
+  })
+  it("another project does not reuse a cached copy whose files were changed", fn() {
+    os.write_file(W + "/home/pkg/github.com/acme/greet@0.3.0/greet.caju", "export fn hello(n: str) -> str { return \"pwned\" }\n", 0o644)
+    fs.remove(W + "/app2/caju.lock")
+    out, code := in_dir("app2", []str{os.getenv("CAJU_BIN"), "pkg", "install"})
+    expect(out).to_equal("the cached copy of github.com/acme/greet@0.3.0 was changed; downloading it again\ndownloading github.com/acme/greet@0.3.0\n2 packages ok")
+    expect(code).to_equal(0)
+  })
+  it("cache list shows every cached package with its commit and size", fn() {
+    out, code := caju([]str{"pkg", "cache", "list"})
+    expect(out).to_contain("github.com/acme/greet@0.2.0  ")
+    expect(out).to_contain("github.com/acme/strutil@1.1.0  ")
+    expect(out).to_end_with("4 packages, 844 B in $W/home/pkg")
+    expect(code).to_equal(0)
+  })
+  it("cache verify checks every copy against the hash recorded when it was downloaded", fn() {
+    out, code := caju([]str{"pkg", "cache", "verify"})
+    expect(strings.count(out, "ok       ")).to_equal(4)
+    expect(code).to_equal(0)
+    os.write_file(W + "/home/pkg/github.com/acme/greet@0.2.0/greet.caju", "# changed\n", 0o644)
+    out2, code2 := caju([]str{"pkg", "cache", "verify"})
+    expect(out2).to_contain("CHANGED  github.com/acme/greet@0.2.0  ")
+    expect(code2).to_equal(1)
+  })
+  it("cache clean removes one version, one package or everything", fn() {
+    out, _ := caju([]str{"pkg", "cache", "clean", "github.com/acme/greet@0.2.0"})
+    expect(out).to_equal("removed 1 cached packages")
+    out2, _ := caju([]str{"pkg", "cache", "clean", "github.com/acme/strutil"})
+    expect(out2).to_equal("removed 2 cached packages")
+    out3, _ := caju([]str{"pkg", "cache", "list"})
+    expect(out3).to_start_with("github.com/acme/greet@0.3.0  ")
+    out4, _ := caju([]str{"pkg", "install"})
+    expect(out4).to_equal("downloading github.com/acme/strutil@1.1.0\n2 packages ok")
   })
   it("refuses a release whose caju.toml has another version", fn() {
     out, code := caju([]str{"pkg", "add", "github.com/acme/bad@1.0.0"})

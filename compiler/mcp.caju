@@ -408,6 +408,40 @@ fn tool_call_path(a: *json.Value) -> (str, bool) {
   for _, id := range p { out = append(out, node_line(g, id)) }
   return strings.join(out, "\n  -> "), false
 }
+# the package manager: the same operations as caju pkg (pkg.caju), answered as text
+fn tool_pkg(a: *json.Value) -> (str, bool) {
+  action := a.get_str("action", "")
+  name := a.get_str("name", "")
+  if action == "cache" {
+    out, bad := pkg.cache_report(true)
+    return out, bad > 0
+  }
+  dir := a.get_str("root", "")
+  if dir == "" { dir = os.getwd() }
+  root := pkg.find_root(dir)
+  if root == "" { return "No caju.toml in " + dir + " or a parent directory. Create one with caju pkg init github.com/owner/repo.", true }
+  out := ""
+  let err: error = nil
+  pkg.reset_log()
+  switch action {
+  case "add", "remove":
+    if name == "" { return action + " needs name", true }
+    if action == "add" { out, err = pkg.add(root, name) } else { out, err = pkg.remove(root, name) }
+  case "install": out, err = pkg.install_report(root)
+  case "update": out, err = pkg.update(root, name)
+  case "tree": out, err = pkg.tree(root)
+  case "verify":
+    report, bad, err2 := pkg.verify(root)
+    if err2 != nil { return err2.Error(), true }
+    return report, bad > 0
+  default: return "action must be one of: add, remove, install, update, tree, verify, cache", true
+  }
+  steps := pkg.log()
+  if len(steps) > 0 { out = strings.join(steps, "\n") + "\n" + out }
+  if err != nil { return strings.join(steps, "\n") + "\n" + err.Error(), true }
+  return out, false
+}
+
 fn tool_graph_stats(a: *json.Value) -> (str, bool) {
   g := graph_of(a)
   count := map[str]int{}
@@ -442,6 +476,7 @@ let TOOLS = []str{
   "{\"name\":\"caju_related\",\"title\":\"Walk the code graph\",\"description\":\"The symbols linked to one: callers, callees, implements, implementations, uses, used_by, fields, methods or members (of a file), up to depth levels away.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"relation\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\",\"implements\",\"implementations\",\"uses\",\"used_by\",\"fields\",\"methods\",\"members\"]},\"depth\":{\"type\":\"integer\",\"default\":1,\"maximum\":5},\"limit\":{\"type\":\"integer\",\"default\":50},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"name\",\"relation\"]}}",
   "{\"name\":\"caju_outline\",\"title\":\"Outline of a file\",\"description\":\"The declarations of one file with their signatures and lines, without the bodies: a cheap way to see a file before reading parts of it.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\",\"description\":\"Relative to the root (compiler/wasm.caju) or a library module (std/strings)\"},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"file\"]}}",
   "{\"name\":\"caju_call_path\",\"title\":\"How one function reaches another\",\"description\":\"The shortest chain of calls from one function or method to another, through the code graph.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"from\",\"to\"]}}",
+  "{\"name\":\"caju_pkg\",\"title\":\"Manage packages\",\"description\":\"The package manager of a project (caju.toml, caju.lock). add installs a package (github.com/owner/repo, optionally @version; default the latest release) and its dependencies; install downloads what caju.lock lists; tree shows the dependencies; verify checks the installed files against caju.lock; cache lists the packages downloaded on this machine. Downloads go to a cache shared by every project and are reused only if their files still have the SHA-256 hash recorded when they were downloaded.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"remove\",\"install\",\"update\",\"tree\",\"verify\",\"cache\"]},\"name\":{\"type\":\"string\",\"description\":\"For add: github.com/owner/repo[@version]; for remove: the package; for update: only this package (optional)\"},\"root\":{\"type\":\"string\",\"description\":\"The project directory, or a directory inside it (default: where the server runs)\"}},\"required\":[\"action\"]}}",
   "{\"name\":\"caju_graph_stats\",\"title\":\"About the code graph\",\"description\":\"How many symbols and links the graph of a project has, how long it took to build, and the files left out because they do not compile.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}}}}",
 }
 
@@ -469,6 +504,7 @@ fn call_tool(name: str, a: *json.Value) -> str {
   case "caju_outline": text, is_err = tool_outline(a)
   case "caju_call_path": text, is_err = tool_call_path(a)
   case "caju_graph_stats": text, is_err = tool_graph_stats(a)
+  case "caju_pkg": text, is_err = tool_pkg(a)
   default: return ""
   }
   return tool_result(text, is_err)

@@ -15,6 +15,10 @@ notes from the section of its version here (`tools/changelog.sh`).
   `caju_symbol`, `caju_related`, `caju_outline`, `caju_call_path` and `caju_graph_stats` answer
   where a symbol is, its signature, callers, callees, implementations and call chains in a few
   lines, so an assistant doesn't read whole files (`docs/mcp.md`).
+- `caju pkg cache list|verify|clean|dir`: the package cache shared by every project on the
+  machine. Each download records its commit and SHA-256 hash; a cached copy is reused by any
+  project only if its files still have that hash, and a changed copy is downloaded again.
+- `caju_pkg` in `caju mcp`: add, remove, install, update and verify packages, and list the cache.
 - `os.read_line()`: one line of the standard input at a time.
 - `docs/language.md`: the language reference, also in the release package with `docs/mcp.md`.
 - WebAssembly modules carry a `name` section (function names in stack traces and profiles);
@@ -22,6 +26,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 - `dump_main --stage=lex` prints the tokens of a file.
 
 ### Changed
+- `caju pkg install`/`add`/`update` replace a changed cached package with a new download instead
+  of failing; `caju pkg update` prints the version changes after the downloads.
 - The documentation is in English (README, docs/, bench notes, CLAUDE.md); docs with Portuguese
   names were renamed: native-architecture.md, native-compiler-plan.md, history.md.
 - Release notes come from this changelog (`tools/changelog.sh`).

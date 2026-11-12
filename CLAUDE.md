@@ -79,7 +79,7 @@ In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`
 sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
-Expected result today: **857 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
+Expected result today: **864 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
 programs from phases 6 and 7, and 3 known bugs in `tests/lang`: a variable read before being
 assigned gives garbage; a dynamic method call on `any` neither converts an untyped argument nor
 checks the argument count).

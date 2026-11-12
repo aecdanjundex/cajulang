@@ -48,6 +48,10 @@ caju pkg install                       # downloads what is missing and checks ev
 caju pkg verify                        # checks the cached packages against the hashes in the lock
 caju pkg tree                          # dependency tree
 caju pkg hash [dir]                    # the hash of a package directory
+caju pkg cache list                    # the packages downloaded on this machine (shared by every project)
+caju pkg cache verify                  # checks each cached copy against the hash recorded when it was downloaded
+caju pkg cache clean [name[@version]]  # removes cached copies: all, one package or one version
+caju pkg cache dir                     # where the cache is
 ```
 
 `add`, `remove` and `update` edit only the `[dependencies]` section of `caju.toml` (comments and the
@@ -98,16 +102,35 @@ same hash, on any machine.
 | when | what is checked |
 |---|---|
 | `install` / `add` downloading a package | the tag's commit and the file hash match `caju.lock` (if the package is already in it) |
-| `install` with the package already cached | the hash of the cached files matches `caju.lock` |
+| `install` / `add` with the package already cached | the hash of the cached files matches the one recorded at download; a changed copy is removed and downloaded again |
+| `install` with the package already cached and in `caju.lock` | the hash of the cached files also matches `caju.lock` |
 | `caju build` / `caju run` | `caju.lock` is up to date with `caju.toml`, and the hash of each cached package matches the lock |
-| `caju pkg verify` | the hash of each cached package, with a report |
+| `caju pkg verify` | the hash of each cached package of the project against `caju.lock`, with a report |
+| `caju pkg cache verify` | the hash of every cached copy against the one recorded at download |
 
 Any mismatch is an error, with both hashes (or commits) in the message.
+
+## The shared cache
+
+Every project on the machine shares one cache: a release is downloaded once and reused by every
+project that needs it, without the network. Reuse is checked, so a project never builds with
+code that differs from what was published:
+
+- When a release is downloaded, its commit and the hash of its files are recorded next to it.
+- Before a copy is reused (by `install`, `add`, `update`, in any project), its files are hashed
+  again and compared with the recorded hash. A copy that was changed is removed and downloaded
+  again; the new download is checked against `caju.lock` as usual.
+- `caju build` and `caju run` never download: they compare each copy with `caju.lock` and refuse
+  a changed one (run `caju pkg install` to replace it).
+- Two `caju` processes downloading the same release at the same time are safe: each downloads
+  into its own temporary directory and the second one uses the copy the first one stored, if it
+  checks out.
+- Copies from before hashes were recorded get their hash recorded the next time they are used.
 
 ## Where the files live
 
 - Cache: `$CAJU_HOME/pkg/<name>@<version>/` (default `~/.caju/pkg`), with `<name>@<version>.info`
-  holding the commit.
+  holding `commit <sha>` and `hash sha256:<hex>`.
 - Download: `git clone --depth 1 --branch vX.Y.Z https://github.com/dono/repo`. `git` must be
   installed. `CAJU_PKG_SOURCE=/caminho` replaces `https://` with a local directory or mirror
   (`/caminho/github.com/dono/repo`); the tests use this.

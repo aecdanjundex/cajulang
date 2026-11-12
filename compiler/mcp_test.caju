@@ -39,9 +39,9 @@ describe("caju mcp", fn() {
     expect(r.get_str("id", "")).to_equal("a")
     expect(mcp.handle("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")).to_equal("")
   })
-  it("lists its eleven tools", fn() {
+  it("lists its twelve tools", fn() {
     r := call("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}")
-    expect(len(r.get_array("result.tools"))).to_equal(11)
+    expect(len(r.get_array("result.tools"))).to_equal(12)
     expect(r.get_str("result.tools.0.name", "")).to_equal("caju_check")
   })
   it("reports a type error with its file, line and column", fn() {
@@ -96,6 +96,11 @@ describe("the code graph tools", fn() {
     out, _ := text("caju_outline", PROJ + ",\"file\":\"shapes/shapes.caju\"}")
     expect(strings.contains(out, "  side: num")).to_be_true()
     expect(strings.contains(out, "func shapes/shapes.sample")).to_be_true()
+  })
+  it("caju_pkg answers a directory without caju.toml with an error", fn() {
+    out, err := text("caju_pkg", "{\"action\":\"tree\",\"root\":\"/\"}")
+    expect(err).to_be_true()
+    expect(out).to_start_with("No caju.toml in /")
   })
   it("answers an unknown name with an error", fn() {
     out, err := text("caju_symbol", PROJ + ",\"name\":\"nope\"}")

@@ -38,6 +38,13 @@ your `PATH`.
 | `caju_test` | Runs `*_test.caju` files (or a directory), optionally only the tests whose name has `filter`; returns `{ok, passed, failed, skipped, output}` |
 | `caju_docs` | Searches the exported functions, methods, structs and constants of the standard library, with their doc comments |
 | `caju_reference` | The language reference (`docs/language.md`), whole or the sections about a `topic` |
+| `caju_pkg` | Adds, removes, installs, updates and verifies the packages of a project, and lists the shared package cache |
+
+`caju_pkg` manages the packages of a project (`action`: `add`, `remove`, `install`, `update`,
+`tree`, `verify`, `cache`), with the same rules as `caju pkg` (`docs/packages.md`): downloads go to
+the cache shared by every project and a cached copy is reused only if its files still have the hash
+recorded when it was downloaded. The answer says, for each package, whether it was downloaded or
+reused.
 
 The code goes either as `files` (`{"main.caju": "...", "util.caju": "..."}`, with `entry` when the
 entry is not `main.caju`) or as the `path` of an entry file on disk (a project with `caju.toml` and

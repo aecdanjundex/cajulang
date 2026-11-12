@@ -433,20 +433,81 @@ export struct Fetched {
   hash: str
 }
 
+# ---- the shared cache
+# Every project on the machine shares $CAJU_HOME/pkg: name@version/ holds the files of a release
+# (without .git) and name@version.info what was recorded when it was downloaded:
+#   commit <git commit>
+#   hash sha256:<hash of the files>
+# A copy is reused, by any project, only if its files still have the recorded hash; a copy that
+# was changed is downloaded again (by install, add, update) or refused (by builds).
+
+export struct CacheEntry {
+  name: str
+  version: str
+  dir: str
+  commit: str
+  hash: str       # the recorded hash ("" in a copy from before hashes were recorded)
+}
+
+# what fetch did since the last reset_log: "reused x@1.0.0 from the cache", "downloaded x@1.0.0"...
+let fetch_log: []str = []str{}
+export fn reset_log() { fetch_log = []str{} }
+export fn log() -> []str { return fetch_log }
+
+fn info_file(dir: str) -> str { return dir + ".info" }
+
+fn read_info(dir: str) -> (commit: str, hash: str, ok: bool) {
+  src, err := os.read_file(info_file(dir))
+  if err != nil || !fs.is_dir(dir) { return "", "", false }
+  for _, line := range strings.split(strings.trim_space(src), "\n") {
+    line = strings.trim_space(line)
+    if strings.has_prefix(line, "commit ") { commit = strings.trim_space(line[7:]) } else if strings.has_prefix(line, "hash ") { hash = strings.trim_space(line[5:]) } else if commit == "" && line != "" {
+      commit = line         # the old format: only the commit
+    }
+  }
+  return commit, hash, true
+}
+
+fn write_info(dir: str, commit: str, hash: str) -> error {
+  tmp := info_file(dir) + ".tmp"
+  err := os.write_file(tmp, "commit " + commit + "\nhash " + hash + "\n", 0o644)
+  if err != nil { return err }
+  return fs.rename(tmp, info_file(dir))
+}
+
+# checks a cached copy: its hash now, and an error if it differs from the one recorded
+export fn check_cached(name: str, version: str) -> (*CacheEntry, str, error) {
+  dir := cache_dir(name, version)
+  commit, recorded, ok := read_info(dir)
+  if !ok { return nil, "", errors.New(name + "@" + version + " is not in the cache") }
+  h, err := hash_dir(dir)
+  if err != nil { return nil, "", err }
+  e := &CacheEntry{name: name, version: version, dir: dir, commit: commit, hash: recorded}
+  if recorded != "" && h != recorded {
+    return e, h, errors.New("the cached copy of " + name + "@" + version + " was changed\n  recorded: " + recorded + "\n  files:    " + h)
+  }
+  return e, h, nil
+}
+
 # the cached copy of name@version, downloading it if needed. want_commit / want_hash ("" = not
 # known yet) come from caju.lock: a copy that does not match them is an error.
 export fn fetch(name: str, version: str, want_commit: str, want_hash: str) -> (*Fetched, error) {
   dst := cache_dir(name, version)
-  info := dst + ".info"
-  if fs.is_dir(dst) && os.exists(info) {
-    h, err := hash_dir(dst)
-    if err != nil { return nil, err }
-    src, _ := os.read_file(info)
-    commit := strings.trim_space(src)
-    if want_hash != "" && h != want_hash {
-      return nil, errors.New("checksum mismatch for " + name + "@" + version + " in the cache " + dst + "\n  caju.lock: " + want_hash + "\n  files:     " + h + "\nThe cached files were changed. Delete that directory and run caju pkg install to download it again.")
+  if e, h, err := check_cached(name, version); e != nil {
+    if err != nil {
+      # changed after it was downloaded: never reuse it, download it again
+      os.stderr("the cached copy of " + name + "@" + version + " was changed; downloading it again\n")
+      fetch_log = append(fetch_log, "the cached copy of " + name + "@" + version + " was changed: removed")
+      fs.remove_all(dst)
+      os.remove(info_file(dst))
+    } else {
+      if e.hash == "" { write_info(dst, e.commit, h) }      # an old copy: record its hash now
+      if want_hash != "" && h != want_hash {
+        return nil, errors.New("checksum mismatch for " + name + "@" + version + " in the cache " + dst + "\n  caju.lock: " + want_hash + "\n  files:     " + h + "\nThe cached files were changed. Delete that directory and run caju pkg install to download it again.")
+      }
+      fetch_log = append(fetch_log, "reused " + name + "@" + version + " from the cache (hash checked)")
+      return &Fetched{dir: dst, commit: e.commit, hash: h}, nil
     }
-    return &Fetched{dir: dst, commit: commit, hash: h}, nil
   }
   os.stderr("downloading " + name + "@" + version + "\n")
   err := fs.mkdir_all(path.join(home(), "tmp"), 0o755)
@@ -471,11 +532,77 @@ export fn fetch(name: str, version: str, want_commit: str, want_hash: str) -> (*
   }
   err = fs.mkdir_all(path.dir(dst), 0o755)
   if err != nil { return nil, err }
+  # a directory left without .info by an interrupted download is not a copy
+  if fs.is_dir(dst) && !os.exists(info_file(dst)) { fs.remove_all(dst) }
   err = fs.rename(src, dst)
+  if err != nil {
+    # another caju (another project) stored the same release meanwhile: use it if it checks out
+    if e, h2, err5 := check_cached(name, version); e != nil && err5 == nil && (want_hash == "" || h2 == want_hash) {
+      return &Fetched{dir: dst, commit: e.commit, hash: h2}, nil
+    }
+    return nil, err
+  }
+  err = write_info(dst, commit, h)
   if err != nil { return nil, err }
-  err = os.write_file(info, commit + "\n", 0o644)
-  if err != nil { return nil, err }
+  fetch_log = append(fetch_log, "downloaded " + name + "@" + version + " (commit " + short_commit(commit) + ", " + h + ")")
   return &Fetched{dir: dst, commit: commit, hash: h}, nil
+}
+
+# every copy in the cache, sorted by name and version
+export fn cache_entries() -> []*CacheEntry {
+  out := []*CacheEntry{}
+  base := path.join(home(), "pkg")
+  files, err := fs.walk_files(base)
+  if err != nil { return out }
+  for _, f := range files {
+    if !strings.has_suffix(f, ".info") { continue }
+    rel := strings.trim_suffix(f, ".info")
+    i := strings.last_index(rel, "@")
+    if i < 0 { continue }
+    dir := path.join(base, rel)
+    commit, hash, ok := read_info(dir)
+    if !ok { continue }
+    out = append(out, &CacheEntry{name: rel[0:i], version: rel[i + 1:], dir: dir, commit: commit, hash: hash})
+  }
+  # sort: name, then version (insertion sort: caches are small)
+  for i := 1; i < len(out); i++ {
+    j := i
+    while j > 0 && (out[j].name < out[j - 1].name || (out[j].name == out[j - 1].name && cmp_text(out[j].version, out[j - 1].version) < 0)) {
+      t := out[j]
+      out[j] = out[j - 1]
+      out[j - 1] = t
+      j--
+    }
+  }
+  return out
+}
+
+# removes the copies of name ("" = all) at version ("" = every version); how many were removed
+export fn cache_clean(name: str, version: str) -> (int, error) {
+  n := 0
+  for _, e := range cache_entries() {
+    if name != "" && e.name != name { continue }
+    if version != "" && e.version != version { continue }
+    err := os.remove(info_file(e.dir))
+    if err != nil { return n, err }
+    err = fs.remove_all(e.dir)
+    if err != nil { return n, err }
+    n++
+  }
+  if name == "" { fs.remove_all(path.join(home(), "tmp")) }
+  return n, nil
+}
+
+# the size of a directory's files, in bytes
+fn dir_size(dir: str) -> int {
+  files, err := fs.walk_files(dir)
+  if err != nil { return 0 }
+  n := 0
+  for _, f := range files {
+    fi, err2 := fs.lstat(path.join(dir, f))
+    if err2 == nil { n += fi.size }
+  }
+  return n
 }
 
 # ---------------------------------------------------------------- resolving
@@ -628,6 +755,193 @@ export fn packages_for(entry: str) -> (map[str]*project.Package, error) {
   return pkgs, nil
 }
 
+# ---------------------------------------------------------------- operations
+# What the commands do, as functions that return their report and an error instead of exiting:
+# `caju pkg` prints them, `caju mcp` returns them to the assistant.
+
+fn split_at(spec: str) -> (str, str) {
+  i := strings.index(spec, "@")
+  if i < 0 { return spec, "" }
+  return spec[0:i], strings.trim_prefix(spec[i + 1:], "v")
+}
+
+fn edit_file(file: str, f: fn(str) -> str) -> error {
+  src, err := os.read_file(file)
+  if err != nil { return err }
+  return os.write_file(file, f(src), 0o644)
+}
+
+# installs what caju.lock lists (resolving again if caju.toml changed)
+export fn install_report(root: str) -> (str, error) {
+  lk, err := install(root)
+  if err != nil { return "", err }
+  return str(len(lk.pkgs)) + " packages ok", nil
+}
+
+# adds name[@version] (default: the latest release) to caju.toml and installs it
+export fn add(root: str, spec: str) -> (str, error) {
+  name, version := split_at(spec)
+  err := check_name(name)
+  if err != nil { return "", err }
+  if version == "" {
+    v, err2 := latest_version(name)
+    if err2 != nil { return "", err2 }
+    version = v
+  }
+  _, err = parse_version(version)
+  if err != nil { return "", err }
+  m, err3 := read_manifest(root)
+  if err3 != nil { return "", err3 }
+  if name == m.name { return "", errors.New("a package cannot depend on itself") }
+  file := path.join(root, "caju.toml")
+  before, _ := os.read_file(file)
+  err = edit_file(file, fn(src: str) -> str { return set_dependency(src, name, version) })
+  if err != nil { return "", err }
+  lk, err4 := install(root)
+  if err4 != nil {
+    os.write_file(file, before, 0o644)          # leave caju.toml as it was
+    return "", err4
+  }
+  return "added " + name + "@" + version + "; " + str(len(lk.pkgs)) + " packages ok", nil
+}
+
+# removes a dependency from caju.toml (it stays if another dependency still needs it)
+export fn remove(root: str, name: str) -> (str, error) {
+  file := path.join(root, "caju.toml")
+  src, err := os.read_file(file)
+  if err != nil { return "", err }
+  out, found := remove_dependency(src, name)
+  if !found { return "", errors.New(name + " is not in [dependencies]") }
+  err = os.write_file(file, out, 0o644)
+  if err != nil { return "", err }
+  lk, err2 := install(root)
+  if err2 != nil {
+    os.write_file(file, src, 0o644)              # leave caju.toml as it was
+    return "", err2
+  }
+  return "removed " + name + "; " + str(len(lk.pkgs)) + " packages ok", nil
+}
+
+# moves the dependencies (or only `only`) to their latest release and installs
+export fn update(root: str, only: str) -> (str, error) {
+  m, err := read_manifest(root)
+  if err != nil { return "", err }
+  lines := []str{}
+  found := false
+  for _, d := range m.deps {
+    if only != "" && only != d.name { continue }
+    found = true
+    v, err2 := latest_version(d.name)
+    if err2 != nil { return "", err2 }
+    if v != d.version {
+      lines = append(lines, d.name + " " + d.version + " -> " + v)
+      err = edit_file(path.join(root, "caju.toml"), fn(src: str) -> str { return set_dependency(src, d.name, v) })
+      if err != nil { return "", err }
+    }
+  }
+  if only != "" && !found { return "", errors.New(only + " is not in [dependencies]") }
+  r, err3 := install_report(root)
+  if err3 != nil { return "", err3 }
+  lines = append(lines, r)
+  return strings.join(lines, "\n"), nil
+}
+
+# checks every package of caju.lock in the cache against the lock; bad counts the problems
+export fn verify(root: str) -> (report: str, bad: int, err: error) {
+  lk, err2 := read_lock(path.join(root, "caju.lock"))
+  if err2 != nil { return "", 0, err2 }
+  lines := []str{}
+  for _, l := range lk.pkgs {
+    dir := cache_dir(l.name, l.version)
+    if !fs.is_dir(dir) {
+      lines = append(lines, "missing  " + l.name + "@" + l.version + " (run caju pkg install)")
+      bad++
+      continue
+    }
+    h, err3 := hash_dir(dir)
+    if err3 != nil { return "", 0, err3 }
+    if h == l.hash { lines = append(lines, "ok       " + l.name + "@" + l.version + " " + h) } else {
+      lines = append(lines, "MISMATCH " + l.name + "@" + l.version + "\n  caju.lock: " + l.hash + "\n  files:     " + h)
+      bad++
+    }
+  }
+  return strings.join(lines, "\n"), bad, nil
+}
+
+# the dependency tree of the project, from caju.lock
+export fn tree(root: str) -> (str, error) {
+  m, err := read_manifest(root)
+  if err != nil { return "", err }
+  lk, err2 := read_lock(path.join(root, "caju.lock"))
+  if err2 != nil { return "", errors.New("no caju.lock (run caju pkg install)") }
+  chosen := map[str]*Locked{}
+  for _, l := range lk.pkgs { chosen[l.name] = l }
+  out := []str{m.name + "@" + m.version}
+  tree_level(&out, requires_of(m), chosen, "", map[str]bool{})
+  return strings.join(out, "\n"), nil
+}
+
+fn tree_level(out: *[]str, reqs: []str, chosen: map[str]*Locked, indent: str, path_: map[str]bool) {
+  for i, r := range reqs {
+    name, min := split_at(r)
+    last := i == len(reqs) - 1
+    branch := "├── "
+    next := "│   "
+    if last {
+      branch = "└── "
+      next = "    "
+    }
+    l := chosen[name]
+    if l == nil {
+      *out = append(*out, indent + branch + r + " (not in caju.lock)")
+      continue
+    }
+    note := ""
+    if l.version != min { note = " (needs " + min + ")" }
+    *out = append(*out, indent + branch + name + "@" + l.version + note)
+    if path_[name] { continue }
+    path_[name] = true
+    tree_level(out, l.deps, chosen, indent + next, path_)
+    delete(path_, name)
+  }
+}
+
+fn short_commit(c: str) -> str {
+  if len(c) > 12 { return c[0:12] }
+  return c
+}
+
+fn human_size(n: int) -> str {
+  if n >= 1 << 20 { return str(n / (1 << 20)) + "." + str(n % (1 << 20) * 10 / (1 << 20)) + " MB" }
+  if n >= 1024 { return str(n / 1024) + " KB" }
+  return str(n) + " B"
+}
+
+# the cache, one line per copy; with check, each copy's files against its recorded hash
+export fn cache_report(check: bool) -> (report: str, bad: int) {
+  lines := []str{}
+  total := 0
+  entries := cache_entries()
+  for _, e := range entries {
+    size := dir_size(e.dir)
+    total += size
+    status := ""
+    if check {
+      _, h, err := check_cached(e.name, e.version)
+      if err != nil {
+        status = "CHANGED  "
+        bad++
+      } else if e.hash == "" {
+        status = "ok (recorded now) "
+        write_info(e.dir, e.commit, h)
+      } else { status = "ok       " }
+    }
+    lines = append(lines, status + e.name + "@" + e.version + "  " + short_commit(e.commit) + "  " + human_size(size))
+  }
+  lines = append(lines, str(len(entries)) + " packages, " + human_size(total) + " in " + path.join(home(), "pkg"))
+  return strings.join(lines, "\n"), bad
+}
+
 # ---------------------------------------------------------------- the command
 
 fn die(msg: str) {
@@ -636,7 +950,7 @@ fn die(msg: str) {
 }
 
 fn pkg_usage() {
-  os.stderr("usage:\n  caju pkg init [name]               create caju.toml (name: github.com/owner/repo)\n  caju pkg add name[@version]         add a dependency (default: the latest release)\n  caju pkg remove name                remove a dependency\n  caju pkg update [name]              move dependencies to their latest release\n  caju pkg install                    download what caju.lock lists (resolving again if caju.toml changed)\n  caju pkg verify                     check the cached packages against the hashes in caju.lock\n  caju pkg tree                       show the dependency tree\n  caju pkg hash [dir]                 the hash of a package directory\n")
+  os.stderr("usage:\n  caju pkg init [name]               create caju.toml (name: github.com/owner/repo)\n  caju pkg add name[@version]         add a dependency (default: the latest release)\n  caju pkg remove name                remove a dependency\n  caju pkg update [name]              move dependencies to their latest release\n  caju pkg install                    download what caju.lock lists (resolving again if caju.toml changed)\n  caju pkg verify                     check the cached packages against the hashes in caju.lock\n  caju pkg tree                       show the dependency tree\n  caju pkg hash [dir]                 the hash of a package directory\n  caju pkg cache list                 the downloaded packages, shared by every project\n  caju pkg cache verify               check every cached package against the hash recorded when downloaded\n  caju pkg cache clean [name[@ver]]   remove cached packages (all, one package, or one version)\n  caju pkg cache dir                  where the cache is\n")
   os.exit(2)
 }
 
@@ -646,18 +960,9 @@ fn project_root() -> str {
   return r
 }
 
-fn do_install(root: str) {
-  lk, err := install(root)
+fn print_or_die(out: str, err: error) {
   if err != nil { die(err.Error()) }
-  print(str(len(lk.pkgs)) + " packages ok")
-}
-
-fn edit_manifest(root: str, f: fn(str) -> str) {
-  file := path.join(root, "caju.toml")
-  src, err := os.read_file(file)
-  if err != nil { die(err.Error()) }
-  err = os.write_file(file, f(src), 0o644)
-  if err != nil { die(err.Error()) }
+  if out != "" { print(out) }
 }
 
 fn cmd_init(args: []str) {
@@ -681,151 +986,52 @@ fn cmd_init(args: []str) {
   print("created caju.toml for " + name)
 }
 
-fn split_at(spec: str) -> (str, str) {
-  i := strings.index(spec, "@")
-  if i < 0 { return spec, "" }
-  return spec[0:i], strings.trim_prefix(spec[i + 1:], "v")
-}
-
-fn cmd_add(args: []str) {
-  if len(args) != 1 { pkg_usage() }
-  root := project_root()
-  name, version := split_at(args[0])
-  err := check_name(name)
-  if err != nil { die(err.Error()) }
-  if version == "" {
-    v, err2 := latest_version(name)
-    if err2 != nil { die(err2.Error()) }
-    version = v
-  }
-  _, err = parse_version(version)
-  if err != nil { die(err.Error()) }
-  m, err3 := read_manifest(root)
-  if err3 != nil { die(err3.Error()) }
-  if name == m.name { die("a package cannot depend on itself") }
-  file := path.join(root, "caju.toml")
-  before, _ := os.read_file(file)
-  edit_manifest(root, fn(src: str) -> str { return set_dependency(src, name, version) })
-  lk, err4 := install(root)
-  if err4 != nil {
-    os.write_file(file, before, 0o644)          # leave caju.toml as it was
-    die(err4.Error())
-  }
-  print("added " + name + "@" + version + "; " + str(len(lk.pkgs)) + " packages ok")
-}
-
-fn cmd_remove(args: []str) {
-  if len(args) != 1 { pkg_usage() }
-  root := project_root()
-  name := args[0]
-  file := path.join(root, "caju.toml")
-  src, err := os.read_file(file)
-  if err != nil { die(err.Error()) }
-  out, found := remove_dependency(src, name)
-  if !found { die(name + " is not in [dependencies]") }
-  err = os.write_file(file, out, 0o644)
-  if err != nil { die(err.Error()) }
-  lk, err2 := install(root)
-  if err2 != nil {
-    os.write_file(file, src, 0o644)              # leave caju.toml as it was
-    die(err2.Error())
-  }
-  print("removed " + name + "; " + str(len(lk.pkgs)) + " packages ok")
-}
-
-fn cmd_update(args: []str) {
-  root := project_root()
-  m, err := read_manifest(root)
-  if err != nil { die(err.Error()) }
-  changed := 0
-  for _, d := range m.deps {
-    if len(args) > 0 && args[0] != d.name { continue }
-    v, err2 := latest_version(d.name)
-    if err2 != nil { die(err2.Error()) }
-    if v != d.version {
-      print(d.name + " " + d.version + " -> " + v)
-      edit_manifest(root, fn(src: str) -> str { return set_dependency(src, d.name, v) })
-      changed++
-    }
-  }
-  if len(args) > 0 && changed == 0 {
-    found := false
-    for _, d := range m.deps { if d.name == args[0] { found = true } }
-    if !found { die(args[0] + " is not in [dependencies]") }
-  }
-  do_install(root)
-}
-
-fn cmd_verify() {
-  root := project_root()
-  lk, err := read_lock(path.join(root, "caju.lock"))
-  if err != nil { die(err.Error()) }
-  bad := 0
-  for _, l := range lk.pkgs {
-    dir := cache_dir(l.name, l.version)
-    if !fs.is_dir(dir) {
-      print("missing  " + l.name + "@" + l.version + " (run caju pkg install)")
-      bad++
-      continue
-    }
-    h, err2 := hash_dir(dir)
-    if err2 != nil { die(err2.Error()) }
-    if h == l.hash { print("ok       " + l.name + "@" + l.version + " " + h) } else {
-      print("MISMATCH " + l.name + "@" + l.version + "\n  caju.lock: " + l.hash + "\n  files:     " + h)
-      bad++
-    }
-  }
-  if bad > 0 { os.exit(1) }
-}
-
-fn cmd_tree() {
-  root := project_root()
-  m, err := read_manifest(root)
-  if err != nil { die(err.Error()) }
-  lk, err2 := read_lock(path.join(root, "caju.lock"))
-  if err2 != nil { die("no caju.lock (run caju pkg install)") }
-  chosen := map[str]*Locked{}
-  for _, l := range lk.pkgs { chosen[l.name] = l }
-  print(m.name + "@" + m.version)
-  tree_level(requires_of(m), chosen, "", map[str]bool{})
-}
-
-fn tree_level(reqs: []str, chosen: map[str]*Locked, indent: str, path_: map[str]bool) {
-  for i, r := range reqs {
-    name, min := split_at(r)
-    last := i == len(reqs) - 1
-    branch := "├── "
-    next := "│   "
-    if last {
-      branch = "└── "
-      next = "    "
-    }
-    l := chosen[name]
-    if l == nil {
-      print(indent + branch + r + " (not in caju.lock)")
-      continue
-    }
-    note := ""
-    if l.version != min { note = " (needs " + min + ")" }
-    print(indent + branch + name + "@" + l.version + note)
-    if path_[name] { continue }
-    path_[name] = true
-    tree_level(l.deps, chosen, indent + next, path_)
-    delete(path_, name)
-  }
+fn cmd_cache(args: []str) {
+  sub := "list"
+  if len(args) > 0 { sub = args[0] }
+  if sub == "list" || sub == "verify" {
+    out, bad := cache_report(sub == "verify")
+    print(out)
+    if bad > 0 { os.exit(1) }
+  } else if sub == "clean" {
+    name := ""
+    version := ""
+    if len(args) > 1 { name, version = split_at(args[1]) }
+    n, err := cache_clean(name, version)
+    if err != nil { die(err.Error()) }
+    print("removed " + str(n) + " cached packages")
+  } else if sub == "dir" { print(path.join(home(), "pkg")) } else { pkg_usage() }
 }
 
 export fn command(args: []str) {
   if len(args) == 0 { pkg_usage() }
   sub := args[0]
   rest := args[1:]
-  if sub == "init" { cmd_init(rest) } else if sub == "add" { cmd_add(rest) } else if sub == "remove" { cmd_remove(rest) } else if sub == "update" { cmd_update(rest) } else if sub == "install" {
-    do_install(project_root())
-  } else if sub == "verify" { cmd_verify() } else if sub == "tree" { cmd_tree() } else if sub == "hash" {
+  out := ""
+  let err: error = nil
+  if sub == "init" {
+    cmd_init(rest)
+    return
+  } else if sub == "cache" {
+    cmd_cache(rest)
+    return
+  } else if sub == "verify" {
+    report, bad, err2 := verify(project_root())
+    if err2 != nil { die(err2.Error()) }
+    print(report)
+    if bad > 0 { os.exit(1) }
+    return
+  } else if sub == "add" || sub == "remove" {
+    if len(rest) != 1 { pkg_usage() }
+    if sub == "add" { out, err = add(project_root(), rest[0]) } else { out, err = remove(project_root(), rest[0]) }
+  } else if sub == "update" {
+    only := ""
+    if len(rest) > 0 { only = rest[0] }
+    out, err = update(project_root(), only)
+  } else if sub == "install" { out, err = install_report(project_root()) } else if sub == "tree" { out, err = tree(project_root()) } else if sub == "hash" {
     dir := "."
     if len(rest) > 0 { dir = rest[0] }
-    h, err := hash_dir(dir)
-    if err != nil { die(err.Error()) }
-    print(h)
+    out, err = hash_dir(dir)
   } else { pkg_usage() }
+  print_or_die(out, err)
 }
