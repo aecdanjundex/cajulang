@@ -2,11 +2,11 @@
 
 <!-- Generated from the spec page of the site (cajulang-site: scripts/export-reference.mjs). Edit it there. -->
 
-How Caju works: syntax, types, statements, functions, errors and modules. The examples were compiled with version 0.4.0 and show the actual output.
+How Caju works: syntax, types, statements, functions, errors and modules. The examples were compiled with version 0.5.0 and show the actual output.
 
 ## Overview
 
-Caju is a compiled, statically typed programming language with type inference, inspired by Go. The compiler generates x86-64 machine code: ELF executables for Linux and PE for Windows. The compiler and runtime are written in Caju itself.
+Caju is a compiled, statically typed programming language with type inference, inspired by Go. The compiler generates x86-64 machine code: ELF executables for Linux and PE for Windows. It also generates WebAssembly modules, which run in Node and in the browser. The compiler and runtime are written in Caju itself.
 
 The language comes with everything you need to work: a compiler, a test runner (`caju test`) and a package manager (`caju pkg`), all in a single `caju` command.
 
@@ -383,6 +383,7 @@ Package error: checksum mismatch for github.com/acme/strutil@1.1.0
 | `caju pkg install` | Downloads what's missing and verifies everything against `caju.lock` |
 | `caju pkg verify` | Checks cached packages against the hashes in the lock file |
 | `caju pkg tree` | Shows the dependency tree |
+| `caju pkg cache list\|verify\|clean` | The packages downloaded on this machine, shared by every project and checked against their hash on every reuse |
 | `caju pkg hash [dir]` | Computes the hash of a package directory |
 
 **Where they live.** Packages are downloaded with `git` (the version tag) into the cache at `~/.caju/pkg`. `add`, `remove` and `update` edit only the `[dependencies]` section of `caju.toml`, leaving the rest of the file untouched.
@@ -408,6 +409,7 @@ MessageBoxA(0, "Hello from Caju", "caju", 0)
 | `caju run file.caju` | Compiles in memory and runs |
 | `caju build -o app file.caju` | Builds a Linux executable (ELF) |
 | `caju build --target windows file.caju` | Builds a Windows `.exe` (PE) |
+| `caju build --target wasm -o app.wasm file.caju` | Builds a WebAssembly module (runs in Node or in the browser) |
 | `caju test` | Runs the `_test.caju` files |
 | `caju pkg ...` | Package manager (see the previous section) |
 | `caju version` | Shows the version |

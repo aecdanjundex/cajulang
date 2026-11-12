@@ -6,7 +6,13 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-12
+
 ### Added
+- `std/cli`: command line programs. Commands and nested subcommands, bool/str/int/list flags
+  (short and long forms, choices, required, environment variables, defaults), required, optional
+  and variadic arguments, generated help (`-h`, `--help`, `help <command>`), `--version`, and
+  errors with suggestions for misspelled names (`docs/cli.md`).
 - `caju mcp`: a Model Context Protocol server for AI assistants, with the tools `caju_check`,
   `caju_run`, `caju_test`, `caju_docs` and `caju_reference` (`docs/mcp.md`).
 - `caju check [--json] file.caju`: type-checks without generating code; with `--json`, the
@@ -26,6 +32,12 @@ notes from the section of its version here (`tools/changelog.sh`).
 - `dump_main --stage=lex` prints the tokens of a file.
 
 ### Changed
+- The `caju` command line is declared with `std/cli`: every command has `--help`, misspelled
+  commands and flags get a suggestion, `--target` values are checked, and `caju bench --runs`
+  also takes `--runs N`. Usage errors exit with 2.
+- `caju pkg cache` alone lists the cache (as `caju pkg cache list`).
+- The release chain starts with the JavaScript compiler building `compiler/build_main.caju`,
+  which builds the whole compiler (the JS compiler lacks std/json's reflection intrinsics).
 - `caju pkg install`/`add`/`update` replace a changed cached package with a new download instead
   of failing; `caju pkg update` prints the version changes after the downloads.
 - The documentation is in English (README, docs/, bench notes, CLAUDE.md); docs with Portuguese
@@ -94,7 +106,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 - Benchmark against Go, Rust and Python (`bench/compare`).
 - Release package, installer (`install.sh`) and GitHub workflows. MIT license.
 
-[Unreleased]: https://github.com/aecdanjundex/cajulang/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/aecdanjundex/cajulang/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/aecdanjundex/cajulang/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/aecdanjundex/cajulang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/aecdanjundex/cajulang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aecdanjundex/cajulang/compare/v0.1.0...v0.2.0

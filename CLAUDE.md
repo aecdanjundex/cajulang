@@ -27,7 +27,7 @@ of the language are in English (a decision from the reorganization); keep it tha
 
 ```
 compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module table)
-  main.caju            the `caju` command (build, run, test, bench, pkg, version)
+  main.caju            the `caju` command (build, run, test, bench, check, pkg, mcp, version), declared with std/cli
   pkg.caju             the package manager (docs/packages.md)
   build_main.caju      only `build` (small driver)
   dump_main.caju       prints a stage's tree (parse, link, check) to compare with the JS
@@ -38,7 +38,7 @@ compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module ta
   graph.caju           the in-memory code graph behind the MCP graph tools (caju_find, caju_symbol...)
 rt/*.caju            runtime for programs: core, gc, values, dynamic, panic, linux, windows, wasm
 lib/*.caju           standard library (import "std/x"): strings, strconv, math, bytes, os, fs, path,
-                     net, http, toml, json, crypto, hash, hex, base64, testing; each with its _test.caju
+                     net, http, toml, json, crypto, hash, hex, base64, cli, testing; each with its _test.caju
 bootstrap/*.js       the original JavaScript compiler (lexer, parser, types, linker, VM, native.js)
 tests/lang/          language tests (*_test.caju + testdata/)
 examples/            language examples; examples_test.caju runs each one and checks the output
@@ -80,7 +80,7 @@ In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`
 sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
-Expected result today: **864 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
+Expected result today: **888 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
 programs from phases 6 and 7, and 3 known bugs in `tests/lang`: a variable read before being
 assigned gives garbage; a dynamic method call on `any` neither converts an untyped argument nor
 checks the argument count).
