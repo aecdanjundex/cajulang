@@ -4,6 +4,8 @@
 #   caju run file.caju [arguments...]      compile in memory and run (nothing written to disk)
 #   caju test [-v] [--run text] [--record] [dir|file ...]          run the test suite (tests/*)
 #   caju bench [--runs=N] [--note=text] [--history] [filter]
+#   caju check [--json] file.caju          type-check without generating code (exit 1 on errors)
+#   caju mcp                               a Model Context Protocol server on stdin/stdout (compiler/mcp.caju)
 #   caju version
 #
 # The installation root (CAJU_ROOT, default: the directory above the one holding this program)
@@ -18,12 +20,13 @@ import "project"
 import "native"
 import "wasm"
 import "pkg"
+import "mcp"
 import "std/fs"
 import filepath "std/path"
 
 
 fn usage() {
-  os.stderr("usage:\n  caju build [-o output] [--target linux|windows|wasm] file.caju\n  caju run file.caju [arguments...]\n  caju test [-v] [--run text] [--record] [--target wasm] [dir|file ...]\n  caju bench [--runs=N] [--note=text] [--history] [filter]\n  caju pkg init|add|remove|update|install|verify|tree|hash ...\n  caju version\n")
+  os.stderr("usage:\n  caju build [-o output] [--target linux|windows|wasm] file.caju\n  caju run file.caju [arguments...]\n  caju test [-v] [--run text] [--record] [--target wasm] [dir|file ...]\n  caju bench [--runs=N] [--note=text] [--history] [filter]\n  caju check [--json] file.caju\n  caju pkg init|add|remove|update|install|verify|tree|hash ...\n  caju mcp\n  caju version\n")
   os.exit(2)
 }
 
@@ -396,6 +399,10 @@ if cmd == "build" {
   cmd_bench(rest)
 } else if cmd == "pkg" {
   pkg.command(rest)
+} else if cmd == "check" {
+  mcp.command_check(rest, root() + "/lib")
+} else if cmd == "mcp" {
+  mcp.serve(root(), os.executable())
 } else if cmd == "version" || cmd == "--version" {
   print("caju " + pkg.VERSION)
 } else { usage() }

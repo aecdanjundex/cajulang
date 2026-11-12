@@ -34,6 +34,7 @@ compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module ta
   *_test.caju          tests for the native compiler, the runtime, pkg and the Windows target
   testdata/            helper programs for those tests
   wasm.caju, wasmenc.caju  the WebAssembly target (`--target wasm`, docs/wasm.md)
+  mcp.caju             `caju check` and `caju mcp`, the Model Context Protocol server (docs/mcp.md)
 rt/*.caju            runtime for programs: core, gc, values, dynamic, panic, linux, windows, wasm
 lib/*.caju           standard library (import "std/x"): strings, strconv, math, bytes, os, fs, path,
                      net, http, toml, json, crypto, hash, hex, base64, testing; each with its _test.caju
@@ -77,7 +78,7 @@ In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`
 sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
-Expected result today: **811 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
+Expected result today: **819 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
 programs from phases 6 and 7, and 3 known bugs in `tests/lang`: a variable read before being
 assigned gives garbage; a dynamic method call on `any` neither converts an untyped argument nor
 checks the argument count).

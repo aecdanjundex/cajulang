@@ -1,0 +1,62 @@
+# caju mcp: the JSON-RPC messages and the tools that run in the process (check, docs, reference)
+import "std/os"
+import "std/json"
+import { describe, it, expect } from "std/testing"
+import "mcp"
+
+mcp.configure(os.getenv("CAJU_ROOT"), os.getenv("CAJU_BIN"))
+
+fn call(line: str) -> *json.Value {
+  v, err := json.parse(mcp.handle(line))
+  expect(err).to_be_nil()
+  return v
+}
+# the text of a tool's result, parsed
+fn tool(name: str, args: str) -> *json.Value {
+  r := call("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"" + name + "\",\"arguments\":" + args + "}}")
+  v, err := json.parse(r.get_str("result.content.0.text", ""))
+  expect(err).to_be_nil()
+  return v
+}
+
+describe("caju mcp", fn() {
+  it("answers initialize with its tools capability and version", fn() {
+    r := call("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}")
+    expect(r.get_int("id", 0)).to_equal(1)
+    expect(r.get_str("result.protocolVersion", "")).to_equal("2025-06-18")
+    expect(r.get_str("result.serverInfo.name", "")).to_equal("caju")
+  })
+  it("keeps string ids and ignores notifications", fn() {
+    r := call("{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"ping\"}")
+    expect(r.get_str("id", "")).to_equal("a")
+    expect(mcp.handle("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")).to_equal("")
+  })
+  it("lists the five tools", fn() {
+    r := call("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}")
+    expect(len(r.get_array("result.tools"))).to_equal(5)
+    expect(r.get_str("result.tools.0.name", "")).to_equal("caju_check")
+  })
+  it("reports a type error with its file, line and column", fn() {
+    v := tool("caju_check", "{\"files\":{\"main.caju\":\"x := 1\\nx = \\\"a\\\"\\n\"}}")
+    expect(v.get_bool("ok", true)).to_be_false()
+    expect(v.get_str("diagnostics.0.file", "")).to_equal("main.caju")
+    expect(v.get_int("diagnostics.0.line", 0)).to_equal(2)
+    expect(v.get_str("diagnostics.0.stage", "")).to_equal("type")
+  })
+  it("names the imported file where the error is", fn() {
+    v := tool("caju_check", "{\"files\":{\"main.caju\":\"import \\\"util\\\"\\nprint(util.f())\\n\",\"util.caju\":\"export fn f() -> int { return \\\"no\\\" }\\n\"}}")
+    expect(v.get_str("diagnostics.0.file", "")).to_equal("util.caju")
+  })
+  it("accepts a program that compiles", fn() {
+    v := tool("caju_check", "{\"files\":{\"main.caju\":\"print(1)\\n\"}}")
+    expect(v.get_bool("ok", false)).to_be_true()
+  })
+  it("finds standard library functions with their comments", fn() {
+    v := tool("caju_docs", "{\"query\":\"trim_space\"}")
+    expect(v.get_str("matches.0.module", "")).to_equal("std/strings")
+  })
+  it("answers an unknown method and bad JSON with errors", fn() {
+    expect(call("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"nope\"}").get_int("error.code", 0)).to_equal(-32601)
+    expect(call("not json").get_int("error.code", 0)).to_equal(-32700)
+  })
+})

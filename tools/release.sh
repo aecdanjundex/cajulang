@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds the release package of Caju for Linux x86-64:
-#   dist/caju-linux-x86_64.tar.gz   caju-<version>/{bin/caju, lib/, rt/, examples/, README.md, LICENSE}
+#   dist/caju-linux-x86_64.tar.gz   caju-<version>/{bin/caju, lib/, rt/, examples/, docs/, README.md, CHANGELOG.md, LICENSE}
 #   dist/caju-linux-x86_64.tar.gz.sha256
 #
 #   tools/release.sh              the compiler comes from the bootstrap chain (needs Node 22+):
@@ -44,8 +44,11 @@ mkdir -p "$pkg/lib"
 for f in lib/*.caju; do case "$f" in *_test.caju) ;; *) cp "$f" "$pkg/lib/" ;; esac; done
 cp -r examples "$pkg/examples"
 find "$pkg/examples" -name '*_test.caju' -delete
-cp README.md "$pkg/"
+cp README.md CHANGELOG.md "$pkg/"
 [ -f LICENSE ] && cp LICENSE "$pkg/"
+# the language reference (caju mcp serves it to AI assistants)
+mkdir -p "$pkg/docs"
+cp docs/language.md docs/mcp.md "$pkg/docs/"
 
 # quick check of the package itself, from a directory outside the repository
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT

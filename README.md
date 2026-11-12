@@ -34,6 +34,17 @@ caju test                           # runs the *_test.caju files in the director
 caju version
 ```
 
+## For AI assistants
+
+`caju mcp` is a Model Context Protocol server: Claude Code, Cursor and other assistants check, run
+and test Caju code and read the language reference through it, with structured results.
+
+```sh
+claude mcp add caju -- caju mcp
+```
+
+Details in `docs/mcp.md`.
+
 ## WebAssembly
 
 ```sh
@@ -114,6 +125,8 @@ describe("strings.split", fn() {
 - `docs/testing.md`: testing with `caju test` and `std/testing`.
 - `docs/compiler-port.md`: how the compiler was ported from JavaScript to Caju.
 - `docs/native-architecture.md`: how the native compiler works internally.
+- `docs/language.md`: the language reference.
+- `docs/mcp.md`: `caju mcp`, the server for AI assistants.
 - `docs/wasm.md`: the WebAssembly target and the in-browser compiler.
 - `docs/native-compiler-plan.md`: the phase plan.
 - `docs/history.md`: what has been done so far, and why.

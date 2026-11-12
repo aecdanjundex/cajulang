@@ -1,0 +1,368 @@
+# caju mcp: a Model Context Protocol server (JSON-RPC 2.0, one message per line on stdin/stdout),
+# so that an AI assistant uses the compiler through tools with structured results instead of
+# reading the output of the command line. Configure it as a stdio server: `caju mcp`.
+#
+# Tools: caju_check (diagnostics without compiling), caju_run (compile and run, with a time limit),
+# caju_test (run test files), caju_docs (exported names of the standard library, with their
+# comments) and caju_reference (the language reference, docs/language.md). The code comes either
+# as files ({"main.caju": "...", "util.caju": "..."}) or as the path of an entry file on disk.
+
+import "std/os"
+import "std/strings"
+import "std/strconv"
+import "std/json"
+import "std/fs"
+import filepath "std/path"
+import "ast"
+import "project"
+import "linker"
+import "check"
+import "pkg"
+
+const PROTOCOL = "2025-06-18"
+const OUTPUT_LIMIT = 100000
+
+let caju_root: str = ""
+let caju_bin: str = ""
+
+# ---- diagnostics ----
+export struct Diagnostic {
+  file: str
+  line: int
+  col: int
+  stage: str                  # lexical, syntax, type, link, compile, package
+  message: str
+}
+
+# the errors of a program (entry file on disk) without generating code: [] when it compiles
+# (a named result: the deferred recover fills it after a compile error)
+export fn diagnose(entry: str, lib_dir: str) -> (out: []*Diagnostic) {
+  out = []*Diagnostic{}
+  files := []*ast.SourceFile{}
+  defer fn() {
+    r := recover()
+    if r != nil {
+      e, ok := r.(*ast.CompileError)
+      if !ok { panic(r) }
+      names := []str{}
+      if len(files) == 0 { files = project.loading }
+      for _, f := range files { names = append(names, f.name) }
+      k := ast.loc_file(e.line)
+      name := filepath.base(entry)
+      if k >= 0 && k < len(names) { name = names[k] }
+      out = append(out, &Diagnostic{file: name, line: ast.loc_line(e.line), col: e.col, stage: e.stage, message: e.msg})
+    }
+  }()
+  pkgs, err := pkg.packages_for(entry)
+  if err != nil {
+    out = append(out, &Diagnostic{file: filepath.base(entry), line: 0, col: 0, stage: "package", message: err.Error()})
+    return out
+  }
+  files = project.load_project_with(entry, lib_dir, pkgs)
+  if len(files) == 0 {
+    out = append(out, &Diagnostic{file: filepath.base(entry), line: 0, col: 0, stage: "link", message: "cannot read " + entry})
+    return out
+  }
+  prog := linker.link(files)
+  check.check(prog)
+  return
+}
+
+fn diags_json(ds: []*Diagnostic) -> str {
+  parts := []str{}
+  for _, d := range ds {
+    head := "{\"file\":" + json.quote(d.file) + ",\"line\":" + str(d.line) + ",\"col\":" + str(d.col)
+    parts = append(parts, head + ",\"stage\":" + json.quote(d.stage) + ",\"message\":" + json.quote(d.message) + "}")
+  }
+  return "[" + strings.join(parts, ",") + "]"
+}
+# `caju check [--json] file.caju`: exit 0 when the program compiles
+export fn command_check(args: []str, lib_dir: str) {
+  as_json := false
+  entry := ""
+  for _, a := range args { if a == "--json" { as_json = true } else { entry = a } }
+  if entry == "" {
+    os.eprintln("usage: caju check [--json] file.caju")
+    os.exit(2)
+  }
+  ds := diagnose(entry, lib_dir)
+  if as_json {
+    os.stdout("{\"ok\":" + str(len(ds) == 0) + ",\"diagnostics\":" + diags_json(ds) + "}\n")
+  } else {
+    for _, d := range ds { os.eprintln(upper_first(d.stage) + " error in " + d.file + ", line " + str(d.line) + ": " + d.message + ".") }
+  }
+  if len(ds) > 0 { os.exit(1) }
+}
+fn upper_first(s: str) -> str {
+  if s == "" { return s }
+  return strings.to_upper(s[0:1]) + s[1:]
+}
+
+# ---- the code of a call: files written to a temporary directory, or a path ----
+struct Source {
+  entry: str
+  dir: str
+  tmp: str                    # "" when the code is on disk already
+}
+
+fn source_of(a: *json.Value, default_entry: str) -> (*Source, str) {
+  path := a.get_str("path", "")
+  if path != "" {
+    if !strings.has_prefix(path, "/") { path = os.getwd() + "/" + path }
+    if !os.exists(path) { return nil, "no such file: " + path }
+    return &Source{entry: path, dir: filepath.dir(path), tmp: ""}, ""
+  }
+  files := a.get("files")
+  if files == nil || files.kind != "object" || len(files.keys) == 0 { return nil, "give either \"files\" (an object: file name -> code) or \"path\"" }
+  tmp, err := fs.temp_dir("", "caju-mcp-")
+  if err != nil { return nil, err.Error() }
+  for _, name := range files.keys {
+    if strings.contains(name, "..") || strings.has_prefix(name, "/") { return nil, "file names are relative and stay inside the project: " + name }
+    p := tmp + "/" + name
+    fs.mkdir_all(filepath.dir(p), 0o755)
+    # (field, not get_str: a file name has dots, and get reads dots as a path)
+    v := files.field(name)
+    text := ""
+    if v != nil && v.kind == "string" { text = v.s }
+    os.write_file(p, text, 0o644)
+  }
+  entry := a.get_str("entry", default_entry)
+  if entry == "" {
+    if len(files.keys) == 1 { entry = files.keys[0] } else { entry = "main.caju" }
+  }
+  return &Source{entry: tmp + "/" + entry, dir: tmp, tmp: tmp}, ""
+}
+fn (s: *Source) done() { if s.tmp != "" { fs.remove_all(s.tmp) } }
+
+fn clip(s: str) -> str {
+  if len(s) <= OUTPUT_LIMIT { return s }
+  return s[0:OUTPUT_LIMIT] + "\n... (output cut at " + str(OUTPUT_LIMIT) + " bytes)"
+}
+# runs the caju command in dir with a time limit; the output (stdout and stderr) and the exit code
+fn run_caju(dir: str, args: []str, seconds: int) -> (str, int) {
+  quoted := []str{}
+  for _, a := range args { quoted = append(quoted, "'" + strings.replace_all(a, "'", "'\\''") + "'") }
+  cmd := "cd '" + strings.replace_all(dir, "'", "'\\''") + "' && exec timeout " + str(seconds) + " '" + caju_bin + "' " + strings.join(quoted, " ")
+  p, err := os.run([]str{"sh", "-c", cmd}, nil, true)
+  if err != nil { return err.Error(), -1 }
+  return p.output, p.code
+}
+
+# ---- the tools ----
+fn tool_check(a: *json.Value) -> (str, bool) {
+  src, bad := source_of(a, "")
+  if src == nil { return bad, true }
+  defer src.done()
+  ds := diagnose(src.entry, caju_root + "/lib")
+  return "{\"ok\":" + str(len(ds) == 0) + ",\"diagnostics\":" + diags_json(ds) + "}", false
+}
+fn tool_run(a: *json.Value) -> (str, bool) {
+  src, bad := source_of(a, "")
+  if src == nil { return bad, true }
+  defer src.done()
+  ds := diagnose(src.entry, caju_root + "/lib")
+  if len(ds) > 0 { return "{\"compiled\":false,\"diagnostics\":" + diags_json(ds) + "}", false }
+  secs := a.get_int("timeout_seconds", 10)
+  if secs < 1 { secs = 1 }
+  if secs > 120 { secs = 120 }
+  args := []str{"run", src.entry}
+  for _, x := range a.get_array("args") { args = append(args, x.s) }
+  out, code := run_caju(src.dir, args, secs)
+  timed_out := code == 124
+  return "{\"compiled\":true,\"exit_code\":" + str(code) + ",\"timed_out\":" + str(timed_out) + ",\"output\":" + json.quote(clip(out)) + "}", false
+}
+fn tool_test(a: *json.Value) -> (str, bool) {
+  src, bad := source_of(a, "")
+  if src == nil { return bad, true }
+  defer src.done()
+  target := src.entry
+  if src.tmp != "" { target = src.tmp }
+  args := []str{"test", target}
+  filter := a.get_str("filter", "")
+  if filter != "" { args = []str{"test", "--run", filter, target} }
+  out, code := run_caju(src.dir, args, a.get_int("timeout_seconds", 60))
+  out = strings.replace_all(out, src.dir + "/", "")
+  passed := 0
+  failed := 0
+  skipped := 0
+  for _, line := range strings.split(out, "\n") {
+    # "3 passed, 1 failed, 0 skipped in 2 files"
+    if strings.contains(line, " passed, ") && strings.contains(line, " failed, ") {
+      f := strings.fields(line)
+      if len(f) >= 6 {
+        passed, _ = strconv.atoi(f[0])
+        failed, _ = strconv.atoi(f[2])
+        skipped, _ = strconv.atoi(f[4])
+      }
+    }
+  }
+  return "{\"ok\":" + str(code == 0) + ",\"passed\":" + str(passed) + ",\"failed\":" + str(failed) + ",\"skipped\":" + str(skipped) + ",\"output\":" + json.quote(clip(out)) + "}", false
+}
+
+# exported declarations of the standard library: "std/strings.split(s: str, sep: str) -> []str"
+struct DocEntry {
+  module: str
+  sig: str
+  doc: str
+}
+fn std_docs() -> []*DocEntry {
+  out := []*DocEntry{}
+  lib := caju_root + "/lib"
+  names, err := fs.read_dir(lib)
+  if err != nil { return out }
+  for _, e := range names {
+    n := e.name
+    if !strings.has_suffix(n, ".caju") || strings.has_suffix(n, "_test.caju") { continue }
+    text, err2 := os.read_file(lib + "/" + n)
+    if err2 != nil { continue }
+    module := "std/" + strings.trim_suffix(n, ".caju")
+    comment := []str{}
+    for _, raw := range strings.split(text, "\n") {
+      line := strings.trim_space(raw)
+      if strings.has_prefix(line, "#") {
+        comment = append(comment, strings.trim_space(line[1:]))
+        continue
+      }
+      if strings.has_prefix(line, "export ") && !strings.has_prefix(raw, " ") {
+        sig := line[7:]
+        if strings.has_suffix(sig, "{") { sig = strings.trim_space(sig[0:len(sig) - 1]) }
+        k := strings.index(sig, " {")
+        if k > 0 && strings.has_prefix(sig, "fn") { sig = sig[0:k] }
+        out = append(out, &DocEntry{module: module, sig: sig, doc: strings.join(comment, " ")})
+      }
+      comment = []str{}
+    }
+  }
+  return out
+}
+fn tool_docs(a: *json.Value) -> (str, bool) {
+  q := strings.to_lower(strings.trim_space(a.get_str("query", "")))
+  limit := a.get_int("limit", 40)
+  parts := []str{}
+  modules := map[str]bool{}
+  for _, d := range std_docs() {
+    modules[d.module] = true
+    hay := strings.to_lower(d.module + " " + d.sig + " " + d.doc)
+    if q != "" && !strings.contains(hay, q) { continue }
+    if len(parts) >= limit { break }
+    parts = append(parts, "{\"module\":" + json.quote(d.module) + ",\"declaration\":" + json.quote(d.sig) + ",\"doc\":" + json.quote(d.doc) + "}")
+  }
+  ms := []str{}
+  for m, _ := range modules { ms = append(ms, json.quote(m)) }
+  return "{\"modules\":[" + strings.join(ms, ",") + "],\"matches\":[" + strings.join(parts, ",") + "]}", false
+}
+fn reference() -> str {
+  text, err := os.read_file(caju_root + "/docs/language.md")
+  if err != nil { return "The language reference (docs/language.md) is not installed with this compiler." }
+  return text
+}
+fn tool_reference(a: *json.Value) -> (str, bool) {
+  text := reference()
+  topic := strings.to_lower(strings.trim_space(a.get_str("topic", "")))
+  if topic == "" { return text, false }
+  # the sections whose title or text mention the topic
+  secs := strings.split(text, "\n## ")
+  keep := []str{}
+  titles := []str{}
+  for i, s := range secs {
+    if i == 0 { continue }
+    titles = append(titles, strings.split(s, "\n")[0])
+    if strings.contains(strings.to_lower(s), topic) { keep = append(keep, "## " + s) }
+  }
+  if len(keep) == 0 { return "No section mentions \"" + topic + "\". Sections: " + strings.join(titles, ", "), false }
+  return strings.join(keep, "\n"), false
+}
+
+# ---- the protocol ----
+let TOOLS = []str{
+  "{\"name\":\"caju_check\",\"title\":\"Check Caju code\",\"description\":\"Type-checks a Caju program without running it and returns structured diagnostics (file, line, column, stage, message). Use it after every edit. Give the code as files (main.caju is the entry) or the path of an entry file on disk.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"files\":{\"type\":\"object\",\"description\":\"File name -> source code, e.g. {\\\"main.caju\\\": \\\"print(1)\\\"}. Other files are imported with import \\\"name\\\".\",\"additionalProperties\":{\"type\":\"string\"}},\"entry\":{\"type\":\"string\",\"description\":\"The entry file among files (default main.caju)\"},\"path\":{\"type\":\"string\",\"description\":\"Instead of files: the entry .caju file on disk\"}}}}",
+  "{\"name\":\"caju_run\",\"title\":\"Run a Caju program\",\"description\":\"Compiles a Caju program to native code and runs it with a time limit. Returns the diagnostics if it does not compile, otherwise the exit code and the output (stdout and stderr together).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"files\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}},\"entry\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Command line arguments of the program\"},\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":120,\"default\":10}}}}",
+  "{\"name\":\"caju_test\",\"title\":\"Run Caju tests\",\"description\":\"Runs Caju test files (*_test.caju, BDD style with describe/it/expect from std/testing) and returns the counts and the report.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"files\":{\"type\":\"object\",\"description\":\"The test files and the files they import\",\"additionalProperties\":{\"type\":\"string\"}},\"path\":{\"type\":\"string\",\"description\":\"Instead of files: a test file or a directory on disk\"},\"filter\":{\"type\":\"string\",\"description\":\"Only the tests whose name contains this text\"},\"timeout_seconds\":{\"type\":\"integer\",\"default\":60}}}}",
+  "{\"name\":\"caju_docs\",\"title\":\"Search the Caju standard library\",\"description\":\"Searches the exported functions, methods, structs and constants of the Caju standard library (std/strings, std/json, std/http...) and returns their declarations and doc comments. Use it instead of guessing names.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Text to look for in the module, the declaration or the comment (empty: everything)\"},\"limit\":{\"type\":\"integer\",\"default\":40}}}}",
+  "{\"name\":\"caju_reference\",\"title\":\"Caju language reference\",\"description\":\"The reference of the Caju language: syntax, types, statements, functions, structs and interfaces, errors, modules, packages, tools. Read it before writing Caju: it is not Go (e.g. -> for results, str/num types, # comments, for i = 1 to n).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"topic\":{\"type\":\"string\",\"description\":\"Only the sections that mention this word (empty: the whole reference)\"}}}}",
+}
+
+fn result(id: str, body: str) -> str { return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + body + "}" }
+fn rpc_error(id: str, code: int, msg: str) -> str {
+  return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + str(code) + ",\"message\":" + json.quote(msg) + "}}"
+}
+fn tool_result(text: str, is_error: bool) -> str {
+  return "{\"content\":[{\"type\":\"text\",\"text\":" + json.quote(text) + "}],\"isError\":" + str(is_error) + "}"
+}
+
+fn call_tool(name: str, a: *json.Value) -> str {
+  if a == nil { a = &json.Value{kind: "object", keys: []str{}, fields: map[str]*json.Value{}} }
+  text := ""
+  is_err := false
+  switch name {
+  case "caju_check": text, is_err = tool_check(a)
+  case "caju_run": text, is_err = tool_run(a)
+  case "caju_test": text, is_err = tool_test(a)
+  case "caju_docs": text, is_err = tool_docs(a)
+  case "caju_reference": text, is_err = tool_reference(a)
+  default: return ""
+  }
+  return tool_result(text, is_err)
+}
+
+# one message -> the response ("" for notifications)
+export fn handle(line: str) -> str {
+  msg, err := json.parse(line)
+  if err != nil { return rpc_error("null", -32700, "parse error: " + err.Error()) }
+  idv := msg.get("id")
+  if idv == nil { return "" }                    # a notification
+  id := idv.string()
+  method := msg.get_str("method", "")
+  switch method {
+  case "initialize":
+    pv := msg.get_str("params.protocolVersion", PROTOCOL)
+    info := "{\"protocolVersion\":" + json.quote(pv) + ",\"capabilities\":{\"tools\":{},\"resources\":{}},\"serverInfo\":{\"name\":\"caju\",\"title\":\"Caju compiler\",\"version\":" + json.quote(pkg.VERSION) + "},"
+    return result(id, info + "\"instructions\":" + json.quote("Tools of the Caju compiler. Caju looks like Go but is not Go: read caju_reference before writing code, search names with caju_docs, and run caju_check after each change (it returns exact positions). caju_run and caju_test compile and run.") + "}")
+  case "ping":
+    return result(id, "{}")
+  case "tools/list":
+    return result(id, "{\"tools\":[" + strings.join(TOOLS, ",") + "]}")
+  case "tools/call":
+    name := msg.get_str("params.name", "")
+    r := call_tool(name, msg.get("params.arguments"))
+    if r == "" { return rpc_error(id, -32602, "unknown tool: " + name) }
+    return result(id, r)
+  case "resources/list":
+    return result(id, "{\"resources\":[{\"uri\":\"caju://reference\",\"name\":\"reference\",\"title\":\"The Caju language\",\"mimeType\":\"text/markdown\"}]}")
+  case "resources/read":
+    uri := msg.get_str("params.uri", "")
+    if uri != "caju://reference" { return rpc_error(id, -32002, "resource not found: " + uri) }
+    return result(id, "{\"contents\":[{\"uri\":\"caju://reference\",\"mimeType\":\"text/markdown\",\"text\":" + json.quote(reference()) + "}]}")
+  case "resources/templates/list":
+    return result(id, "{\"resourceTemplates\":[]}")
+  case "prompts/list":
+    return result(id, "{\"prompts\":[]}")
+  }
+  return rpc_error(id, -32601, "method not found: " + method)
+}
+
+# where the tools find lib/, docs/ and the caju command
+export fn configure(root: str, bin: str) {
+  caju_root = root
+  caju_bin = bin
+}
+# `caju mcp`: serves until the end of the standard input
+export fn serve(root: str, bin: str) {
+  configure(root, bin)
+  while true {
+    line, ok := os.read_line()
+    if !ok { return }
+    if strings.trim_space(line) == "" { continue }
+    out := handle_safe(line)
+    if out != "" { os.stdout(out + "\n") }
+  }
+}
+# a crash in a tool answers with an error instead of ending the server
+fn handle_safe(line: str) -> (out: str) {
+  defer fn() {
+    r := recover()
+    if r != nil { out = rpc_error("null", -32603, "internal error: " + str(r)) }
+  }()
+  out = handle(line)
+  return
+}

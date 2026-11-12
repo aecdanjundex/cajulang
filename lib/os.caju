@@ -123,6 +123,40 @@ export fn eprintln(s: str) { stderr(s + "\n") }
 # reads the whole standard input
 export fn read_stdin() -> str { return read_all(0) }
 
+let stdin_rest: str = ""         # bytes read by read_line after the last line it returned
+let stdin_done: bool = false
+
+# reads one line of the standard input, without the line break (and a "\r" before it); false at
+# the end of the input. Reads as much as is available and keeps the rest for the next call.
+export fn read_line() -> (str, bool) {
+  buf := 0
+  while true {
+    i := strings.index(stdin_rest, "\n")
+    if i >= 0 {
+      line := stdin_rest[0:i]
+      stdin_rest = stdin_rest[i + 1:]
+      return strings.trim_suffix(line, "\r"), true
+    }
+    if stdin_done {
+      if stdin_rest == "" { return "", false }
+      line := stdin_rest
+      stdin_rest = ""
+      return line, true
+    }
+    if buf == 0 { buf = __newstr(65536) }
+    r := __syscall(SYS_READ, 0, buf + 8, 65536, 0, 0, 0)
+    if r <= 0 {
+      stdin_done = true
+      continue
+    }
+    b := strings.Builder{}
+    b.write(stdin_rest)
+    for k := 0; k < r; k++ { b.write_byte(__load8(buf + 8 + k)) }
+    stdin_rest = b.string()
+  }
+  return "", false
+}
+
 fn read_all(fd: int) -> str {
   b := strings.Builder{}
   buf := __newstr(65536)

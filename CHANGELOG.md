@@ -6,6 +6,14 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Added
+- `caju mcp`: a Model Context Protocol server for AI assistants, with the tools `caju_check`,
+  `caju_run`, `caju_test`, `caju_docs` and `caju_reference` (`docs/mcp.md`).
+- `caju check [--json] file.caju`: type-checks without generating code; with `--json`, the
+  diagnostics with file, line, column and stage.
+- `os.read_line()`: one line of the standard input at a time.
+- `docs/language.md`: the language reference, also in the release package with `docs/mcp.md`.
+
 ### Changed
 - The documentation is in English (README, docs/, bench notes, CLAUDE.md); docs with Portuguese
   names were renamed: native-architecture.md, native-compiler-plan.md, history.md.
