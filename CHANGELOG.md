@@ -13,11 +13,15 @@ notes from the section of its version here (`tools/changelog.sh`).
   diagnostics with file, line, column and stage.
 - `os.read_line()`: one line of the standard input at a time.
 - `docs/language.md`: the language reference, also in the release package with `docs/mcp.md`.
+- WebAssembly modules carry a `name` section (function names in stack traces and profiles);
+  `tools/wasm/disasm.mjs` prints the instructions of a function by name.
+- `dump_main --stage=lex` prints the tokens of a file.
 
 ### Changed
 - The documentation is in English (README, docs/, bench notes, CLAUDE.md); docs with Portuguese
   names were renamed: native-architecture.md, native-compiler-plan.md, history.md.
 - Release notes come from this changelog (`tools/changelog.sh`).
+- WebAssembly: no default epilogue after a function's final `return` (smaller code).
 
 ## [0.4.0] - 2026-11-12
 

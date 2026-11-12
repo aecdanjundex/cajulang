@@ -1,7 +1,8 @@
 # dump_main: prints the syntax tree of a stage in the canonical text of bootstrap/dump.js,
 # to compare the port with the bootstrap compiler.
 #
-#   dump_main [--stage=parse|link|check] file.caju
+#   dump_main [--stage=lex|parse|link|check] file.caju
+#     lex    the tokens of the entry file: line:col TYPE value
 #     parse  the entry file only, as the parser returns it
 #     link   the linked program (all imported files)
 #     check  the linked program after the type checker and the checks (with annotations)
@@ -55,6 +56,11 @@ fn run(stage: str, entry: str, lib_dir: str) {
       } else { panic(r) }
     }
   }()
+  if stage == "lex" {
+    files = project.load_project(entry, lib_dir)
+    for _, t := range lexer.lex(files[0].src, 0) { os.stdout(str(t.line) + ":" + str(t.col) + " " + t.type + " " + t.value + "\n") }
+    return
+  }
   tree := run_stage(stage, entry, lib_dir)
   os.stdout(dump.dump(tree))
 }
@@ -65,9 +71,9 @@ for _, a := range os.args()[1:] {
   if strings.has_prefix(a, "--stage=") { stage = a[8:] } else if !strings.has_prefix(a, "--") { entry = a }
 }
 if entry == "" {
-  os.eprintln("usage: dump_main [--stage=parse|link|check] file.caju")
+  os.eprintln("usage: dump_main [--stage=lex|parse|link|check] file.caju")
   os.exit(2)
 }
 lib_dir := os.getenv("CAJU_LIB")
-if lib_dir == "" { lib_dir = "/home/aecio/caju/lib" }
+if lib_dir == "" { lib_dir = os.getenv("CAJU_ROOT") + "/lib" }
 run(stage, entry, lib_dir)
