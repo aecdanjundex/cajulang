@@ -1092,8 +1092,11 @@ fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, bo
   }
   if !hd {
     for _, st := range body { f.stmt(st) }
-    if is_top { f.i64c(0) } else if f.has_rn { f.load_results() } else { f.i64c(0) }
-    f.epilogue()
+    # (a body that ends with return never gets here)
+    if len(body) == 0 || body[len(body) - 1].kind != "Return" {
+      if is_top { f.i64c(0) } else if f.has_rn { f.load_results() } else { f.i64c(0) }
+      f.epilogue()
+    }
   } else {
     # block $done { loop $again { try { if phase == 0 { block $body { body } } run the defers; br $done }
     # catch $jump { not this frame: rethrow; recovered: phase = 1; br $again } } }
