@@ -39,6 +39,14 @@ Memória: `[1024, 64 KB)` argumentos e ambiente (o hospedeiro escreve antes de `
 partir de 64 KB, pilha de 16 MB, uma reserva de 48 MB para o `mmap` do runtime e a arena do
 coletor (2 GB de endereços; o hospedeiro faz a memória crescer quando o coletor pede páginas).
 
+## Profundidade de chamadas
+
+Cada chamada da Caju é também um quadro da pilha do motor JavaScript. No Node, `run.mjs` roda o
+programa numa thread com 256 MB de pilha e o limite de 10.000 chamadas aninhadas vale igual ao
+nativo. Num navegador a pilha é fixa: no worker do Chrome cabem cerca de 6.300 chamadas; passando
+disso, o programa termina com "too much recursion for this browser's stack" (o hospedeiro
+converte o `RangeError`). Por isso as funções usam poucas locais do wasm (4 fixas).
+
 ## O hospedeiro
 
 `caju.syscall(n, a1..a6)` recebe os números do Linux: read, write, open, close, stat, fstat, lstat,
