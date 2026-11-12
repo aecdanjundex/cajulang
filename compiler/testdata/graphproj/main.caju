@@ -1,0 +1,12 @@
+import "shapes/shapes"
+
+# prints the total area of a few shapes
+fn main() {
+  print(report(shapes.sample()))
+}
+
+fn report(list: []shapes.Shape) -> str {
+  return "total: " + str(shapes.total(list))
+}
+
+main()

@@ -37,7 +37,9 @@ caju version
 ## For AI assistants
 
 `caju mcp` is a Model Context Protocol server: Claude Code, Cursor and other assistants check, run
-and test Caju code and read the language reference through it, with structured results.
+and test Caju code and read the language reference through it, with structured results. An
+in-memory code graph answers where a symbol is, who calls it and what implements an interface in a
+few lines, so the assistant doesn't read whole files.
 
 ```sh
 claude mcp add caju -- caju mcp

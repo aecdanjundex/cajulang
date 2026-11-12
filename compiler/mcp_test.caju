@@ -1,6 +1,7 @@
 # caju mcp: the JSON-RPC messages and the tools that run in the process (check, docs, reference)
 import "std/os"
 import "std/json"
+import "std/strings"
 import { describe, it, expect } from "std/testing"
 import "mcp"
 
@@ -19,6 +20,13 @@ fn tool(name: str, args: str) -> *json.Value {
   return v
 }
 
+# the text a tool answers (the graph tools answer lines, not JSON) and whether it is an error
+fn text(name: str, args: str) -> (str, bool) {
+  r := call("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"" + name + "\",\"arguments\":" + args + "}}")
+  return r.get_str("result.content.0.text", ""), r.get_bool("result.isError", false)
+}
+let PROJ = "{\"root\":\"" + os.getenv("CAJU_ROOT") + "/compiler/testdata/graphproj\""
+
 describe("caju mcp", fn() {
   it("answers initialize with its tools capability and version", fn() {
     r := call("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}")
@@ -31,9 +39,9 @@ describe("caju mcp", fn() {
     expect(r.get_str("id", "")).to_equal("a")
     expect(mcp.handle("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")).to_equal("")
   })
-  it("lists the five tools", fn() {
+  it("lists its eleven tools", fn() {
     r := call("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}")
-    expect(len(r.get_array("result.tools"))).to_equal(5)
+    expect(len(r.get_array("result.tools"))).to_equal(11)
     expect(r.get_str("result.tools.0.name", "")).to_equal("caju_check")
   })
   it("reports a type error with its file, line and column", fn() {
@@ -58,5 +66,40 @@ describe("caju mcp", fn() {
   it("answers an unknown method and bad JSON with errors", fn() {
     expect(call("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"nope\"}").get_int("error.code", 0)).to_equal(-32601)
     expect(call("not json").get_int("error.code", 0)).to_equal(-32700)
+  })
+})
+
+describe("the code graph tools", fn() {
+  it("finds symbols by part of the name, the closest first", fn() {
+    out, err := text("caju_find", PROJ + ",\"query\":\"area\"}")
+    expect(err).to_be_false()
+    expect(strings.has_prefix(out, "imethod shapes/shapes.Shape.area")).to_be_true()
+    expect(strings.contains(out, "method shapes/shapes.Circle.area")).to_be_true()
+  })
+  it("describes a symbol with its doc, callers and callees", fn() {
+    out, _ := text("caju_symbol", PROJ + ",\"name\":\"total\"}")
+    expect(strings.contains(out, "fn total(list: []Shape) -> num")).to_be_true()
+    expect(strings.contains(out, "doc: adds the area of every shape")).to_be_true()
+    expect(strings.contains(out, "called by (1): main.report")).to_be_true()
+  })
+  it("lists the structs that implement an interface", fn() {
+    out, _ := text("caju_related", PROJ + ",\"name\":\"Shape\",\"relation\":\"implementations\"}")
+    expect(len(strings.split(out, "\n"))).to_equal(2)
+    expect(strings.contains(out, "struct shapes/shapes.Square")).to_be_true()
+  })
+  it("follows a chain of calls through an interface", fn() {
+    out, _ := text("caju_call_path", PROJ + ",\"from\":\"report\",\"to\":\"Square.area\"}")
+    expect(len(strings.split(out, "\n  -> "))).to_equal(4)
+    expect(strings.contains(out, "imethod shapes/shapes.Shape.area")).to_be_true()
+  })
+  it("outlines a file with its fields and methods", fn() {
+    out, _ := text("caju_outline", PROJ + ",\"file\":\"shapes/shapes.caju\"}")
+    expect(strings.contains(out, "  side: num")).to_be_true()
+    expect(strings.contains(out, "func shapes/shapes.sample")).to_be_true()
+  })
+  it("answers an unknown name with an error", fn() {
+    out, err := text("caju_symbol", PROJ + ",\"name\":\"nope\"}")
+    expect(err).to_be_true()
+    expect(out).to_equal("No symbol \"nope\".")
   })
 })

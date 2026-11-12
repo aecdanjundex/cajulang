@@ -1,0 +1,21 @@
+# something with an area
+export interface Shape {
+  area() -> num
+}
+
+export struct Square { side: num }
+export struct Circle { r: num }
+
+fn (s: Square) area() -> num { return s.side * s.side }
+fn (c: Circle) area() -> num { return 3.0 * c.r * c.r }
+
+# adds the area of every shape
+export fn total(list: []Shape) -> num {
+  sum := 0.0
+  for _, s := range list { sum += s.area() }
+  return sum
+}
+
+export fn sample() -> []Shape {
+  return []Shape{Square{side: 2.0}, Circle{r: 1.0}}
+}

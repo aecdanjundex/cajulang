@@ -1,0 +1,672 @@
+# The code graph of a Caju project, kept in memory by `caju mcp` so that an AI assistant finds the
+# piece of code it needs (a definition, its callers, the implementations of an interface) without
+# reading whole files.
+#
+# Nodes: files, functions, methods, structs, fields, interfaces (and their methods) and top-level
+# variables, with their signature, doc comment and lines. Edges: a file defines its declarations;
+# a function calls functions and methods (resolved by the type checker, so `s.area()` on a Circle
+# goes to Circle.area, and through an interface to the interface's method); a struct has fields and
+# methods, implements interfaces, and functions use the types of their parameters and results.
+#
+# Building: every directory of the project is linked and type-checked as one program (an entry in
+# memory that imports all its files), so that each file's imports resolve as when it is compiled.
+# A file that does not compile is left out (and listed). The graph is rebuilt only when a file
+# changes (size or modification time); queries are lookups in maps and adjacency lists.
+
+import "std/os"
+import "std/strings"
+import "std/fs"
+import filepath "std/path"
+import "ast"
+import "project"
+import "linker"
+import "check"
+import "pkg"
+
+export struct GNode {
+  id: int
+  kind: str                   # file, func, method, struct, field, interface, imethod, var
+  name: str                   # display name: compiler/wasm.compile_wasm, geo.Circle.area
+  short: str                  # the last part: compile_wasm, area
+  path: str                   # absolute file
+  file: str                   # file relative to the root (std/strings.caju for the library)
+  line: int
+  end_line: int
+  sig: str
+  doc: str
+  exported: bool
+  parent: int                 # struct or interface of a member, file of a declaration; -1
+}
+
+struct Edge {
+  dst: int
+  kind: str                   # defines, calls, has_field, has_method, implements, uses, dispatches (interface method -> a struct method that may run)
+}
+
+export struct Graph {
+  root: str
+  nodes: []*GNode
+  by_key: map[str]int         # absolute file + "#" + local name
+  by_name: map[str]int        # lower-case display name
+  by_short: map[str][]int     # lower-case last part
+  out: [][]*Edge
+  inn: [][]*Edge
+  stamps: map[str]str         # absolute file -> "size:mtime" when built
+  excluded: []str             # files left out, with the reason
+  lines: map[str][]str        # absolute file -> its lines
+  build_ms: int
+  cache: map[str]*Pending     # directory -> its linked program, reused while none of its files change
+  relinked: int               # directories linked again by the last build
+}
+
+let graphs = map[str]*Graph{}
+
+# ---- the files of a project ----
+let SKIP_DIRS = map[str]bool{"build": true, "dist": true, "node_modules": true, "testdata": true, "results": true}
+
+# the .caju files under root (absolute paths), without entering skipped or hidden directories
+fn project_files(root: str) -> []str {
+  acc := &Acc{files: []str{}}
+  walk_dir(root, acc)
+  return acc.files
+}
+struct Acc { files: []str }
+fn walk_dir(dir: str, acc: *Acc) {
+  entries, err := fs.read_dir(dir)
+  if err != nil { return }
+  for _, e := range entries {
+    if strings.has_prefix(e.name, ".") { continue }
+    p := dir + "/" + e.name
+    if e.is_dir {
+      if !SKIP_DIRS[e.name] && !strings.has_prefix(e.name, "results") { walk_dir(p, acc) }
+    } else if strings.has_suffix(e.name, ".caju") {
+      acc.files = append(acc.files, p)
+    }
+  }
+}
+fn stamp(p: str) -> str {
+  fi, err := fs.stat(p)
+  if err != nil { return "" }
+  return str(fi.size) + ":" + str(fi.mtime)
+}
+
+# the graph of root, built again if a file was added, removed or changed
+export fn graph_for(root: str, lib_dir: str) -> *Graph {
+  root = filepath.clean(root)
+  g, ok := graphs[root]
+  if ok {
+    files := project_files(root)
+    fresh := len(files) == len(g.stamps)
+    if fresh { for _, p := range files { if g.stamps[p] != stamp(p) { fresh = false } } }
+    if fresh { return g }
+    g = build(root, lib_dir, g.cache)
+    graphs[root] = g
+    return g
+  }
+  g = build(root, lib_dir, map[str]*Pending{})
+  graphs[root] = g
+  return g
+}
+
+# ---- building ----
+struct Group {
+  dir: str
+  names: []str                # import names of the directory's files
+  paths: []str
+}
+
+fn build(root: str, lib_dir: str, old: map[str]*Pending) -> *Graph {
+  t0 := os.nanotime()
+  g := &Graph{root: root, nodes: []*GNode{}, by_key: map[str]int{}, by_name: map[str]int{}, by_short: map[str][]int{},
+    out: [][]*Edge{}, inn: [][]*Edge{}, stamps: map[str]str{}, excluded: []str{}, lines: map[str][]str{}, cache: map[str]*Pending{}}
+  groups := map[str]*Group{}
+  order := []str{}
+  for _, p := range project_files(root) {
+    g.stamps[p] = stamp(p)
+    d := filepath.dir(p)
+    gr, ok := groups[d]
+    if !ok {
+      gr = &Group{dir: d, names: []str{}, paths: []str{}}
+      groups[d] = gr
+      order = append(order, d)
+    }
+    name := filepath.base(p)
+    if filepath.clean(d) == filepath.clean(lib_dir) { name = "std/" + name }
+    gr.names = append(gr.names, strings.trim_suffix(name, ".caju"))
+    gr.paths = append(gr.paths, p)
+  }
+  pending := []*Pending{}
+  for _, d := range order {
+    gr := groups[d]
+    pd, ok := old[d]
+    if !ok || !pd.still_valid(gr) {
+      tg := os.nanotime()
+      pd = g.load_group(gr, lib_dir)
+      g.relinked++
+      if os.getenv("CAJU_GRAPH_DEBUG") != "" { os.eprintln("graph: " + rel_to(root, d) + " " + str(len(gr.paths)) + " files " + str((os.nanotime() - tg) / 1000000) + " ms") }
+    } else {
+      for _, e := range pd.excluded { g.excluded = append(g.excluded, e) }
+    }
+    if pd != nil { g.cache[d] = pd }
+    pending = append(pending, pd)
+  }
+  # declarations first (edges may point to any directory), then the edges
+  for _, pd := range pending { if pd != nil { g.declare(pd) } }
+  for _, pd := range pending { if pd != nil { g.connect(pd) } }
+  g.implementations()
+  g.build_ms = (os.nanotime() - t0) / 1000000
+  return g
+}
+
+# a linked and checked directory, waiting to become nodes and edges
+struct Pending {
+  prog: *ast.Node
+  files: []*ast.SourceFile
+  abs: []str                  # absolute path of each file (by file index)
+  lib_dir: str
+  group_files: str            # the directory's files when it was linked
+  deps: map[str]str           # every file it read -> its stamp
+  excluded: []str
+}
+# the same files in the directory, and none of the files it read changed
+fn (pd: *Pending) still_valid(gr: *Group) -> bool {
+  if pd.group_files != strings.join(gr.paths, "\n") { return false }
+  for p, st := range pd.deps { if stamp(p) != st { return false } }
+  return true
+}
+
+fn (g: *Graph) load_group(gr: *Group, lib_dir: str) -> *Pending {
+  first_excluded := len(g.excluded)
+  keep := []bool{}
+  for i := 0; i < len(gr.names); i++ { keep = append(keep, true) }
+  pkgs, _ := pkg.packages_for(gr.paths[0])
+  # each file with what it imports (as when it is the entry)
+  loads := [][]*ast.SourceFile{}
+  for _, p := range gr.paths { loads = append(loads, safe_load(p, lib_dir, pkgs)) }
+  tries := 0
+  while tries <= len(gr.names) {
+    tries++
+    src := ""
+    files := []*ast.SourceFile{}
+    seen := map[str]bool{}
+    for i, nm := range gr.names {
+      if !keep[i] { continue }
+      src += "import \"" + nm + "\"\n"
+    }
+    if src == "" { return nil }
+    files = append(files, &ast.SourceFile{name: "·graph.caju", src: src})
+    for i, ld := range loads {
+      if !keep[i] { continue }
+      for k, f := range ld {
+        nm := f.name
+        # the entry of a load is named by its base name; as an import it is "name.caju"
+        if k == 0 { nm = gr.names[i] + ".caju" }
+        if seen[nm] { continue }
+        seen[nm] = true
+        files = append(files, &ast.SourceFile{name: nm, src: f.src})
+      }
+    }
+    prog, bad := link_checked(files)
+    if bad < 0 {
+      abs := []str{gr.dir + "/·graph.caju"}
+      deps := map[str]str{}
+      for i := 1; i < len(files); i++ {
+        ap := module_path(gr.dir, files[i].name, lib_dir)
+        abs = append(abs, ap)
+        deps[ap] = stamp(ap)
+      }
+      for _, p := range gr.paths { deps[p] = stamp(p) }
+      ex := []str{}
+      for k := first_excluded; k < len(g.excluded); k++ { ex = append(ex, g.excluded[k]) }
+      return &Pending{prog: prog, files: files, abs: abs, lib_dir: lib_dir, group_files: strings.join(gr.paths, "\n"), deps: deps, excluded: ex}
+    }
+    # leave out the file with the error (or every file that imports it)
+    culprit := "?"
+    if bad < len(files) { culprit = files[bad].name }
+    dropped := false
+    for i, nm := range gr.names {
+      if !keep[i] { continue }
+      if nm + ".caju" == culprit {
+        keep[i] = false
+        dropped = true
+        g.excluded = append(g.excluded, rel_to(g.root, gr.paths[i]) + ": " + last_error)
+      }
+    }
+    if !dropped {
+      for i, ld := range loads {
+        if !keep[i] { continue }
+        for _, f := range ld {
+          if f.name == culprit && keep[i] {
+            keep[i] = false
+            g.excluded = append(g.excluded, rel_to(g.root, gr.paths[i]) + ": imports " + culprit + ": " + last_error)
+          }
+        }
+      }
+    }
+    if !dropped && culprit == "?" { return nil }
+  }
+  return nil
+}
+
+let last_error: str = ""
+
+fn safe_load(p: str, lib_dir: str, pkgs: map[str]*project.Package) -> (out: []*ast.SourceFile) {
+  out = []*ast.SourceFile{}
+  defer fn() { if recover() != nil { out = []*ast.SourceFile{} } }()
+  out = project.load_project_with(p, lib_dir, pkgs)
+  return
+}
+# links and checks; the index of the file with the first error, or -1
+fn link_checked(files: []*ast.SourceFile) -> (prog: *ast.Node, bad: int) {
+  bad = -1
+  defer fn() {
+    r := recover()
+    if r != nil {
+      e, ok := r.(*ast.CompileError)
+      if !ok { panic(r) }
+      bad = ast.loc_file(e.line)
+      last_error = e.msg
+      prog = nil
+    }
+  }()
+  prog = linker.link(files)
+  check.check(prog)
+  return
+}
+fn module_path(dir: str, name: str, lib_dir: str) -> str {
+  if strings.has_prefix(name, "std/") { return lib_dir + "/" + name[4:] }
+  return filepath.clean(dir + "/" + name)
+}
+fn rel_to(root: str, p: str) -> str {
+  r, err := filepath.rel(root, p)
+  if err != nil || strings.has_prefix(r, "..") { return p }
+  return r
+}
+
+# ---- names ----
+# "Circle@geo.caju.area" -> ("geo.caju", "Circle.area"); a name without "@" is local to the entry
+fn split_q(q: str) -> (str, str) {
+  at := strings.index(q, "@")
+  if at < 0 { return "", q }
+  rest := q[at + 1:]
+  k := strings.index(rest, ".caju")
+  if k < 0 { return "", q }
+  module := rest[0:k + 5]
+  return module, q[0:at] + rest[k + 5:]
+}
+fn (g: *Graph) display_module(path: str, lib_dir: str) -> str {
+  if strings.has_prefix(path, lib_dir + "/") { return "std/" + strings.trim_suffix(path[len(lib_dir) + 1:], ".caju") }
+  return strings.trim_suffix(rel_to(g.root, path), ".caju")
+}
+fn (pd: *Pending) path_of_module(module: str) -> str {
+  for i, f := range pd.files { if f.name == module { return pd.abs[i] } }
+  return ""
+}
+# the node of a qualified name of this program, or -1
+fn (g: *Graph) find_q(pd: *Pending, q: str) -> int {
+  module, local := split_q(q)
+  if module == "" { return -1 }
+  p := pd.path_of_module(module)
+  id, ok := g.by_key[p + "#" + local]
+  if !ok { return -1 }
+  return id
+}
+
+# ---- nodes ----
+fn (g: *Graph) add(kind: str, path: str, local: str, display: str, line: int, end_line: int, parent: int, exported: bool) -> int {
+  key := path + "#" + local
+  if id, ok := g.by_key[key]; ok { return id }
+  short := local
+  if k := strings.last_index(local, "."); k >= 0 { short = local[k + 1:] }
+  n := &GNode{id: len(g.nodes), kind: kind, name: display, short: short, path: path, file: "", line: line, end_line: end_line, sig: "", doc: "", exported: exported, parent: parent}
+  g.nodes = append(g.nodes, n)
+  g.out = append(g.out, []*Edge{})
+  g.inn = append(g.inn, []*Edge{})
+  g.by_key[key] = n.id
+  g.by_name[strings.to_lower(display)] = n.id
+  g.by_short[strings.to_lower(short)] = append(g.by_short[strings.to_lower(short)], n.id)
+  return n.id
+}
+fn (g: *Graph) edge(a: int, b: int, kind: str) {
+  if a < 0 || b < 0 || a == b { return }
+  for _, e := range g.out[a] { if e.dst == b && e.kind == kind { return } }
+  g.out[a] = append(g.out[a], &Edge{dst: b, kind: kind})
+  g.inn[b] = append(g.inn[b], &Edge{dst: a, kind: kind})
+}
+
+fn (g: *Graph) source_lines(path: str, src: str) -> []str {
+  if ls, ok := g.lines[path]; ok { return ls }
+  ls := strings.split(src, "\n")
+  g.lines[path] = ls
+  return ls
+}
+# the declaration's first line, without its body; the comment lines right above it
+fn (g: *Graph) describe(n: *GNode) {
+  ls := g.lines[n.path]
+  if n.line < 1 || n.line > len(ls) { return }
+  s := strings.trim_space(ls[n.line - 1])
+  if strings.has_prefix(s, "export ") { s = s[7:] }
+  if n.kind == "func" || n.kind == "method" {
+    k := strings.index(s, " {")
+    if k > 0 { s = s[0:k] }
+  } else if strings.has_suffix(s, "{") {
+    s = strings.trim_space(s[0:len(s) - 1])
+  }
+  n.sig = s
+  doc := []str{}
+  i := n.line - 2
+  while i >= 0 {
+    t := strings.trim_space(ls[i])
+    if strings.has_prefix(t, "# ----") || strings.has_prefix(t, "// ----") { break }    # a section title, not a doc comment
+    if strings.has_prefix(t, "#") { doc = append([]str{strings.trim_space(t[1:])}, doc...) } else if strings.has_prefix(t, "//") { doc = append([]str{strings.trim_space(t[2:])}, doc...) } else { break }
+    i--
+  }
+  n.doc = strings.join(doc, " ")
+  if n.end_line == 0 { n.end_line = block_end(ls, n.line) }
+}
+# the line where the block opened on line ends (by braces), or the line itself
+fn block_end(ls: []str, line: int) -> int {
+  depth := 0
+  opened := false
+  for i := line - 1; i < len(ls); i++ {
+    for _, c := range ls[i] {
+      if c == '{' {
+        depth++
+        opened = true
+      } else if c == '}' {
+        depth--
+      }
+    }
+    if opened && depth <= 0 { return i + 1 }
+    if !opened { return line }
+  }
+  return line
+}
+
+fn (g: *Graph) declare(pd: *Pending) {
+  for _, st := range pd.prog.stmts {
+    if st.kind != "Module" { continue }
+    path := pd.path_of_module(st.name)
+    if path == "" { continue }
+    if _, done := g.by_key[path + "#"]; done { continue }   # (the file came with another directory)
+    fi := -1
+    for i, f := range pd.files { if f.name == st.name { fi = i } }
+    g.source_lines(path, pd.files[fi].src)
+    mod := g.display_module(path, pd.lib_dir)
+    fid := g.add("file", path, "", mod, 1, len(g.lines[path]), -1, true)
+    g.nodes[fid].file = file_label(mod, path)
+    for _, d := range st.stmts { g.declare_one(pd, d, path, mod, fid) }
+  }
+}
+fn file_label(mod: str, path: str) -> str { return mod + ".caju" }
+
+fn (g: *Graph) declare_one(pd: *Pending, d: *ast.Node, path: str, mod: str, fid: int) {
+  _, local := split_q(d.name)
+  line := ast.loc_line(d.line)
+  switch d.kind {
+  case "Func":
+    kind := "func"
+    parent := fid
+    if d.recv != nil {
+      kind = "method"
+      _, tl := split_q(strings.trim_prefix(d.recv.type, "*"))
+      sid := g.add("struct", path, tl, mod + "." + tl, 0, 0, fid, true)
+      parent = sid
+    }
+    end := 0
+    if d.end_line > 0 { end = ast.loc_line(d.end_line) }
+    id := g.add(kind, path, local, mod + "." + local, line, end, parent, d.exported)
+    g.fix(id, line, end, parent, d.exported)
+    g.edge(parent, id, "defines")
+    if kind == "method" { g.edge(parent, id, "has_method") }
+  case "Struct":
+    id := g.add("struct", path, local, mod + "." + local, line, 0, fid, d.exported)
+    g.fix(id, line, 0, fid, d.exported)
+    g.edge(fid, id, "defines")
+    for _, f := range d.fields {
+      fl := ast.loc_line(f.line)
+      if fl == 0 { fl = line }
+      fd := g.add("field", path, local + "." + f.name, mod + "." + local + "." + f.name, fl, fl, id, d.exported)
+      g.nodes[fd].sig = f.name + ": " + show_type(f.type)
+      g.edge(id, fd, "has_field")
+    }
+  case "Interface":
+    id := g.add("interface", path, local, mod + "." + local, line, 0, fid, d.exported)
+    g.fix(id, line, 0, fid, d.exported)
+    g.edge(fid, id, "defines")
+    for _, m := range d.methods {
+      ml := ast.loc_line(m.line)
+      mid := g.add("imethod", path, local + "." + m.name, mod + "." + local + "." + m.name, ml, ml, id, d.exported)
+      g.nodes[mid].sig = m.name + "(...)"
+      if ml > 0 && ml <= len(g.lines[path]) { g.nodes[mid].sig = strings.trim_space(g.lines[path][ml - 1]) }
+      g.edge(id, mid, "has_method")
+    }
+  case "VarDecl", "Assign":
+    names := d.names
+    if d.kind == "Assign" { names = []str{d.name} }
+    for _, nm := range names {
+      _, l := split_q(nm)
+      if l == "" || l == "_" || strings.contains(l, "·") { continue }
+      id := g.add("var", path, l, mod + "." + l, line, line, fid, d.exported)
+      g.fix(id, line, line, fid, d.exported)
+      g.edge(fid, id, "defines")
+    }
+  }
+}
+# a node first created from a reference (a method's struct) gets its real position later
+fn (g: *Graph) fix(id: int, line: int, end: int, parent: int, exported: bool) {
+  n := g.nodes[id]
+  n.line = line
+  if end > 0 { n.end_line = end }
+  n.parent = parent
+  n.exported = exported
+  g.describe(n)
+}
+# a type text without the module suffixes: "[]Point@geo.caju" -> "[]Point"
+fn show_type(t: str) -> str {
+  out := ""
+  i := 0
+  while i < len(t) {
+    at := strings.index(t[i:], "@")
+    if at < 0 { return out + t[i:] }
+    out += t[i:i + at]
+    j := i + at
+    k := strings.index(t[j:], ".caju")
+    if k < 0 { return out + t[j:] }
+    i = j + k + 5
+  }
+  return out
+}
+# the qualified type names inside a type text ("map[str]Point@geo.caju" -> ["Point@geo.caju"])
+fn type_names(t: str) -> []str {
+  out := []str{}
+  i := 0
+  while i < len(t) {
+    at := strings.index(t[i:], "@")
+    if at < 0 { break }
+    a := i + at
+    b := a
+    while b > 0 && is_ident(int(t[b - 1])) { b-- }
+    k := strings.index(t[a:], ".caju")
+    if k < 0 { break }
+    out = append(out, t[b:a + k + 5])
+    i = a + k + 5
+  }
+  return out
+}
+fn is_ident(c: int) -> bool { return c == 95 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+
+# ---- edges ----
+fn (g: *Graph) connect(pd: *Pending) {
+  for _, st := range pd.prog.stmts {
+    if st.kind != "Module" { continue }
+    path := pd.path_of_module(st.name)
+    fid, ok := g.by_key[path + "#"]
+    if !ok { continue }
+    for _, d := range st.stmts {
+      src := fid
+      if d.kind == "Func" {
+        src = g.find_q(pd, d.name)
+        for _, t := range d.ptypes { for _, tn := range type_names(t) { g.edge(src, g.find_q(pd, tn), "uses") } }
+        for _, tn := range type_names(d.rtype) { g.edge(src, g.find_q(pd, tn), "uses") }
+        if d.body != nil { g.walk(pd, src, d.body) }
+        continue
+      }
+      if d.kind == "Struct" {
+        sid := g.find_q(pd, d.name)
+        for _, f := range d.fields { for _, tn := range type_names(f.type) { g.edge(sid, g.find_q(pd, tn), "uses") } }
+        continue
+      }
+      if d.kind == "Interface" || d.kind == "Import" || d.kind == "Extern" { continue }
+      g.walk(pd, src, d)             # top-level code: the file calls
+    }
+  }
+}
+fn (g: *Graph) walk(pd: *Pending, src: int, n: *ast.Node) {
+  if n == nil { return }
+  switch n.kind {
+  case "Call":
+    if n.call_kind == "func" { g.edge(src, g.find_q(pd, n.name), "calls") }
+  case "MethodCall":
+    if n.target_name != "" {
+      g.edge(src, g.find_q(pd, n.target_name), "calls")
+    } else if n.obj != nil && n.obj.ty != "" {
+      # through an interface: to the interface's method
+      for _, tn := range type_names(n.obj.ty) {
+        im, il := split_q(tn)
+        p := pd.path_of_module(im)
+        if id, ok := g.by_key[p + "#" + il + "." + n.name]; ok { g.edge(src, id, "calls") }
+      }
+    }
+  case "Var":
+    if n.fn_ref { g.edge(src, g.find_q(pd, n.name), "calls") }
+  case "StructLit", "CompositeLit":
+    if n.stype != "" { g.edge(src, g.find_q(pd, n.stype), "uses") }
+  case "FuncLit":
+    if n.fn_ != nil { g.walk(pd, src, n.fn_.body) }
+    return
+  }
+  for _, k := range []*ast.Node{n.value, n.left, n.right, n.arg, n.expr, n.obj, n.index, n.lo, n.hi, n.key, n.call, n.fn_,
+      n.cond, n.init, n.post, n.then, n.otherwise, n.tag, n.subject, n.from_, n.to_, n.body, n.target} { g.walk(pd, src, k) }
+  for _, xs := range [][]*ast.Node{n.stmts, n.args, n.values, n.targets, n.exprs, n.cases, n.elems, n.sfields} {
+    for _, x := range xs { g.walk(pd, src, x) }
+  }
+}
+# struct S implements interface I when S (or *S) has every method of I
+fn (g: *Graph) implementations() {
+  # struct id -> method name -> method id
+  methods := map[int]map[str]int{}
+  for _, n := range g.nodes {
+    if n.kind == "method" && n.parent >= 0 {
+      if methods[n.parent] == nil { methods[n.parent] = map[str]int{} }
+      methods[n.parent][n.short] = n.id
+    }
+  }
+  for _, it := range g.nodes {
+    if it.kind != "interface" { continue }
+    need := []int{}
+    for _, e := range g.out[it.id] { if e.kind == "has_method" { need = append(need, e.dst) } }
+    if len(need) == 0 { continue }
+    for sid, ms := range methods {
+      ok := true
+      for _, m := range need {
+        if _, has := ms[g.nodes[m].short]; !has { ok = false }
+      }
+      if !ok { continue }
+      g.edge(sid, it.id, "implements")
+      # a call to the interface method may run the struct's method
+      for _, m := range need { g.edge(m, ms[g.nodes[m].short], "dispatches") }
+    }
+  }
+}
+
+# ---- queries ----
+# the nodes a name means: a display name (geo.Circle.area), its end (Circle.area, area)
+export fn (g: *Graph) resolve(name: str) -> []int {
+  q := strings.to_lower(strings.trim_space(name))
+  if id, ok := g.by_name[q]; ok { return []int{id} }
+  out := []int{}
+  last := q
+  if k := strings.last_index(q, "."); k >= 0 { last = q[k + 1:] }
+  for _, id := range g.by_short[last] {
+    n := strings.to_lower(g.nodes[id].name)
+    if last == q || strings.has_suffix(n, "." + q) || strings.has_suffix(n, "/" + q) { out = append(out, id) }
+  }
+  return out
+}
+# nodes whose name contains text (exact short names first), of a kind ("" for any)
+export fn (g: *Graph) search(text: str, kind: str, limit: int) -> []int {
+  q := strings.to_lower(strings.trim_space(text))
+  exact := []int{}
+  prefix := []int{}
+  other := []int{}
+  for _, n := range g.nodes {
+    if kind != "" && n.kind != kind && !(kind == "type" && (n.kind == "struct" || n.kind == "interface")) { continue }
+    if n.kind == "file" && kind == "" && q != "" && !strings.contains(strings.to_lower(n.name), q) { continue }
+    s := strings.to_lower(n.short)
+    full := strings.to_lower(n.name)
+    if q == "" || s == q {
+      exact = append(exact, n.id)
+    } else if strings.has_prefix(s, q) {
+      prefix = append(prefix, n.id)
+    } else if strings.contains(full, q) || strings.contains(strings.to_lower(n.doc), q) {
+      other = append(other, n.id)
+    }
+  }
+  out := append(append(exact, prefix...), other...)
+  if len(out) > limit { out = out[0:limit] }
+  return out
+}
+# the nodes linked to id: relation is an edge kind, outgoing (calls, uses, implements, has_field,
+# has_method, defines) or incoming with "~" before it (~calls: the callers)
+export fn (g: *Graph) neighbors(id: int, relation: str) -> []int {
+  out := []int{}
+  incoming := strings.has_prefix(relation, "~")
+  kind := strings.trim_prefix(relation, "~")
+  list := g.out[id]
+  if incoming { list = g.inn[id] }
+  for _, e := range list { if e.kind == kind { out = append(out, e.dst) } }
+  return out
+}
+# the shortest chain of calls from a to b (node ids), or nil
+export fn (g: *Graph) call_path(a: int, b: int) -> []int {
+  prev := map[int]int{a: -1}
+  queue := []int{a}
+  while len(queue) > 0 {
+    x := queue[0]
+    queue = queue[1:]
+    if x == b {
+      path := []int{}
+      for x != -1 {
+        path = append([]int{x}, path...)
+        x = prev[x]
+      }
+      return path
+    }
+    for _, e := range g.out[x] {
+      if e.kind != "calls" && e.kind != "dispatches" { continue }
+      if _, seen := prev[e.dst]; !seen {
+        prev[e.dst] = x
+        queue = append(queue, e.dst)
+      }
+    }
+  }
+  return nil
+}
+# the source lines of a node
+export fn (g: *Graph) code(id: int) -> str {
+  n := g.nodes[id]
+  ls := g.lines[n.path]
+  a := n.line
+  b := n.end_line
+  if a < 1 { return "" }
+  if b < a { b = a }
+  if b > len(ls) { b = len(ls) }
+  return strings.join(ls[a - 1:b], "\n")
+}
+export fn (g: *Graph) location(id: int) -> str {
+  n := g.nodes[id]
+  f := rel_to(g.root, n.path)
+  if n.end_line > n.line { return f + ":" + str(n.line) + "-" + str(n.end_line) }
+  return f + ":" + str(n.line)
+}

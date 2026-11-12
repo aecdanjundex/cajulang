@@ -11,6 +11,10 @@ notes from the section of its version here (`tools/changelog.sh`).
   `caju_run`, `caju_test`, `caju_docs` and `caju_reference` (`docs/mcp.md`).
 - `caju check [--json] file.caju`: type-checks without generating code; with `--json`, the
   diagnostics with file, line, column and stage.
+- A code graph in `caju mcp`, kept in memory and updated incrementally: `caju_find`,
+  `caju_symbol`, `caju_related`, `caju_outline`, `caju_call_path` and `caju_graph_stats` answer
+  where a symbol is, its signature, callers, callees, implementations and call chains in a few
+  lines, so an assistant doesn't read whole files (`docs/mcp.md`).
 - `os.read_line()`: one line of the standard input at a time.
 - `docs/language.md`: the language reference, also in the release package with `docs/mcp.md`.
 - WebAssembly modules carry a `name` section (function names in stack traces and profiles);

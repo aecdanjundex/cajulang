@@ -18,6 +18,7 @@ import "project"
 import "linker"
 import "check"
 import "pkg"
+import "graph"
 
 const PROTOCOL = "2025-06-18"
 const OUTPUT_LIMIT = 100000
@@ -273,6 +274,162 @@ fn tool_reference(a: *json.Value) -> (str, bool) {
   return strings.join(keep, "\n"), false
 }
 
+
+# ---- the code graph (compiler/graph.caju), kept in memory between calls ----
+fn graph_of(a: *json.Value) -> *graph.Graph {
+  root := a.get_str("root", "")
+  if root == "" { root = os.getwd() }
+  if !strings.has_prefix(root, "/") { root = os.getwd() + "/" + root }
+  return graph.graph_for(root, caju_root + "/lib")
+}
+# one line per node: kind name — signature — file:line
+fn node_line(g: *graph.Graph, id: int) -> str {
+  n := g.nodes[id]
+  line := n.kind + " " + n.name
+  if n.sig != "" && n.kind != "file" { line += "  |  " + n.sig }
+  return line + "  |  " + g.location(id)
+}
+fn one_node(g: *graph.Graph, name: str) -> (int, str) {
+  ids := g.resolve(name)
+  if len(ids) == 1 { return ids[0], "" }
+  if len(ids) == 0 {
+    near := g.search(name, "", 8)
+    msg := "No symbol \"" + name + "\"."
+    if len(near) > 0 {
+      msg += " Close matches:"
+      for _, id := range near { msg += "\n" + node_line(g, id) }
+    }
+    return -1, msg
+  }
+  msg := "\"" + name + "\" is ambiguous; use one of these names:"
+  for k, id := range ids {
+    if k >= 15 { break }
+    msg += "\n" + node_line(g, id)
+  }
+  return -1, msg
+}
+fn tool_find(a: *json.Value) -> (str, bool) {
+  g := graph_of(a)
+  ids := g.search(a.get_str("query", ""), a.get_str("kind", ""), a.get_int("limit", 20))
+  if len(ids) == 0 { return "No match among " + str(len(g.nodes)) + " symbols.", false }
+  out := []str{}
+  for _, id := range ids { out = append(out, node_line(g, id)) }
+  return strings.join(out, "\n"), false
+}
+fn names_of(g: *graph.Graph, ids: []int, limit: int) -> str {
+  out := []str{}
+  for k, id := range ids {
+    if k >= limit {
+      out = append(out, "... and " + str(len(ids) - limit) + " more")
+      break
+    }
+    out = append(out, g.nodes[id].name)
+  }
+  return strings.join(out, ", ")
+}
+fn tool_symbol(a: *json.Value) -> (str, bool) {
+  g := graph_of(a)
+  id, msg := one_node(g, a.get_str("name", ""))
+  if id < 0 { return msg, true }
+  n := g.nodes[id]
+  out := []str{n.kind + " " + n.name + "  (" + g.location(id) + ")"}
+  if n.sig != "" { out = append(out, n.sig) }
+  if n.doc != "" { out = append(out, "doc: " + n.doc) }
+  rel := [][]str{{"has_field", "fields"}, {"has_method", "methods"}, {"implements", "implements"}, {"~implements", "implemented by"},
+    {"dispatches", "runs"}, {"~dispatches", "runs for"}, {"calls", "calls"}, {"~calls", "called by"}, {"uses", "uses"}, {"~uses", "used by"}}
+  for _, r := range rel {
+    ids := g.neighbors(id, r[0])
+    if len(ids) > 0 { out = append(out, r[1] + " (" + str(len(ids)) + "): " + names_of(g, ids, 25)) }
+  }
+  if a.get_bool("code", false) { out = append(out, "", g.code(id)) }
+  return strings.join(out, "\n"), false
+}
+fn tool_related(a: *json.Value) -> (str, bool) {
+  g := graph_of(a)
+  id, msg := one_node(g, a.get_str("name", ""))
+  if id < 0 { return msg, true }
+  relations := map[str]str{"callers": "~calls", "callees": "calls", "implements": "implements", "implementations": "~implements",
+    "uses": "uses", "used_by": "~uses", "fields": "has_field", "methods": "has_method", "members": "defines"}
+  r := a.get_str("relation", "callers")
+  edge, ok := relations[r]
+  if !ok { return "relation must be one of: callers, callees, implements, implementations, uses, used_by, fields, methods, members", true }
+  if r == "implementations" && g.nodes[id].kind == "imethod" { edge = "dispatches" }
+  depth := a.get_int("depth", 1)
+  if depth < 1 { depth = 1 }
+  if depth > 5 { depth = 5 }
+  seen := map[int]bool{id: true}
+  level := []int{id}
+  out := []str{}
+  limit := a.get_int("limit", 50)
+  for d := 1; d <= depth; d++ {
+    next := []int{}
+    for _, x := range level {
+      for _, y := range g.neighbors(x, edge) {
+        if seen[y] { continue }
+        seen[y] = true
+        next = append(next, y)
+        if len(out) < limit {
+          prefix := ""
+          if depth > 1 { prefix = strings.repeat("  ", d - 1) }
+          out = append(out, prefix + node_line(g, y))
+        }
+      }
+    }
+    level = next
+  }
+  if len(out) == 0 { return "No " + r + " of " + g.nodes[id].name + ".", false }
+  return strings.join(out, "\n"), false
+}
+fn tool_outline(a: *json.Value) -> (str, bool) {
+  g := graph_of(a)
+  f := a.get_str("file", "")
+  id := -1
+  for _, n := range g.nodes {
+    if n.kind == "file" && (n.name == strings.trim_suffix(f, ".caju") || g.location(n.id) == f || strings.has_suffix(n.path, "/" + f)) { id = n.id }
+  }
+  if id < 0 { return "No file \"" + f + "\" in the graph (files are relative to the root, e.g. compiler/wasm.caju or std/strings).", true }
+  out := []str{g.nodes[id].name + ".caju"}
+  for _, d := range g.neighbors(id, "defines") {
+    out = append(out, node_line(g, d))
+    for _, m := range g.neighbors(d, "has_field") { out = append(out, "  " + g.nodes[m].sig) }
+    for _, m := range g.neighbors(d, "has_method") { out = append(out, "  " + node_line(g, m)) }
+  }
+  return strings.join(out, "\n"), false
+}
+fn tool_call_path(a: *json.Value) -> (str, bool) {
+  g := graph_of(a)
+  x, m1 := one_node(g, a.get_str("from", ""))
+  if x < 0 { return m1, true }
+  y, m2 := one_node(g, a.get_str("to", ""))
+  if y < 0 { return m2, true }
+  p := g.call_path(x, y)
+  if p == nil { return "No chain of calls from " + g.nodes[x].name + " to " + g.nodes[y].name + ".", false }
+  out := []str{}
+  for _, id := range p { out = append(out, node_line(g, id)) }
+  return strings.join(out, "\n  -> "), false
+}
+fn tool_graph_stats(a: *json.Value) -> (str, bool) {
+  g := graph_of(a)
+  count := map[str]int{}
+  edges := 0
+  for _, n := range g.nodes {
+    count[n.kind] = count[n.kind] + 1
+    edges += len(g.out[n.id])
+  }
+  out := []str{"root: " + g.root, "built in " + str(g.build_ms) + " ms (" + str(g.relinked) + " directories linked, the others reused); " + str(len(g.nodes)) + " nodes, " + str(edges) + " edges"}
+  for _, kn := range []str{"file", "func", "method", "struct", "field", "interface", "imethod", "var"} {
+    if count[kn] > 0 { out = append(out, kn + ": " + str(count[kn])) }
+  }
+  if len(g.excluded) > 0 {
+    out = append(out, "left out (" + str(len(g.excluded)) + "):")
+    for k, e := range g.excluded {
+      if k >= 20 { break }
+      out = append(out, "  " + e)
+    }
+  }
+  return strings.join(out, "\n"), false
+}
+
 # ---- the protocol ----
 let TOOLS = []str{
   "{\"name\":\"caju_check\",\"title\":\"Check Caju code\",\"description\":\"Type-checks a Caju program without running it and returns structured diagnostics (file, line, column, stage, message). Use it after every edit. Give the code as files (main.caju is the entry) or the path of an entry file on disk.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"files\":{\"type\":\"object\",\"description\":\"File name -> source code, e.g. {\\\"main.caju\\\": \\\"print(1)\\\"}. Other files are imported with import \\\"name\\\".\",\"additionalProperties\":{\"type\":\"string\"}},\"entry\":{\"type\":\"string\",\"description\":\"The entry file among files (default main.caju)\"},\"path\":{\"type\":\"string\",\"description\":\"Instead of files: the entry .caju file on disk\"}}}}",
@@ -280,6 +437,12 @@ let TOOLS = []str{
   "{\"name\":\"caju_test\",\"title\":\"Run Caju tests\",\"description\":\"Runs Caju test files (*_test.caju, BDD style with describe/it/expect from std/testing) and returns the counts and the report.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"files\":{\"type\":\"object\",\"description\":\"The test files and the files they import\",\"additionalProperties\":{\"type\":\"string\"}},\"path\":{\"type\":\"string\",\"description\":\"Instead of files: a test file or a directory on disk\"},\"filter\":{\"type\":\"string\",\"description\":\"Only the tests whose name contains this text\"},\"timeout_seconds\":{\"type\":\"integer\",\"default\":60}}}}",
   "{\"name\":\"caju_docs\",\"title\":\"Search the Caju standard library\",\"description\":\"Searches the exported functions, methods, structs and constants of the Caju standard library (std/strings, std/json, std/http...) and returns their declarations and doc comments. Use it instead of guessing names.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Text to look for in the module, the declaration or the comment (empty: everything)\"},\"limit\":{\"type\":\"integer\",\"default\":40}}}}",
   "{\"name\":\"caju_reference\",\"title\":\"Caju language reference\",\"description\":\"The reference of the Caju language: syntax, types, statements, functions, structs and interfaces, errors, modules, packages, tools. Read it before writing Caju: it is not Go (e.g. -> for results, str/num types, # comments, for i = 1 to n).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"topic\":{\"type\":\"string\",\"description\":\"Only the sections that mention this word (empty: the whole reference)\"}}}}",
+  "{\"name\":\"caju_find\",\"title\":\"Find symbols in the code graph\",\"description\":\"Searches the in-memory graph of a Caju project (functions, methods, structs, fields, interfaces, variables, files, the standard library too) by name or doc text. One line per match: kind, name, signature, file:lines. Use it instead of grep or reading files.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\",\"enum\":[\"func\",\"method\",\"struct\",\"interface\",\"type\",\"field\",\"var\",\"file\"]},\"limit\":{\"type\":\"integer\",\"default\":20},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"query\"]}}",
+  "{\"name\":\"caju_symbol\",\"title\":\"A symbol and its links\",\"description\":\"One symbol of the code graph: signature, doc, location, fields, methods, the interfaces it implements, what it calls and who calls it. With code=true, also its source (only that declaration).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"compiler/wasm.compile_wasm, Circle.area or just area\"},\"code\":{\"type\":\"boolean\",\"default\":false},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"name\"]}}",
+  "{\"name\":\"caju_related\",\"title\":\"Walk the code graph\",\"description\":\"The symbols linked to one: callers, callees, implements, implementations, uses, used_by, fields, methods or members (of a file), up to depth levels away.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"relation\":{\"type\":\"string\",\"enum\":[\"callers\",\"callees\",\"implements\",\"implementations\",\"uses\",\"used_by\",\"fields\",\"methods\",\"members\"]},\"depth\":{\"type\":\"integer\",\"default\":1,\"maximum\":5},\"limit\":{\"type\":\"integer\",\"default\":50},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"name\",\"relation\"]}}",
+  "{\"name\":\"caju_outline\",\"title\":\"Outline of a file\",\"description\":\"The declarations of one file with their signatures and lines, without the bodies: a cheap way to see a file before reading parts of it.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\",\"description\":\"Relative to the root (compiler/wasm.caju) or a library module (std/strings)\"},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"file\"]}}",
+  "{\"name\":\"caju_call_path\",\"title\":\"How one function reaches another\",\"description\":\"The shortest chain of calls from one function or method to another, through the code graph.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}},\"required\":[\"from\",\"to\"]}}",
+  "{\"name\":\"caju_graph_stats\",\"title\":\"About the code graph\",\"description\":\"How many symbols and links the graph of a project has, how long it took to build, and the files left out because they do not compile.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"root\":{\"type\":\"string\",\"description\":\"The project directory (default: where the server runs)\"}}}}",
 }
 
 fn result(id: str, body: str) -> str { return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + body + "}" }
@@ -300,6 +463,12 @@ fn call_tool(name: str, a: *json.Value) -> str {
   case "caju_test": text, is_err = tool_test(a)
   case "caju_docs": text, is_err = tool_docs(a)
   case "caju_reference": text, is_err = tool_reference(a)
+  case "caju_find": text, is_err = tool_find(a)
+  case "caju_symbol": text, is_err = tool_symbol(a)
+  case "caju_related": text, is_err = tool_related(a)
+  case "caju_outline": text, is_err = tool_outline(a)
+  case "caju_call_path": text, is_err = tool_call_path(a)
+  case "caju_graph_stats": text, is_err = tool_graph_stats(a)
   default: return ""
   }
   return tool_result(text, is_err)
