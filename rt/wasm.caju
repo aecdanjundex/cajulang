@@ -1,0 +1,39 @@
+# WebAssembly runtime: the system part. The host (tools/wasm/host.mjs in Node, the playground's
+# worker in a browser) emulates the Linux system calls the runtime and the standard library use,
+# with the memory of the module as the address space (see compiler/wasm.caju).
+let rt_argp: int = 0
+
+fn rt_os_init() {
+  p := __argp()
+  argc := __load64(p)
+  e := p + 8 * (argc + 2)
+  while __load64(e) != 0 {
+    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=") { rt_skip_sleep = true }
+    e += 8
+  }
+}
+fn rt_os_write(p: int, n: int) {
+  while n > 0 {
+    w := __syscall(1, 1, p, n, 0, 0, 0)
+    if w <= 0 { return }
+    p += w
+    n -= w
+  }
+}
+# memory from the host's pool (mmap)
+fn rt_os_mem(n: int) -> int { return __syscall(9, 0, n, 3, 34, -1, 0) }
+# the arena: the host gives its fixed address; the memory grows when pages are committed
+fn rt_os_reserve(n: int) -> int { return __syscall(9, 0, n, 3, 16418, -1, 0) }
+fn rt_os_commit(p: int, n: int) { __syscall(10, p, n, 3, 0, 0, 0) }
+# a wasm memory never shrinks: free pages keep their memory (rt_alloc_x zeroes reused pages)
+fn rt_os_release(p: int, n: int) { }
+fn rt_os_exit(c: int) { __syscall(231, c, 0, 0, 0, 0, 0) }
+fn rt_os_sleep(s: num) {
+  ts := rt_tmp + 64
+  sec := int(s)
+  __store64(ts, sec)
+  __store64(ts + 8, int((s - num(sec)) * 1000000000.0))
+  __syscall(35, ts, 0, 0, 0, 0, 0)
+}
+# the arena of the collector: 2 GB (a wasm memory has at most 4)
+fn rt_os_arena_size() -> int { return 1 << 31 }

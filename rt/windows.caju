@@ -23,3 +23,5 @@ fn rt_os_commit(p: int, n: int) { VirtualAlloc(p, n, 4096, 4) }
 fn rt_os_release(p: int, n: int) { }
 fn rt_os_exit(c: int) { ExitProcess(c) }
 fn rt_os_sleep(s: num) { Sleep(int(s * 1000.0)) }
+# the arena of the collector: 16 GB of addresses (only the pages used take memory)
+fn rt_os_arena_size() -> int { return 1 << 34 }

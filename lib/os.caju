@@ -19,6 +19,7 @@ const SYS_CHMOD = 90
 const SYS_CLOCK_GETTIME = 228
 const SYS_MEMFD_CREATE = 319
 const SYS_EXECVEAT = 322
+const SYS_CAJU_SPAWN = 1000      # not Linux: the WebAssembly host's "run a program" (Linux: ENOSYS)
 
 const O_RDONLY = 0
 const O_WRONLY = 1
@@ -258,15 +259,22 @@ export fn run(argv: []str, env: []str, merge_stderr: bool) -> (*Process, error) 
   if len(argv) == 0 { return nil, errors.New("run: no program") }
   path := look_path(argv[0])
   if env == nil { env = environ() }
+  cargv := cstr_array(argv)
+  cenv := cstr_array(env)
+  cpath := cstr(path)
+  __flush()
+  # hosts without fork (a WebAssembly host, see tools/wasm/caju-host.mjs): one call runs the
+  # program and gives a descriptor with its output and the wait status; Linux answers ENOSYS
+  res := __newstr(16)
+  merge := 0
+  if merge_stderr { merge = 1 }
+  rr := __syscall(SYS_CAJU_SPAWN, cpath, cargv, cenv, merge, res + 8, 0)
+  if rr != -38 { return spawned(path, argv[0], rr, res) }
   fds := __newstr(8)
   r := __syscall(SYS_PIPE, fds + 8, 0, 0, 0, 0, 0)
   if r < 0 { return nil, sys_error("pipe", path, r) }
   rd := __load8(fds + 8) | (__load8(fds + 9) << 8) | (__load8(fds + 10) << 16)
   wr := __load8(fds + 12) | (__load8(fds + 13) << 8) | (__load8(fds + 14) << 16)
-  cargv := cstr_array(argv)
-  cenv := cstr_array(env)
-  cpath := cstr(path)
-  __flush()
   pid := __syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
   if pid < 0 { return nil, sys_error("fork", path, pid) }
   if pid == 0 {
@@ -294,6 +302,21 @@ export fn run(argv: []str, env: []str, merge_stderr: bool) -> (*Process, error) 
     p.code = 128 + sig
   }
   if p.code == 127 && !exists(path) { return p, errors.New("run " + argv[0] + ": program not found") }
+  return p, nil
+}
+
+fn spawned(path: str, name: str, rr: int, res: int) -> (*Process, error) {
+  if rr < 0 { return nil, sys_error("spawn", path, rr) }
+  out := read_all(__load64(res + 8))
+  __syscall(SYS_CLOSE, __load64(res + 8), 0, 0, 0, 0, 0)
+  status := __load64(res + 16)
+  p := &Process{output: out}
+  sig := status & 0x7F
+  if sig == 0 { p.code = (status >> 8) & 0xFF } else {
+    p.signal = sig
+    p.code = 128 + sig
+  }
+  if p.code == 127 && !exists(path) { return p, errors.New("run " + name + ": program not found") }
   return p, nil
 }
 

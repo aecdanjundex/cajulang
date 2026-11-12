@@ -17,3 +17,7 @@ jobs:
         run: tools/release.sh
       - name: Test suite
         run: CAJU_ROOT=$PWD build/release/caju test
+      - name: WebAssembly package and language tests in wasm
+        run: |
+          CAJU=build/release/caju tools/wasm/package.sh
+          CAJU_ROOT=$PWD build/release/caju test --target wasm tests/lang

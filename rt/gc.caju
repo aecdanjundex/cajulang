@@ -49,7 +49,7 @@ let rt_data_lo: int = 0        # globals of the program and the runtime
 let rt_data_hi: int = 0
 
 fn rt_gc_init() {
-  size := 1 << 34
+  size := rt_os_arena_size()
   rt_npages = size >> 16
   base := rt_os_reserve(size + 65536)
   rt_arena = (base + 65535) & -65536

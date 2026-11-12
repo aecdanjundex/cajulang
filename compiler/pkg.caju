@@ -19,7 +19,7 @@ import "std/toml"
 import "std/crypto"
 import "project"
 
-export const VERSION = "0.3.0"     # the version of the compiler (caju version)
+export const VERSION = "0.4.0"     # the version of the compiler (caju version)
 const LOCK_VERSION = 1
 
 # ---------------------------------------------------------------- versions (semver)

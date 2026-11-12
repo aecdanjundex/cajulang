@@ -32,3 +32,5 @@ fn rt_os_sleep(s: num) {
   __store64(ts + 8, int((s - num(sec)) * 1000000000.0))
   __syscall(35, ts, 0, 0, 0, 0, 0)
 }
+# the arena of the collector: 16 GB of addresses (only the pages used take memory)
+fn rt_os_arena_size() -> int { return 1 << 34 }

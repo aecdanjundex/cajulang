@@ -1,0 +1,360 @@
+# WebAssembly binary encoder: a module made of functions, a table for indirect calls, one memory,
+# a few globals, exception tags and a data segment. Used by compiler/wasm.caju.
+#
+# Function indexes are given on first use (imports must all be declared before that), so the
+# code generator can call a function before generating it. Addresses of data symbols are not
+# known while a body is being written: `addr` leaves a 5-byte placeholder that `finish` patches.
+
+import "std/bytes"
+
+# value types
+export const I32 = 0x7F
+export const I64 = 0x7E
+export const F64 = 0x7C
+
+export struct Func {
+  name: str
+  index: int
+  type_idx: int
+  body: *bytes.Buffer          # instructions, without the locals header
+  locals: []int                # value type of each extra local (after the parameters)
+  defined: bool
+  exported: str
+}
+
+struct Import {
+  module: str
+  field: str
+  type_idx: int
+}
+
+struct Fixup {
+  buf: *bytes.Buffer
+  at: int
+  sym: str
+  add: int
+}
+
+struct Global {
+  t: int
+  init: int
+  mutable: bool
+  exported: str
+}
+
+export struct Module {
+  types: []str                 # encoded function types
+  type_of: map[str]int
+  imports: []*Import
+  funcs: []*Func               # defined functions, in index order
+  by_name: map[str]*Func
+  table: []int                 # function index of each table slot
+  table_of: map[str]int        # function name -> table slot
+  globals: []*Global
+  tags: []int                  # type index of each exception tag
+  data_base: int               # memory address of data[0]
+  data: *bytes.Buffer
+  syms: map[str]int            # data symbol -> offset in data
+  fixups: []*Fixup
+  min_pages: int
+  max_pages: int
+  mem_export: str
+  start_export: str
+}
+
+export fn new_module(data_base: int) -> *Module {
+  return &Module{types: []str{}, type_of: map[str]int{}, imports: []*Import{}, funcs: []*Func{},
+    by_name: map[str]*Func{}, table: []int{}, table_of: map[str]int{}, globals: []*Global{}, tags: []int{},
+    data_base: data_base, data: bytes.new_buffer(1 << 16), syms: map[str]int{}, fixups: []*Fixup{},
+    min_pages: 1, max_pages: 65536, mem_export: "memory", start_export: ""}
+}
+
+# ---- LEB128 ----
+export fn uleb(b: *bytes.Buffer, v: int) {
+  while true {
+    c := v & 127
+    v = v >> 7
+    if v == 0 {
+      b.byte(c)
+      return
+    }
+    b.byte(c | 128)
+  }
+}
+export fn sleb(b: *bytes.Buffer, v: int) {
+  while true {
+    c := v & 127
+    v = v >> 7                 # arithmetic shift: keeps the sign
+    if (v == 0 && c & 64 == 0) || (v == -1 && c & 64 != 0) {
+      b.byte(c)
+      return
+    }
+    b.byte(c | 128)
+  }
+}
+# signed LEB128 of v in exactly 5 bytes (patched later; v must fit in 34 bits)
+fn sleb5_at(b: *bytes.Buffer, at: int, v: int) {
+  for i := 0; i < 4; i++ {
+    b.set(at + i, (v & 127) | 128)
+    v = v >> 7
+  }
+  b.set(at + 4, v & 127)
+}
+fn name_bytes(b: *bytes.Buffer, s: str) {
+  uleb(b, len(s))
+  b.write(s)
+}
+
+# ---- types ----
+# index of the function type params -> results (each a string of value type bytes)
+export fn (m: *Module) func_type(params: []int, results: []int) -> int {
+  b := bytes.new_buffer(16)
+  b.byte(0x60)
+  uleb(b, len(params))
+  for _, p := range params { b.byte(p) }
+  uleb(b, len(results))
+  for _, r := range results { b.byte(r) }
+  key := b.string()
+  if i, ok := m.type_of[key]; ok { return i }
+  m.types = append(m.types, key)
+  m.type_of[key] = len(m.types) - 1
+  return len(m.types) - 1
+}
+
+# ---- functions ----
+export fn (m: *Module) import_func(module: str, field: str, name: str, type_idx: int) {
+  if len(m.funcs) > 0 { panic("wasm: imports must come before the functions") }
+  m.imports = append(m.imports, &Import{module: module, field: field, type_idx: type_idx})
+  m.by_name[name] = &Func{name: name, index: len(m.imports) - 1, type_idx: type_idx, defined: true}
+}
+# the function called name (created on first use; its body comes later with define)
+export fn (m: *Module) func(name: str, type_idx: int) -> *Func {
+  if f, ok := m.by_name[name]; ok { return f }
+  f := &Func{name: name, index: len(m.imports) + len(m.funcs), type_idx: type_idx, body: nil, locals: []int{}}
+  m.funcs = append(m.funcs, f)
+  m.by_name[name] = f
+  return f
+}
+export fn (m: *Module) has_func(name: str) -> bool {
+  _, ok := m.by_name[name]
+  return ok
+}
+export fn (m: *Module) define(name: str, type_idx: int, locals: []int, body: *bytes.Buffer) {
+  f := m.func(name, type_idx)
+  if f.defined { panic("wasm: function defined twice: " + name) }
+  f.defined = true
+  f.locals = locals
+  f.body = body
+}
+export fn (m: *Module) export_func(name: str, as: str) { m.by_name[name].exported = as }
+# the table slot of a function (for indirect calls: closures keep it as their code pointer)
+export fn (m: *Module) slot(name: str, type_idx: int) -> int {
+  if i, ok := m.table_of[name]; ok { return i }
+  f := m.func(name, type_idx)
+  m.table = append(m.table, f.index)
+  m.table_of[name] = len(m.table) - 1
+  return len(m.table) - 1
+}
+
+export fn (m: *Module) global(t: int, init: int, mutable: bool, exported: str) -> int {
+  m.globals = append(m.globals, &Global{t: t, init: init, mutable: mutable, exported: exported})
+  return len(m.globals) - 1
+}
+export fn (m: *Module) set_global_init(i: int, v: int) { m.globals[i].init = v }
+export fn (m: *Module) tag(type_idx: int) -> int {
+  m.tags = append(m.tags, type_idx)
+  return len(m.tags) - 1
+}
+
+# ---- data ----
+export fn (m: *Module) data_sym(sym: str, align: int) -> int {
+  while m.data.len() % align != 0 { m.data.byte(0) }
+  off := m.data.len()
+  m.syms[sym] = off
+  return off
+}
+export fn (m: *Module) has_sym(sym: str) -> bool {
+  _, ok := m.syms[sym]
+  return ok
+}
+# a data word holding the address of a symbol (data symbol, or "@" + function name: its table slot)
+export fn (m: *Module) data_reloc(off: int, sym: str) {
+  m.fixups = append(m.fixups, &Fixup{buf: nil, at: off, sym: sym, add: 0})
+}
+# i64.const with the address of a data symbol (patched by finish)
+export fn (m: *Module) addr(b: *bytes.Buffer, sym: str, add: int) {
+  b.byte(0x42)
+  m.fixups = append(m.fixups, &Fixup{buf: b, at: b.len(), sym: sym, add: add})
+  b.zeros(5)
+}
+# i32.const with the address of a data symbol (for loads and stores of globals)
+export fn (m: *Module) addr32(b: *bytes.Buffer, sym: str, add: int) {
+  b.byte(0x41)
+  m.fixups = append(m.fixups, &Fixup{buf: b, at: b.len(), sym: sym, add: add})
+  b.zeros(5)
+}
+export fn (m: *Module) sym_addr(sym: str) -> int {
+  off, ok := m.syms[sym]
+  if !ok { panic("wasm: undefined symbol " + sym) }
+  return m.data_base + off
+}
+fn (m: *Module) resolve(sym: str) -> int {
+  if len(sym) > 0 && sym[0] == 64 {
+    t, ok := m.table_of[sym[1:]]
+    if !ok { panic("wasm: function not in the table: " + sym[1:]) }
+    return t
+  }
+  return m.sym_addr(sym)
+}
+
+# ---- output ----
+fn section(out: *bytes.Buffer, id: int, b: *bytes.Buffer) {
+  out.byte(id)
+  uleb(out, b.len())
+  out.append(b)
+}
+
+export fn (m: *Module) finish() -> *bytes.Buffer {
+  for _, fx := range m.fixups {
+    v := m.resolve(fx.sym) + fx.add
+    if fx.buf == nil { m.data.set_u64(fx.at, v) } else { sleb5_at(fx.buf, fx.at, v) }
+  }
+  for _, f := range m.funcs { if !f.defined { panic("wasm: function never defined: " + f.name) } }
+  out := bytes.new_buffer(m.data.len() + 1 << 20)
+  out.write("\x00asm")
+  out.u32(1)
+
+  b := bytes.new_buffer(1024)
+  uleb(b, len(m.types))
+  for _, t := range m.types { b.write(t) }
+  section(out, 1, b)
+
+  b = bytes.new_buffer(256)
+  uleb(b, len(m.imports))
+  for _, im := range m.imports {
+    name_bytes(b, im.module)
+    name_bytes(b, im.field)
+    b.byte(0)
+    uleb(b, im.type_idx)
+  }
+  section(out, 2, b)
+
+  b = bytes.new_buffer(4 * len(m.funcs) + 8)
+  uleb(b, len(m.funcs))
+  for _, f := range m.funcs { uleb(b, f.type_idx) }
+  section(out, 3, b)
+
+  b = bytes.new_buffer(16)                   # table: funcref, exactly the slots used
+  b.byte(1)
+  b.byte(0x70)
+  b.byte(1)
+  uleb(b, len(m.table))
+  uleb(b, len(m.table))
+  section(out, 4, b)
+
+  b = bytes.new_buffer(16)                   # memory
+  b.byte(1)
+  b.byte(1)
+  uleb(b, m.min_pages)
+  uleb(b, m.max_pages)
+  section(out, 5, b)
+
+  if len(m.tags) > 0 {                       # tags (exception handling): section 13
+    b = bytes.new_buffer(16)
+    uleb(b, len(m.tags))
+    for _, tg := range m.tags {
+      b.byte(0)
+      uleb(b, tg)
+    }
+    section(out, 13, b)
+  }
+
+  b = bytes.new_buffer(64)
+  uleb(b, len(m.globals))
+  for _, gl := range m.globals {
+    b.byte(gl.t)
+    if gl.mutable { b.byte(1) } else { b.byte(0) }
+    if gl.t == I32 { b.byte(0x41) } else { b.byte(0x42) }
+    sleb(b, gl.init)
+    b.byte(0x0B)
+  }
+  section(out, 6, b)
+
+  b = bytes.new_buffer(256)
+  n := 1
+  for _, gl := range m.globals { if gl.exported != "" { n++ } }
+  for _, f := range m.funcs { if f.exported != "" { n++ } }
+  uleb(b, n)
+  name_bytes(b, m.mem_export)
+  b.byte(2)
+  b.byte(0)
+  for i, gl := range m.globals {
+    if gl.exported == "" { continue }
+    name_bytes(b, gl.exported)
+    b.byte(3)
+    uleb(b, i)
+  }
+  for _, f := range m.funcs {
+    if f.exported == "" { continue }
+    name_bytes(b, f.exported)
+    b.byte(0)
+    uleb(b, f.index)
+  }
+  section(out, 7, b)
+
+  if len(m.table) > 0 {                      # elements: table[0..] = the functions
+    b = bytes.new_buffer(4 * len(m.table) + 16)
+    b.byte(1)
+    b.byte(0)
+    b.byte(0x41)
+    b.byte(0)
+    b.byte(0x0B)
+    uleb(b, len(m.table))
+    for _, fi := range m.table { uleb(b, fi) }
+    section(out, 9, b)
+  }
+
+  b = bytes.new_buffer(4)                    # data count (needed by nothing here, but harmless)
+  uleb(b, 1)
+  section(out, 12, b)
+
+  b = bytes.new_buffer(1 << 20)
+  uleb(b, len(m.funcs))
+  for _, f := range m.funcs {
+    fb := bytes.new_buffer(f.body.len() + 32)
+    # locals, grouped by runs of the same type
+    groups := 0
+    i := 0
+    while i < len(f.locals) {
+      j := i
+      while j < len(f.locals) && f.locals[j] == f.locals[i] { j++ }
+      groups++
+      i = j
+    }
+    uleb(fb, groups)
+    i = 0
+    while i < len(f.locals) {
+      j := i
+      while j < len(f.locals) && f.locals[j] == f.locals[i] { j++ }
+      uleb(fb, j - i)
+      fb.byte(f.locals[i])
+      i = j
+    }
+    fb.append(f.body)
+    fb.byte(0x0B)
+    uleb(b, fb.len())
+    b.append(fb)
+  }
+  section(out, 10, b)
+
+  b = bytes.new_buffer(m.data.len() + 16)
+  uleb(b, 1)
+  b.byte(0)
+  b.byte(0x41)
+  sleb(b, m.data_base)
+  b.byte(0x0B)
+  uleb(b, m.data.len())
+  b.append(m.data)
+  section(out, 11, b)
+  return out
+}

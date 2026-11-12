@@ -25,9 +25,14 @@ jobs:
         run: |
           CAJU_PACKAGE=dist/caju-linux-x86_64.tar.gz CAJU_HOME=$RUNNER_TEMP/caju CAJU_BIN_DIR=$RUNNER_TEMP/bin sh install.sh
           $RUNNER_TEMP/bin/caju run $RUNNER_TEMP/caju/examples/hello-world.caju
+      - name: WebAssembly package (the compiler in wasm; self-compiles; browser test)
+        run: CAJU=build/release/caju tools/wasm/package.sh
+      - name: Test suite in WebAssembly
+        run: CAJU_ROOT=$PWD build/release/caju test --target wasm tests/lang
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" dist/caju-linux-x86_64.tar.gz dist/caju-linux-x86_64.tar.gz.sha256 \
+            dist/caju-wasm.tar.gz dist/caju-wasm.tar.gz.sha256 \
             --title "Caju ${{ github.ref_name }}" --generate-notes

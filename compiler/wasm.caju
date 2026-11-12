@@ -1,0 +1,3899 @@
+# WebAssembly code generator: the same program and runtime as compiler/native.caju, compiled to a
+# wasm module that runs in a browser or in Node (tools/wasm/host.mjs gives it the system calls).
+#
+# The model copies the native one so that the runtime (rt/*.caju) works unchanged:
+# - every value is one i64 (floats travel as their bits); pointers are addresses in the linear
+#   memory, below 4 GB;
+# - the arguments, the locals and every temporary that must survive a call live on a stack in the
+#   linear memory (global $sp), never only on the wasm stack: the collector scans that stack from
+#   $sp up to rt_stack_top, as it scans the machine stack in the native program;
+# - each function of the program or the runtime is a wasm function () -> i64 (one type, so
+#   closures and method tables keep a table slot as their "code address" and call_indirect works
+#   for all); the caller pushes the closure (calls of values) and the arguments, the callee finds
+#   parameter i of n at $fp + 8*(n-1-i) and its locals below $fp; the caller pops the arguments;
+# - results 2, 3... of a function go in g.ret (as in the native code); the second value of
+#   v, ok := m[k] and x.(T) goes in the global $aux (the native code uses RCX);
+# - a recovered panic throws the wasm exception $jump with the frame of the function that
+#   deferred the recover; that function catches it (see gen_function).
+#
+# Memory: [1024, 64 KB) arguments and environment (written by the host before the start), then
+# the data (globals, texts, type descriptors), the stack (STACK_SIZE), a pool for rt_os_mem (the
+# host's mmap) and, from ARENA_BASE, the collector's arena (the host grows the memory on commit).
+
+import "std/bytes"
+import "std/strings"
+import "std/math"
+import "ast"
+import "types"
+import "linker"
+import "check"
+import W "wasmenc"
+
+const ARGV = 1024
+const DATA_BASE = 65536
+const STACK_SIZE = 16 << 20
+const POOL_SIZE = 48 << 20
+
+# globals of the module
+const G_SP = 0
+const G_DEPTH = 1
+const G_AUX = 2
+
+struct Var {
+  off: int                    # >= 0: from $fp (parameters, closure); < 0: frame slot -8k
+  sym: str                    # a global (data symbol)
+  t: str
+  celled: bool
+  cap: int                    # -1: not captured
+}
+
+struct Unit {
+  tree: *ast.Node
+  p: str
+  is_runtime: bool
+  funcs: map[str]*ast.Node
+  externs: map[str]*ast.Node
+  globals: map[str]*Var
+  celled: map[str]bool
+}
+
+struct Lit {
+  u: *Unit
+  label: str
+  fnode: *ast.Node
+  cap_types: []str
+}
+
+struct BoundThunk {
+  u: *Unit
+  f: *ast.Node
+}
+
+struct Gen {
+  m: *W.Module
+  t0: int                     # the type () -> i64 of every Caju function
+  str_syms: map[str]str
+  descs: map[str]str
+  mtabs: map[str]str
+  file_names: []str
+  ut: *types.Result
+  rtt: *types.Result
+  r_unit: *Unit
+  u_unit: *Unit
+  lits: []*Lit
+  static_clos: map[str]bool
+  thunks_m: map[str]*BoundThunk
+  rt_syms: map[str]str
+  hidden_n: int
+}
+
+fn nfail(msg: str, n: *ast.Node) {
+  if n == nil {
+    ast.fail("compile", "WebAssembly compiler: " + msg, 1, 0)
+    return
+  }
+  ast.fail("compile", "WebAssembly compiler: " + msg, n.line, n.col)
+}
+
+# ---- helpers on type texts (as in native.caju) ----
+fn strip_ptr(t: str) -> str {
+  if len(t) > 0 && t[0] == 42 { return t[1:] }
+  return t
+}
+fn is_float_name(t: str) -> bool { return t == "num" || t == "float32" || t == "flit" }
+fn in_kind_code(t: str) -> bool {
+  _, ok := types.KIND_CODE[t]
+  return ok
+}
+fn kind_code(t: str) -> int {
+  k, ok := types.KIND_CODE[types.dflt(t)]
+  if !ok { return 0 }
+  return k
+}
+fn is_unsigned(t: str) -> bool {
+  k := kind_code(t)
+  return k >= 5 && k <= 9
+}
+fn results_of_t(r: str) -> []str {
+  if r == "" || r == "void" { return []str{} }
+  if r[0] == 40 { return types.tinfo(r).items }
+  return []str{r}
+}
+fn parse_raw(s: str) -> int {
+  x := 0
+  for i := 0; i < len(s); i++ { x = x * 10 + (int(s[i]) - 48) }
+  return x
+}
+fn optional(x: int) -> bool { return x != ast.NONE && x != 0 }
+fn at_or(xs: []str, i: int) -> str {
+  if i < len(xs) { return xs[i] }
+  return ""
+}
+
+fn (g: *Gen) struct_info(t: str) -> *types.StructInfo {
+  s, ok := g.ut.struct_table[t]
+  if ok { return s }
+  s2, ok2 := g.rtt.struct_table[t]
+  if ok2 { return s2 }
+  return nil
+}
+fn (g: *Gen) iface_info(t: str) -> *types.IfaceInfo {
+  s, ok := g.ut.iface_table[t]
+  if ok { return s }
+  s2, ok2 := g.rtt.iface_table[t]
+  if ok2 { return s2 }
+  return nil
+}
+fn (g: *Gen) is_struct(t: str) -> bool { return g.struct_info(types.dflt(t)) != nil }
+fn (g: *Gen) is_iface_t(t: str) -> bool { return t != "" && (types.loose(t) || g.iface_info(types.dflt(t)) != nil) }
+fn (g: *Gen) is_func_t(t: str) -> bool {
+  return t != "" && !g.is_iface_t(t) && !g.is_struct(t) && types.tinfo(types.dflt(t)).k == "func"
+}
+fn (g: *Gen) kind_of_t(t: str) -> str {
+  if t != "" && !g.is_struct(t) { return types.tinfo(types.dflt(t)).k }
+  return ""
+}
+fn (g: *Gen) byte_elems(t: str) -> bool {
+  tt := strip_ptr(types.dflt(t))
+  if tt == "" { return false }
+  k := g.kind_of_t(tt)
+  if k != "slice" && k != "array" { return false }
+  return types.dflt(types.tinfo(tt).elem) == "bool"
+}
+fn elem_size(byte_e: bool) -> int {
+  if byte_e { return 1 }
+  return 8
+}
+fn (g: *Gen) is_value_type(t: str) -> bool { return t != "" && (g.is_struct(t) || g.kind_of_t(t) == "array") }
+fn (g: *Gen) cls(t: str, n: *ast.Node) -> str {
+  d := t
+  if d == "" { d = "any" }
+  d = types.dflt(d)
+  if is_float_name(t) || is_float_name(d) { return "f" }
+  if d == "bool" || in_kind_code(d) { return "i" }
+  if d == "str" { return "s" }
+  if d == "void" { return "v" }
+  if d == "nil" || g.is_iface_t(d) || g.is_struct(d) { return "p" }
+  k := types.tinfo(d).k
+  if k == "slice" || k == "array" || k == "map" || k == "ptr" || k == "func" { return "p" }
+  nfail("the type " + types.show_t(t) + " is not supported yet", n)
+  return ""
+}
+fn (g: *Gen) struct_fields(t: str) -> []*ast.Node { return g.struct_info(types.dflt(t)).node.fields }
+fn (g: *Gen) field_index(t: str, name: str, n: *ast.Node) -> int {
+  fs := g.struct_fields(strip_ptr(t))
+  for i, f := range fs { if f.name == name { return i } }
+  nfail("field " + name + " not found", n)
+  return -1
+}
+fn (g: *Gen) field_type(t: str, name: str) -> str {
+  for _, f := range g.struct_fields(t) { if f.name == name { return f.type } }
+  return ""
+}
+
+# ---- data ----
+fn (g: *Gen) data_sym(sym: str, align: int) -> int { return g.m.data_sym(sym, align) }
+fn (g: *Gen) reloc(off: int, sym: str) { g.m.data_reloc(off, sym) }
+# the table slot of a function (its "code address"), as data relocation text
+fn (g: *Gen) code_ref(name: str) -> str {
+  g.m.slot(name, g.t0)
+  return "@" + name
+}
+fn (g: *Gen) str_lit(s: str) -> str {
+  sym, ok := g.str_syms[s]
+  if ok { return sym }
+  sym = "str." + str(len(g.str_syms))
+  g.data_sym(sym, 8)
+  g.m.data.u64(len(s))
+  g.m.data.write(s)
+  g.m.data.byte(0)
+  g.str_syms[s] = sym
+  return sym
+}
+
+# type descriptor (layout in docs/arquitetura-nativo.md and rt/values.caju)
+fn (g: *Gen) desc(t0: str, n: *ast.Node) -> str {
+  t := types.dflt(t0)
+  have, ok := g.descs[t]
+  if ok { return have }
+  sym := "desc." + str(len(g.descs))
+  g.descs[t] = sym
+  fields := []int{0, 0, 0, 0, 0, 0, 0, 0}
+  refs := []str{"", "", "", "", "", "", "", ""}
+  if t == "·errstr" { refs[4] = g.str_lit("*errors.errorString") } else { refs[4] = g.str_lit(types.bare(t)) }
+  if t == "str" { fields[0] = 5 } else if t == "bool" { fields[0] = 4 } else if is_float_name(t) { fields[0] = 3 } else if in_kind_code(t) {
+    if is_unsigned(t) { fields[0] = 2 } else { fields[0] = 1 }
+    fields[6] = kind_code(t)
+  } else if t == "·errstr" {
+    fields[0] = 13
+    refs[7] = g.method_table("", true)
+  } else if t == "any" || types.loose(t) {
+    fields[0] = 11
+  } else if g.iface_info(t) != nil {
+    fields[0] = 12
+    names := []str{}
+    for m, _ := range g.iface_info(t).methods { names = append(names, m) }
+    lst := sym + ".m"
+    base := g.data_sym(lst, 8)
+    g.m.data.u64(len(names))
+    for i := 0; i < len(names); i++ { g.m.data.u64(0) }
+    for i, m := range names { g.reloc(base + 8 + 8 * i, g.str_lit(m)) }
+    refs[7] = lst
+  } else if g.is_struct(t) {
+    fs := g.struct_fields(t)
+    fields[0] = 8
+    fields[1] = len(fs)
+    tab := sym + ".f"
+    name_syms := []str{}
+    desc_syms := []str{}
+    for _, f := range fs {
+      name_syms = append(name_syms, g.str_lit(f.name))
+      desc_syms = append(desc_syms, g.desc(f.type, n))
+    }
+    base := g.data_sym(tab, 8)
+    for _, f := range fs {
+      g.m.data.u64(0)
+      g.m.data.u64(0)
+      if g.is_value_type(f.type) { g.m.data.u64(1) } else { g.m.data.u64(0) }
+    }
+    if len(fs) == 0 { g.m.data.u64(0) }
+    for i := 0; i < len(fs); i++ {
+      g.reloc(base + 24 * i, name_syms[i])
+      g.reloc(base + 24 * i + 8, desc_syms[i])
+    }
+    refs[5] = tab
+    mt := g.method_table(t, false)
+    if mt != "" { refs[7] = mt }
+  } else {
+    ti := types.tinfo(t)
+    if ti.k == "slice" {
+      fields[0] = 6
+      refs[2] = g.desc(ti.elem, n)
+    } else if ti.k == "array" {
+      fields[0] = 7
+      fields[1] = ti.n
+      refs[2] = g.desc(ti.elem, n)
+    } else if ti.k == "ptr" {
+      fields[0] = 9
+      refs[2] = g.desc(ti.elem, n)
+      if g.is_struct(ti.elem) {
+        mt := g.method_table(types.dflt(ti.elem), false)
+        if mt != "" { refs[7] = mt }
+      }
+    } else if ti.k == "map" {
+      fields[0] = 10
+      refs[2] = g.desc(ti.val, n)
+      refs[3] = g.desc(ti.key, n)
+    } else if ti.k == "func" {
+      fields[0] = 14
+    } else {
+      fields[0] = 15
+    }
+  }
+  base := g.data_sym(sym, 8)
+  for _, w := range fields { g.m.data.u64(w) }
+  for i, s := range refs { if s != "" { g.reloc(base + 8 * i, s) } }
+  return sym
+}
+
+struct MEntry {
+  name: str
+  code: str
+  path: []int
+  copy: str
+  vset: bool
+  ret: str
+}
+
+fn (g: *Gen) method_table(sname: str, is_err: bool) -> str {
+  key := sname
+  if is_err { key = "" }
+  have, ok := g.mtabs[key]
+  if ok { return have }
+  entries := []*MEntry{}
+  if is_err {
+    entries = append(entries, &MEntry{name: "Error", code: "r.f.rt_err_error", path: []int{}, copy: "", vset: true, ret: "str"})
+  } else {
+    _, user := g.ut.struct_table[sname]
+    if !user {
+      g.mtabs[key] = ""
+      return ""
+    }
+    all := g.ut.method_set(sname, true)
+    vset := g.ut.method_set(sname, false)
+    for m, mm := range all {
+      st := sname
+      path := []int{}
+      for _, p := range mm.path {
+        i := g.field_index(st, p, nil)
+        st = strip_ptr(types.dflt(g.struct_fields(st)[i].type))
+        path = append(path, i)
+      }
+      node := mm.info.node
+      r := node.ret_ty
+      if r == "" { r = node.rtype }
+      if r == "" { r = "void" }
+      ret := r
+      if r == "void" || r[0] == 40 || g.is_iface_t(r) { ret = "" }
+      copy := ""
+      if !mm.ptr { copy = node.ptypes[0] }
+      _, inv := vset[m]
+      entries = append(entries, &MEntry{name: m, code: "u.f." + node.name, path: path, copy: copy, vset: inv, ret: ret})
+    }
+  }
+  sym := "mt." + str(len(g.mtabs))
+  g.mtabs[key] = sym
+  base := g.data_sym(sym, 8)
+  g.m.data.u64(len(entries))
+  for _, e := range entries {
+    g.m.data.zeros(32)
+    if e.vset { g.m.data.u64(1) } else { g.m.data.u64(0) }
+    g.m.data.u64(0)
+  }
+  for i, e := range entries {
+    at := base + 8 + 48 * i
+    g.reloc(at, g.str_lit(e.name))
+    g.reloc(at + 8, g.code_ref(e.code))
+    if len(e.path) > 0 {
+      ps := sym + ".p" + str(i)
+      g.data_sym(ps, 8)
+      g.m.data.u64(len(e.path))
+      for _, x := range e.path { g.m.data.u64(x) }
+      g.reloc(at + 16, ps)
+    }
+    if e.copy != "" { g.reloc(at + 24, g.desc(e.copy, nil)) }
+    if e.ret != "" { g.reloc(at + 40, g.desc(e.ret, nil)) }
+  }
+  return sym
+}
+fn (g: *Gen) key_kind(t: str, n: *ast.Node) -> int {
+  if g.is_value_type(t) || g.is_iface_t(t) { nfail("maps with struct, array, any or interface keys are not supported yet", n) }
+  if is_float_name(types.dflt(t)) { return 1 }
+  if types.dflt(t) == "str" { return 2 }
+  return 0
+}
+fn (g: *Gen) map_kinds(ti: *types.TInfo) -> int {
+  kk := g.key_kind(ti.key, nil)
+  c := g.cls(ti.val, nil)
+  if kk != 2 && (c == "i" || c == "f") { kk += 256 }
+  return kk
+}
+fn (g: *Gen) where_text(n: *ast.Node) -> str {
+  line := 1
+  if n != nil { line = n.line }
+  f := ast.loc_file(line)
+  name := "main.caju"
+  if f >= 0 && f < len(g.file_names) && g.file_names[f] != "" { name = g.file_names[f] }
+  return name + ", line " + str(ast.loc_line(line))
+}
+fn (g: *Gen) rt_call(name: str) -> str {
+  s, ok := g.rt_syms[name]
+  if ok { return s }
+  _, has := g.r_unit.funcs[name]
+  if !has { panic("runtime has no " + name) }
+  s = "r.f." + name
+  g.rt_syms[name] = s
+  return s
+}
+
+# ---- units ----
+fn (g: *Gen) flat(body: []*ast.Node, u: *Unit) {
+  for _, st := range body {
+    if st.kind == "Module" {
+      g.flat(st.stmts, u)
+    } else if st.kind == "Func" {
+      u.funcs[st.name] = st
+    } else if st.kind == "Extern" {
+      u.externs[st.name] = st
+    }
+  }
+}
+fn (g: *Gen) unit(tree: *ast.Node, p: str, is_runtime: bool, res: *types.Result) -> *Unit {
+  celled := res.global_celled
+  if celled == nil { celled = map[str]bool{} }
+  u := &Unit{tree: tree, p: p, is_runtime: is_runtime, funcs: map[str]*ast.Node{}, externs: map[str]*ast.Node{}, globals: map[str]*Var{}, celled: celled}
+  g.flat(tree.stmts, u)
+  return u
+}
+fn param_types(f: *ast.Node) -> []str {
+  out := []str{}
+  for i := 0; i < len(f.params); i++ {
+    t := ""
+    if i < len(f.ptypes) { t = f.ptypes[i] }
+    if t == "" { t = "any" }
+    out = append(out, t)
+  }
+  return out
+}
+fn ret_of(f: *ast.Node) -> str {
+  if f.ret_ty != "" { return f.ret_ty }
+  if f.rtype != "" { return f.rtype }
+  return "void"
+}
+fn (g: *Gen) static_closure(u: *Unit, name: str, n: *ast.Node) -> str {
+  key := u.p + ".c." + name
+  _, ok := g.static_clos[key]
+  if !ok {
+    _, has := u.funcs[name]
+    if !has { nfail("function " + types.bare(name) + " not found", n) }
+    off := g.data_sym(key, 8)
+    g.m.data.u64(0)
+    g.reloc(off, g.code_ref(u.p + ".f." + name))
+    g.static_clos[key] = true
+  }
+  return key
+}
+fn (g: *Gen) bound_thunk(u: *Unit, f: *ast.Node) -> str {
+  key := u.p + ".t." + f.name
+  _, ok := g.thunks_m[key]
+  if !ok { g.thunks_m[key] = &BoundThunk{u: u, f: f} }
+  return key
+}
+fn (g: *Gen) gen_unit(u: *Unit) {
+  # in a fixed order: the module comes out the same from run to run
+  names := []str{}
+  for name, _ := range u.funcs { names = append(names, name) }
+  sort_strs(names)
+  for _, name := range names {
+    f := u.funcs[name]
+    celled := f.celled
+    if celled == nil { celled = map[str]bool{} }
+    g.gen_function(u, u.p + ".f." + name, f.params, param_types(f), f.body.stmts, ret_of(f), false, celled, f, false, []str{})
+  }
+}
+fn sort_strs(xs: []str) {
+  for i := 1; i < len(xs); i++ {
+    x := xs[i]
+    j := i - 1
+    while j >= 0 && xs[j] > x {
+      xs[j + 1] = xs[j]
+      j--
+    }
+    xs[j + 1] = x
+  }
+}
+
+# ---- the whole program ----
+export fn compile_wasm(files: []*ast.SourceFile, rt_sources: []str) -> *bytes.Buffer {
+  m := W.new_module(DATA_BASE)
+  g := &Gen{m: m, str_syms: map[str]str{}, descs: map[str]str{}, mtabs: map[str]str{}, file_names: []str{},
+    lits: []*Lit{}, static_clos: map[str]bool{}, thunks_m: map[str]*BoundThunk{}, rt_syms: map[str]str{}}
+  for _, sf := range files { g.file_names = append(g.file_names, sf.name) }
+  tree := linker.link(files)
+  g.ut = check.check(tree)
+  rt_src := strings.join(rt_sources, "\n")
+  rt_tree := linker.link([]*ast.SourceFile{&ast.SourceFile{name: "rt.caju", src: rt_src}})
+  g.rtt = types.typecheck(rt_tree, true)
+
+  g.t0 = m.func_type([]int{}, []int{W.I64})
+  # imports: system calls (Linux numbers, emulated by the host) and fmod (JavaScript's %)
+  m.import_func("caju", "syscall", "imp.syscall", m.func_type([]int{W.I64, W.I64, W.I64, W.I64, W.I64, W.I64, W.I64}, []int{W.I64}))
+  m.import_func("caju", "fmod", "imp.fmod", m.func_type([]int{W.F64, W.F64}, []int{W.F64}))
+  m.global(W.I32, 0, true, "")                   # G_SP (set by the start function)
+  m.global(W.I64, 10000, true, "")               # G_DEPTH: calls left before the depth limit
+  m.global(W.I64, 0, true, "")                   # G_AUX
+  m.tag(m.func_type([]int{W.I64}, []int{}))      # $jump: a recovered panic
+
+  g.data_sym("g.data_lo", 8)
+  g.data_sym("g.argp", 8)
+  m.data.u64(ARGV)
+  g.data_sym("g.ret", 8)
+  m.data.zeros(8 * 16)
+
+  g.r_unit = g.unit(rt_tree, "r", true, g.rtt)
+  g.u_unit = g.unit(tree, "u", false, g.ut)
+
+  g.gen_helpers()
+  g.gen_function(g.r_unit, "r.top", []str{}, []str{}, rt_tree.stmts, "void", true, map[str]bool{}, nil, false, []str{})
+  g.gen_function(g.u_unit, "u.top", []str{}, []str{}, tree.stmts, "void", true, map[str]bool{}, nil, false, []str{})
+  g.gen_unit(g.r_unit)
+  g.gen_unit(g.u_unit)
+  for i := 0; i < len(g.lits); i++ {
+    l := g.lits[i]
+    f := l.fnode
+    celled := f.celled
+    if celled == nil { celled = map[str]bool{} }
+    g.gen_function(l.u, l.label, f.params, param_types(f), f.body.stmts, ret_of(f), false, celled, f, true, l.cap_types)
+  }
+  keys := []str{}
+  for key, _ := range g.thunks_m { keys = append(keys, key) }
+  sort_strs(keys)
+  for _, key := range keys { g.gen_bound_thunk(key, g.thunks_m[key]) }
+  g.gen_calldefer()
+  g.gen_start()
+
+  g.data_sym("g.data_hi", 8)
+  m.data.u64(0)
+  # the stack after the data, then the pool and the arena (see the top of this file)
+  data_end := DATA_BASE + m.data.len()
+  stack_lo := (data_end + 65535) / 65536 * 65536
+  stack_top := stack_lo + STACK_SIZE
+  m.min_pages = stack_top / 65536
+  m.global(W.I32, stack_lo, false, "stack_lo")
+  m.global(W.I32, stack_top, false, "stack_top")
+  m.global(W.I32, stack_top, false, "pool_lo")
+  m.global(W.I32, stack_top + POOL_SIZE, false, "arena_base")
+  m.global(W.I32, ARGV, false, "argv")
+  m.set_global_init(G_SP, stack_top)
+  return m.finish()
+}
+
+# ---- one function ----
+struct Loop {
+  brk: int                    # block to leave
+  cont: int                   # block to leave to continue (-1: a switch)
+  label: str
+}
+struct Target {
+  t: *ast.Node
+  map_: *Var
+  key: *Var
+  addr: *Var
+  deref: bool
+}
+struct PVal {
+  h: *Var
+  a: *ast.Node
+  t: str
+  n: *ast.Node
+}
+
+# wasm locals of every function: 0 $fp (i32: $sp at the entry; the arguments are above it),
+# 1 $fb (i32: $sp after the prologue; the frame slots are above it), 2 and 3 scratch i64 (2 also
+# holds the value being pushed); more are added by new_local. Few locals: every wasm frame takes
+# room in the engine's own stack, and a browser's stack must hold thousands of nested calls
+const L_FP = 0
+const L_FB = 1
+const L_T = 2
+const L_T2 = 3
+
+struct Fn {
+  g: *Gen
+  b: *bytes.Buffer
+  u: *Unit
+  is_top: bool
+  locals: map[str]*Var
+  nloc: int
+  caps: map[str]*Var
+  env_off: int
+  rnames: []str
+  has_rn: bool
+  ret_t: str
+  celled_set: map[str]bool
+  fnode: *ast.Node
+  rec: *Var                   # defer record (nil: no defer)
+  saved: []*Var               # with defer: the results while the defers run
+  body_id: int                # with defer: the block a return leaves
+  loops: []*Loop
+  tmp_load: *Var
+  wl: []int                   # types of the wasm locals
+  ctl: []int                  # open blocks (ids), innermost last
+  next_id: int
+  slot_fix: []int             # (position, offset) of frame slot offsets to patch
+  frame_fix: int              # position of the frame size in the prologue
+}
+
+# ---- emitting ----
+fn (f: *Fn) op(x: int) { f.b.byte(x) }
+fn (f: *Fn) op2(x: int, y: int) {
+  f.b.byte(x)
+  f.b.byte(y)
+}
+fn (f: *Fn) i64c(v: int) {
+  f.b.byte(0x42)
+  W.sleb(f.b, v)
+}
+fn (f: *Fn) i32c(v: int) {
+  f.b.byte(0x41)
+  W.sleb(f.b, v)
+}
+fn (f: *Fn) lget(i: int) {
+  f.b.byte(0x20)
+  W.uleb(f.b, i)
+}
+fn (f: *Fn) lset(i: int) {
+  f.b.byte(0x21)
+  W.uleb(f.b, i)
+}
+fn (f: *Fn) ltee(i: int) {
+  f.b.byte(0x22)
+  W.uleb(f.b, i)
+}
+fn (f: *Fn) gget(i: int) {
+  f.b.byte(0x23)
+  W.uleb(f.b, i)
+}
+fn (f: *Fn) gset(i: int) {
+  f.b.byte(0x24)
+  W.uleb(f.b, i)
+}
+fn (f: *Fn) mem(op: int, align: int, off: int) {
+  f.b.byte(op)
+  W.uleb(f.b, align)
+  W.uleb(f.b, off)
+}
+fn (f: *Fn) new_local(t: int) -> int {
+  f.wl = append(f.wl, t)
+  return len(f.wl) - 1
+}
+fn (f: *Fn) call_fn(name: str) {
+  f.b.byte(0x10)
+  W.uleb(f.b, f.g.m.func(name, f.g.t0).index)
+}
+fn (f: *Fn) call_helper(name: str) {
+  f.b.byte(0x10)
+  W.uleb(f.b, f.g.m.by_name[name].index)
+}
+fn (f: *Fn) wrap() { f.op(0xA7) }                     # i32.wrap_i64
+# i64 address on the stack -> the i64 at addr + off
+fn (f: *Fn) load_at_off(off: int) {
+  f.wrap()
+  f.mem(0x29, 3, off)
+}
+fn (f: *Fn) addr_of(sym: str) { f.g.m.addr(f.b, sym, 0) }      # i64.const address
+
+# structured control: every block gets an id; br finds its depth
+fn (f: *Fn) open(opcode: int, bt: int) -> int {
+  f.op(opcode)
+  f.op(bt)
+  f.next_id++
+  f.ctl = append(f.ctl, f.next_id)
+  return f.next_id
+}
+fn (f: *Fn) block() -> int { return f.open(0x02, 0x40) }
+fn (f: *Fn) loop_() -> int { return f.open(0x03, 0x40) }
+fn (f: *Fn) if_() -> int { return f.open(0x04, 0x40) }
+fn (f: *Fn) if_i64() -> int { return f.open(0x04, 0x7E) }
+fn (f: *Fn) else_() { f.op(0x05) }
+fn (f: *Fn) end() {
+  f.op(0x0B)
+  f.ctl = f.ctl[:len(f.ctl) - 1]
+}
+fn (f: *Fn) depth(id: int) -> int {
+  for i := len(f.ctl) - 1; i >= 0; i-- { if f.ctl[i] == id { return len(f.ctl) - 1 - i } }
+  panic("wasm: block not open")
+  return 0
+}
+fn (f: *Fn) br(id: int) {
+  f.op(0x0C)
+  W.uleb(f.b, f.depth(id))
+}
+fn (f: *Fn) br_if(id: int) {
+  f.op(0x0D)
+  W.uleb(f.b, f.depth(id))
+}
+
+# ---- the stack in memory ----
+# i64 -> pushed (inline: $sp -= 8; [$sp] = v, through L_T: no caller keeps a value in L_T
+# across a push)
+fn (f: *Fn) push() {
+  f.lset(L_T)
+  f.gget(G_SP)
+  f.i32c(8)
+  f.op(0x6B)
+  f.gset(G_SP)
+  f.gget(G_SP)
+  f.lget(L_T)
+  f.mem(0x37, 3, 0)
+}
+# -> i64 ([$sp]; $sp += 8)
+fn (f: *Fn) pop() {
+  f.gget(G_SP)
+  f.mem(0x29, 3, 0)
+  f.gget(G_SP)
+  f.i32c(8)
+  f.op(0x6A)
+  f.gset(G_SP)
+}
+fn (f: *Fn) pop_n(k: int) {
+  if k == 0 { return }
+  f.gget(G_SP)
+  f.i32c(8 * k)
+  f.op(0x6A)
+  f.gset(G_SP)
+}
+# the i64 at [sp + 8k] (k-th value from the top of the memory stack)
+fn (f: *Fn) peek(k: int) {
+  f.gget(G_SP)
+  f.mem(0x29, 3, 8 * k)
+}
+
+# ---- variables ----
+fn (f: *Fn) new_slot() -> int {
+  f.nloc++
+  return -8 * f.nloc
+}
+# address base and memarg of a slot (the offset of a frame slot is patched with the frame size)
+fn (f: *Fn) slot_mem(op: int, v: *Var) {
+  if v.off >= 0 {
+    f.mem(op, 3, v.off)
+    return
+  }
+  f.b.byte(op)
+  W.uleb(f.b, 3)
+  f.slot_fix = append(f.slot_fix, f.b.len())
+  f.slot_fix = append(f.slot_fix, v.off)
+  f.b.zeros(5)
+}
+fn (f: *Fn) slot_base(v: *Var) {
+  if v.off >= 0 { f.lget(L_FP) } else { f.lget(L_FB) }
+}
+fn (f: *Fn) load_slot(v: *Var) {
+  if v.cap >= 0 {
+    f.lget(L_FP)
+    f.mem(0x29, 3, f.env_off)
+    f.load_at_off(8 + 8 * v.cap)
+    return
+  }
+  if v.sym != "" {
+    f.g.m.addr32(f.b, v.sym, 0)
+    f.mem(0x29, 3, 0)
+    return
+  }
+  f.slot_base(v)
+  f.slot_mem(0x29, v)
+}
+fn (f: *Fn) store_slot(v: *Var) {
+  f.lset(L_T)
+  if v.sym != "" {
+    f.g.m.addr32(f.b, v.sym, 0)
+    f.lget(L_T)
+    f.mem(0x37, 3, 0)
+    return
+  }
+  f.slot_base(v)
+  f.lget(L_T)
+  f.slot_mem(0x37, v)
+}
+fn (f: *Fn) load_v(v: *Var) {
+  f.load_slot(v)
+  if v.celled { f.load_at_off(0) }
+}
+fn (f: *Fn) store_v(v: *Var, decl: bool) {
+  if !v.celled {
+    f.store_slot(v)
+    return
+  }
+  if decl {
+    f.push()
+    f.rt("rt_cell", 1)
+    f.store_slot(v)
+    return
+  }
+  f.lset(L_T2)
+  f.load_slot(v)
+  f.wrap()
+  f.lget(L_T2)
+  f.mem(0x37, 3, 0)
+}
+fn (f: *Fn) add_decl(name: str, t: str, n: *ast.Node) {
+  if name == "_" { return }
+  scope := f.locals
+  if f.is_top { scope = f.u.globals }
+  prev, ok := scope[name]
+  if ok {
+    if t != "·mixed" && prev.t != "any" && f.g.cls(prev.t, n) != f.g.cls(t, n) {
+      nfail("the variable \"" + types.bare(name) + "\" is declared with different types", n)
+    }
+    return
+  }
+  if t == "·mixed" { t = "any" }
+  if f.is_top {
+    sym := f.u.p + ".g." + name
+    f.g.data_sym(sym, 8)
+    f.g.m.data.u64(0)
+    scope[name] = &Var{off: 0, sym: sym, t: t, celled: f.u.celled[name], cap: -1}
+  } else {
+    scope[name] = &Var{off: f.new_slot(), sym: "", t: t, celled: f.celled_set[name], cap: -1}
+  }
+}
+fn (f: *Fn) decls_list(xs: []*ast.Node) { for _, x := range xs { f.decls(x) } }
+fn (f: *Fn) decls(n: *ast.Node) {
+  if n == nil { return }
+  switch n.kind {
+  case "Func", "FuncLit", "Extern", "Struct": return
+  case "Assign": if n.decl != "" { f.add_decl(n.name, n.ty, n) }
+  case "ForTo": f.add_decl(n.name, n.ty, n)
+  case "VarDecl":
+    for i, nm := range n.names {
+      t := ""
+      if i < len(n.types) { t = n.types[i] }
+      f.add_decl(nm, t, n)
+    }
+  case "Range": if n.define { for _, v := range n.vars { f.add_decl(v.name, v.ty, n) } }
+  case "TypeSwitch":
+    if n.bind != "" && n.bind != "_" { f.add_decl(n.bind, "·mixed", n) }
+    for _, c := range n.cases { f.decls_list(c.stmts) }
+  case "Select": nfail("select is not supported yet", n)
+  }
+  f.decls_list(n.stmts)
+  f.decls(n.body)
+  f.decls(n.then)
+  f.decls(n.otherwise)
+  f.decls(n.init)
+  f.decls(n.post)
+  if n.kind == "Switch" { for _, c := range n.cases { f.decls_list(c.stmts) } }
+}
+fn has_defer_list(xs: []*ast.Node) -> bool {
+  for _, x := range xs { if has_defer(x) { return true } }
+  return false
+}
+fn has_defer(n: *ast.Node) -> bool {
+  if n == nil { return false }
+  if n.kind == "Defer" { return true }
+  if n.kind == "FuncLit" || n.kind == "Func" { return false }
+  for _, k := range []*ast.Node{n.value, n.left, n.right, n.arg, n.expr, n.obj, n.index, n.lo, n.hi, n.key, n.ch, n.call, n.fn_,
+      n.cond, n.init, n.post, n.then, n.otherwise, n.tag, n.subject, n.from_, n.to_, n.body, n.target, n.recv} {
+    if has_defer(k) { return true }
+  }
+  for _, xs := range [][]*ast.Node{n.stmts, n.args, n.values, n.targets, n.exprs, n.cases, n.elems, n.fields, n.methods, n.embeds, n.vars, n.sfields} {
+    if has_defer_list(xs) { return true }
+  }
+  return false
+}
+fn (f: *Fn) hidden() -> *Var {
+  if f.is_top {
+    f.g.hidden_n++
+    sym := f.u.p + ".h." + str(f.g.hidden_n)
+    f.g.data_sym(sym, 8)
+    f.g.m.data.u64(0)
+    return &Var{sym: sym, cap: -1}
+  }
+  return &Var{off: f.new_slot(), cap: -1}
+}
+fn (f: *Fn) lookup(name: str, n: *ast.Node) -> *Var {
+  v, ok := f.locals[name]
+  if ok { return v }
+  c, ok2 := f.caps[name]
+  if ok2 { return c }
+  gl, ok3 := f.u.globals[name]
+  if ok3 { return gl }
+  nfail("variable \"" + types.bare(name) + "\" not found", n)
+  return nil
+}
+# address of the defer record (i64)
+fn (f: *Fn) rec_addr() {
+  if f.rec.sym != "" {
+    f.addr_of(f.rec.sym)
+    return
+  }
+  f.lget(L_FB)
+  f.op(0xAD)                                          # i64.extend_i32_u
+  f.b.byte(0x42)
+  f.slot_fix = append(f.slot_fix, -1 - f.b.len())    # (negative position: an i64.const)
+  f.slot_fix = append(f.slot_fix, f.rec.off)
+  f.b.zeros(5)
+  f.op(0x7C)
+}
+
+# ---- runtime calls, errors, depth ----
+fn never_returns(name: str) -> bool {
+  return name == "rt_fail" || name == "rt_index_fail" || name == "rt_nil_index" || name == "rt_slice_fail" || name == "rt_nil_call" || name == "rt_panic_val"
+}
+# calls a runtime function with the arguments already pushed; its result on the wasm stack
+fn (f: *Fn) rt(name: str, nargs: int) {
+  f.call_fn(f.g.rt_call(name))
+  if never_returns(name) {
+    f.op(0x00)                                        # unreachable
+    return
+  }
+  f.pop_n(nargs)
+}
+fn (f: *Fn) push_desc(t: str, n: *ast.Node) {
+  f.addr_of(f.g.desc(t, n))
+  f.push()
+}
+fn (f: *Fn) where_arg(n: *ast.Node) {
+  f.addr_of(f.g.str_lit(f.g.where_text(n)))
+  f.push()
+}
+fn (f: *Fn) fail_here(n: *ast.Node, msg: str) {
+  f.where_arg(n)
+  f.addr_of(f.g.str_lit(msg))
+  f.push()
+  f.rt("rt_fail", 2)
+}
+# i32 condition on the stack: when true, the runtime error msg
+fn (f: *Fn) fail_if(n: *ast.Node, msg: str) {
+  f.if_()
+  f.fail_here(n, msg)
+  f.end()
+}
+# i64 on the stack (kept): error if it is 0
+fn (f: *Fn) nil_check(n: *ast.Node, msg: str) {
+  f.ltee(L_T)
+  f.lget(L_T)
+  f.op(0x50)                                          # i64.eqz
+  f.fail_if(n, msg)
+}
+fn (f: *Fn) depth_in(n: *ast.Node) {
+  if f.u.is_runtime { return }
+  f.gget(G_DEPTH)
+  f.i64c(1)
+  f.op(0x7D)
+  f.gset(G_DEPTH)
+  f.gget(G_DEPTH)
+  f.i64c(0)
+  f.op(0x53)                                          # i64.lt_s
+  f.fail_if(n, "Too much recursion: more than 10,000 nested function calls")
+}
+fn (f: *Fn) depth_out() {
+  if f.u.is_runtime { return }
+  f.gget(G_DEPTH)
+  f.i64c(1)
+  f.op(0x7C)
+  f.gset(G_DEPTH)
+}
+fn (f: *Fn) call_user(nm: str, n: *ast.Node, nargs: int) {
+  f.depth_in(n)
+  f.call_fn(f.u.p + ".f." + nm)
+  f.depth_out()
+  f.pop_n(nargs)
+}
+# calls the closure whose object is pushed below the nargs arguments (call_indirect)
+fn (f: *Fn) call_closure(nargs: int) {
+  f.peek(nargs)
+  f.load_at_off(0)
+  f.wrap()
+  f.op(0x11)
+  W.uleb(f.b, f.g.t0)
+  f.op(0)
+}
+
+# ---- results ----
+fn (f: *Fn) gret_store(i: int) {                        # i64 -> g.ret[i]
+  f.lset(L_T)
+  f.g.m.addr32(f.b, "g.ret", 8 * i)
+  f.lget(L_T)
+  f.mem(0x37, 3, 0)
+}
+fn (f: *Fn) gret_load(i: int) {
+  f.g.m.addr32(f.b, "g.ret", 8 * i)
+  f.mem(0x29, 3, 0)
+}
+fn (f: *Fn) load_results() {
+  for i := len(f.rnames) - 1; i >= 0; i-- {
+    f.load_v(f.lookup(f.rnames[i], nil))
+    if i > 0 { f.gret_store(i) }
+  }
+}
+# the epilogue: the result (on the stack) goes back to the caller
+fn (f: *Fn) epilogue() {
+  f.lget(L_FP)
+  f.gset(G_SP)
+  f.op(0x0F)                                          # return
+}
+# leaves with the result on the stack (and the others in g.ret)
+fn (f: *Fn) ret_jump(n: *ast.Node) {
+  if f.rec == nil {
+    f.epilogue()
+    return
+  }
+  nres := len(results_of_t(f.ret_t))
+  f.store_slot(f.saved[0])
+  for i := 1; i < nres; i++ {
+    f.gret_load(i)
+    f.store_slot(f.saved[i])
+  }
+  f.br(f.body_id)
+}
+
+fn (g: *Gen) gen_function(u: *Unit, label: str, params: []str, ptypes: []str, body: []*ast.Node, ret_t: str, is_top: bool,
+    celled_set: map[str]bool, fnode: *ast.Node, is_lit: bool, cap_types: []str) {
+  f := &Fn{g: g, b: bytes.new_buffer(1024), u: u, is_top: is_top, locals: map[str]*Var{}, nloc: 0, caps: map[str]*Var{},
+    env_off: 8 * len(params), rnames: []str{}, has_rn: false, ret_t: ret_t, celled_set: celled_set, fnode: fnode, rec: nil,
+    saved: []*Var{}, loops: []*Loop{}, wl: []int{W.I32, W.I32, W.I64, W.I64}, ctl: []int{}, slot_fix: []int{}}
+  pvars := []*Var{}
+  if !is_top {
+    n := len(params)
+    for i, p := range params {
+      v := &Var{off: 8 * (n - 1 - i), t: ptypes[i], celled: celled_set[p], cap: -1}
+      f.locals[p] = v
+      pvars = append(pvars, v)
+    }
+  }
+  if is_lit {
+    for i, nm := range fnode.captures { f.caps[nm] = &Var{cap: i, celled: true, t: cap_types[i]} }
+  }
+  if fnode != nil && len(fnode.rnames) > 0 {
+    f.rnames = fnode.rnames
+    f.has_rn = true
+  }
+  if f.has_rn {
+    rs := results_of_t(ret_t)
+    for i, nm := range f.rnames { f.add_decl(nm, rs[i], fnode) }
+  }
+  f.decls_list(body)
+
+  # prologue: $fp = $sp; $fb = $sp = $fp - frame (the frame size is patched at the end)
+  f.gget(G_SP)
+  f.ltee(L_FP)
+  f.op(0x41)
+  f.frame_fix = f.b.len()
+  f.b.zeros(5)
+  f.op(0x6B)
+  f.ltee(L_FB)
+  f.gset(G_SP)
+  # celled parameters: the cell replaces the value
+  for _, v := range pvars {
+    if v.celled {
+      f.load_slot(v)
+      f.push()
+      f.rt("rt_cell", 1)
+      f.store_slot(v)
+    }
+  }
+  hd := has_defer_list(body)
+  if hd {
+    if is_top {
+      f.rec = &Var{sym: u.p + ".dr", cap: -1}
+      g.data_sym(f.rec.sym, 8)
+      g.m.data.zeros(48)
+    } else {
+      for i := 0; i < 6; i++ { f.rec = &Var{off: f.new_slot(), cap: -1} }
+    }
+    r := f.new_local(W.I64)
+    f.rec_addr()
+    f.lset(r)
+    f.lget(r)
+    f.wrap()
+    f.g.m.addr32(f.b, "r.g.rt_dtop", 0)
+    f.mem(0x29, 3, 0)
+    f.mem(0x37, 3, 0)
+    f.lget(r)
+    f.wrap()
+    f.i64c(0)
+    f.mem(0x37, 3, 8)
+    f.lget(r)
+    f.wrap()
+    f.lget(L_FP)
+    f.op(0xAD)
+    f.mem(0x37, 3, 16)
+    f.lget(r)
+    f.wrap()
+    f.gget(G_DEPTH)
+    f.mem(0x37, 3, 32)
+    f.g.m.addr32(f.b, "r.g.rt_dtop", 0)
+    f.lget(r)
+    f.mem(0x37, 3, 0)
+    nres := 0
+    if !is_top { nres = len(results_of_t(ret_t)) }
+    ns := nres
+    if ns < 1 { ns = 1 }
+    for i := 0; i < ns; i++ { f.saved = append(f.saved, f.hidden()) }
+  }
+  if f.has_rn {
+    rs := results_of_t(ret_t)
+    for i, nm := range f.rnames {
+      f.push_desc(rs[i], fnode)
+      f.rt("rt_zero", 1)
+      f.store_v(f.locals[nm], true)
+    }
+  }
+  if !hd {
+    for _, st := range body { f.stmt(st) }
+    if is_top { f.i64c(0) } else if f.has_rn { f.load_results() } else { f.i64c(0) }
+    f.epilogue()
+  } else {
+    # block $done { loop $again { try { if phase == 0 { block $body { body } } run the defers; br $done }
+    # catch $jump { not this frame: rethrow; recovered: phase = 1; br $again } } }
+    phase := f.new_local(W.I32)
+    done := f.block()
+    again := f.loop_()
+    f.op2(0x06, 0x40)                                  # try
+    f.next_id++
+    try_id := f.next_id
+    f.ctl = append(f.ctl, try_id)
+    f.lget(phase)
+    f.op(0x45)                                         # i32.eqz
+    f.if_()
+    f.body_id = f.block()
+    for _, st := range body { f.stmt(st) }
+    if is_top || !f.has_rn {
+      f.i64c(0)
+      f.store_slot(f.saved[0])
+    }
+    f.end()
+    f.end()
+    f.rec_addr()
+    f.push()
+    f.rt("rt_run_defers", 1)
+    f.op(0x1A)
+    f.br(done)
+    f.op2(0x07, 0)                                     # catch $jump
+    f.lget(L_FP)
+    f.op(0xAD)
+    f.op(0x52)                                         # i64.ne
+    f.if_()
+    f.op2(0x09, 1)                                     # rethrow (the try, one level out)
+    f.end()
+    # recovered: back to this frame, rt_dtop = this record, the depth at the entry
+    f.lget(L_FB)
+    f.gset(G_SP)
+    r := f.new_local(W.I64)
+    f.rec_addr()
+    f.lset(r)
+    f.g.m.addr32(f.b, "r.g.rt_dtop", 0)
+    f.lget(r)
+    f.mem(0x37, 3, 0)
+    f.lget(r)
+    f.load_at_off(32)
+    f.gset(G_DEPTH)
+    if !f.has_rn && !is_top {
+      for i, t := range results_of_t(ret_t) {
+        f.push_desc(t, fnode)
+        f.rt("rt_zero", 1)
+        f.store_slot(f.saved[i])
+      }
+    }
+    f.i32c(1)
+    f.lset(phase)
+    f.br(again)
+    f.end()                                            # (try)
+    f.end()                                            # (loop)
+    f.end()                                            # (block)
+    if f.has_rn {
+      f.load_results()
+    } else {
+      nres := 0
+      if !is_top { nres = len(results_of_t(ret_t)) }
+      for i := 1; i < nres; i++ {
+        f.load_slot(f.saved[i])
+        f.gret_store(i)
+      }
+      f.load_slot(f.saved[0])
+    }
+    f.epilogue()
+  }
+  f.finish_fn(label)
+}
+# patches the frame size and the slot offsets, and hands the body to the module
+fn (f: *Fn) finish_fn(label: str) {
+  frame := (8 * f.nloc + 15) / 16 * 16
+  if f.frame_fix > 0 || f.b.len() > 0 { sleb5(f.b, f.frame_fix, frame) }
+  for i := 0; i < len(f.slot_fix); i += 2 {
+    at := f.slot_fix[i]
+    v := frame + f.slot_fix[i + 1]
+    if at < 0 { sleb5(f.b, -1 - at, v) } else { uleb5(f.b, at, v) }
+  }
+  f.op(0x00)                                           # (the end is never reached: every path returns)
+  f.g.m.define(label, f.g.t0, f.wl[0:], f.b)
+}
+fn uleb5(b: *bytes.Buffer, at: int, v: int) {
+  for i := 0; i < 4; i++ {
+    b.set(at + i, (v & 127) | 128)
+    v = v >> 7
+  }
+  b.set(at + 4, v & 127)
+}
+fn sleb5(b: *bytes.Buffer, at: int, v: int) { uleb5(b, at, v) }    # (v >= 0 and below 2^34)
+
+# ---- helper functions (real wasm parameters) ----
+fn (g: *Gen) helper(name: str, params: []int, results: []int, locals: []int, code: *bytes.Buffer) {
+  ti := g.m.func_type(params, results)
+  g.m.func(name, ti)
+  g.m.define(name, ti, locals, code)
+}
+fn hb(g: *Gen) -> *Fn { return &Fn{g: g, b: bytes.new_buffer(128), ctl: []int{}} }
+fn (g: *Gen) gen_helpers() {
+  # h.push(v): $sp -= 8; [$sp] = v
+  f := hb(g)
+  f.gget(G_SP)
+  f.i32c(8)
+  f.op(0x6B)
+  f.gset(G_SP)
+  f.gget(G_SP)
+  f.lget(0)
+  f.mem(0x37, 3, 0)
+  g.helper("h.push", []int{W.I64}, []int{}, []int{}, f.b)
+  # h.pop() -> [$sp]; $sp += 8
+  f = hb(g)
+  f.gget(G_SP)
+  f.mem(0x29, 3, 0)
+  f.gget(G_SP)
+  f.i32c(8)
+  f.op(0x6A)
+  f.gset(G_SP)
+  g.helper("h.pop", []int{}, []int{W.I64}, []int{}, f.b)
+  # h.f2i(bits): cvttsd2si (NaN and out of range give the smallest int64)
+  f = hb(g)
+  f.lget(0)
+  f.op(0xBF)
+  f.lset(1)
+  f.lget(1)
+  f.lget(1)
+  f.op(0x61)                                           # f64.eq: not NaN
+  f.lget(1)
+  f.b.byte(0x44)
+  f.b.u64(0x43E0000000000000)                          # 2^63
+  f.op(0x63)                                           # f64.lt
+  f.op(0x71)
+  f.lget(1)
+  f.b.byte(0x44)
+  f.b.u64(-4332462841530417152)                        # -2^63 (0xC3E0000000000000)
+  f.op(0x66)                                           # f64.ge
+  f.op(0x71)
+  f.if_i64()
+  f.lget(1)
+  f.op(0xB0)                                           # i64.trunc_f64_s
+  f.else_()
+  f.i64c(-9223372036854775807 - 1)
+  f.end()
+  g.helper("h.f2i", []int{W.I64}, []int{W.I64}, []int{W.F64}, f.b)
+  # h.f2c(bits): int(x) of a num: NaN and infinities give 0, the rest as h.f2i
+  f = hb(g)
+  f.lget(0)
+  f.op(0xBF)
+  f.ltee(1)
+  f.lget(1)
+  f.op(0xA1)                                           # x - x: 0 when finite, NaN otherwise
+  f.lget(1)
+  f.lget(1)
+  f.op(0xA1)
+  f.op(0x61)
+  f.if_i64()
+  f.lget(0)
+  f.call_helper("h.f2i")
+  f.else_()
+  f.i64c(0)
+  f.end()
+  g.helper("h.f2c", []int{W.I64}, []int{W.I64}, []int{W.F64}, f.b)
+}
+fn (f: *Fn) f2i() { f.call_helper("h.f2i") }
+
+# _start (exported): the runtime's globals, the collector's ranges, rt_init, the program, rt_exit(0)
+fn (g: *Gen) gen_start() {
+  f := &Fn{g: g, b: bytes.new_buffer(512), ctl: []int{}, wl: []int{W.I32, W.I32, W.I64, W.I64}}
+  f.call_fn("r.top")
+  f.op(0x1A)
+  f.g.m.addr32(f.b, "r.g.rt_stack_top", 0)
+  f.gget(G_SP)
+  f.op(0xAD)
+  f.mem(0x37, 3, 0)
+  f.g.m.addr32(f.b, "r.g.rt_data_lo", 0)
+  f.addr_of("g.data_lo")
+  f.mem(0x37, 3, 0)
+  f.g.m.addr32(f.b, "r.g.rt_data_hi", 0)
+  f.addr_of("g.data_hi")
+  f.mem(0x37, 3, 0)
+  f.call_fn(g.rt_call("rt_init"))
+  f.op(0x1A)
+  gs := []str{"rt_d_int", "rt_d_num", "rt_d_bool", "rt_d_str", "rt_d_any", "rt_d_err"}
+  ts := []str{"int", "num", "bool", "str", "any", "·errstr"}
+  for i := 0; i < len(gs); i++ {
+    f.g.m.addr32(f.b, "r.g." + gs[i], 0)
+    f.addr_of(g.desc(ts[i], nil))
+    f.mem(0x37, 3, 0)
+  }
+  f.call_fn("u.top")
+  f.op(0x1A)
+  f.i64c(0)
+  f.push()
+  f.call_fn(g.rt_call("rt_exit"))
+  f.op(0x1A)
+  ti := g.m.func_type([]int{}, []int{})
+  g.m.func("_start", ti)
+  g.m.define("_start", ti, f.wl, f.b)
+  g.m.export_func("_start", "_start")
+}
+
+# rt.calldefer(node): calls the closure of a defer node [next, closure, n, arguments...]
+fn (g: *Gen) gen_calldefer() {
+  f := &Fn{g: g, b: bytes.new_buffer(256), ctl: []int{}, wl: []int{W.I32, W.I32, W.I64, W.I64}}
+  nd := f.new_local(W.I64)
+  cnt := f.new_local(W.I64)
+  p := f.new_local(W.I64)
+  f.gget(G_SP)
+  f.lset(L_FP)
+  f.lget(L_FP)
+  f.mem(0x29, 3, 0)
+  f.lset(nd)
+  f.lget(nd)
+  f.load_at_off(8)
+  f.push()                                             # the closure before the arguments
+  f.lget(nd)
+  f.load_at_off(16)
+  f.lset(cnt)
+  f.lget(nd)
+  f.i64c(24)
+  f.op(0x7C)
+  f.lset(p)
+  out := f.block()
+  top := f.loop_()
+  f.lget(cnt)
+  f.op(0x50)
+  f.br_if(out)
+  f.lget(p)
+  f.load_at_off(0)
+  f.push()
+  f.lget(p)
+  f.i64c(8)
+  f.op(0x7C)
+  f.lset(p)
+  f.lget(cnt)
+  f.i64c(1)
+  f.op(0x7D)
+  f.lset(cnt)
+  f.br(top)
+  f.end()
+  f.end()
+  f.lget(nd)
+  f.load_at_off(8)
+  f.load_at_off(0)
+  f.wrap()
+  f.op(0x11)
+  W.uleb(f.b, g.t0)
+  f.op(0)
+  f.lget(L_FP)
+  f.gset(G_SP)
+  f.op(0x0F)
+  f.op(0x00)
+  g.m.define("rt.calldefer", g.t0, f.wl, f.b)
+}
+
+# u.t.Type.method: a bound method value; the receiver is in the closure [code, receiver]
+fn (g: *Gen) gen_bound_thunk(key: str, bt: *BoundThunk) {
+  fd := bt.f
+  n := len(fd.params) - 1
+  f := &Fn{g: g, b: bytes.new_buffer(256), u: bt.u, ctl: []int{}, wl: []int{W.I32, W.I32, W.I64, W.I64}}
+  f.gget(G_SP)
+  f.lset(L_FP)
+  f.lget(L_FP)
+  f.mem(0x29, 3, 8 * n)
+  f.load_at_off(8)
+  if !strings.has_prefix(fd.ptypes[0], "*") {
+    f.push()
+    f.push_desc(fd.ptypes[0], fd)
+    f.rt("rt_copy_val", 2)
+  }
+  f.push()
+  for i := 0; i < n; i++ {
+    f.lget(L_FP)
+    f.mem(0x29, 3, 8 * (n - 1 - i))
+    f.push()
+  }
+  f.call_fn(bt.u.p + ".f." + fd.name)
+  f.lget(L_FP)
+  f.gset(G_SP)
+  f.op(0x0F)
+  f.op(0x00)
+  g.m.define(key, g.t0, f.wl, f.b)
+}
+
+# ---- expressions: one i64 on the wasm stack ----
+fn fresh(n: *ast.Node) -> bool {
+  if n.kind == "Paren" { return fresh(n.expr) }
+  k := n.kind
+  return !(k == "Var" || k == "Field" || k == "Index" || k == "Deref" || k == "TypeAssert")
+}
+fn is_simple(n: *ast.Node) -> bool {
+  k := n.kind
+  return k == "Number" || k == "String" || k == "Bool" || k == "Nil" || (k == "Var" && !n.fn_ref)
+}
+fn (f: *Fn) expr_to(n: *ast.Node, t: str) {
+  f.expr(n)
+  f.coerce(n.ty, t, n)
+}
+fn (f: *Fn) bind_value(n: *ast.Node, t: str) {
+  f.expr(n)
+  if !fresh(n) && f.g.is_value_type(n.ty) {
+    f.push()
+    f.push_desc(n.ty, n)
+    f.rt("rt_copy_val", 2)
+  }
+  if t == "" { t = n.ty }
+  f.coerce(n.ty, t, n)
+}
+# fits the value to integer kind k (int8 wraps at 8 bits...; 10: rounds to float32)
+fn (f: *Fn) wrap_kind(k: int) {
+  switch k {
+  case 1: f.op(0xC2)
+  case 2: f.op(0xC3)
+  case 3: f.op(0xC4)
+  case 6:
+    f.i64c(255)
+    f.op(0x83)
+  case 7:
+    f.i64c(65535)
+    f.op(0x83)
+  case 8:
+    f.i64c(4294967295)
+    f.op(0x83)
+  case 10:
+    f.op(0xBF)
+    f.op(0xB6)
+    f.op(0xBB)
+    f.op(0xBD)
+  }
+}
+fn (f: *Fn) coerce(src: str, dst: str, n: *ast.Node) {
+  g := f.g
+  if src == "" || dst == "" || dst == "void" || src == "void" { return }
+  fi := g.is_iface_t(src)
+  ti := g.is_iface_t(dst)
+  if ti && !fi {
+    if types.dflt(src) == "nil" { return }
+    if src[0] == 40 { nfail("multiple results do not fit in a single value", n) }
+    f.push()
+    if types.dflt(src) == "int" {
+      f.rt("rt_box_int", 1)
+      return
+    }
+    f.push_desc(src, n)
+    f.rt("rt_box", 2)
+    return
+  }
+  if fi && !ti {
+    if types.dflt(dst) == "nil" { return }
+    f.lset(L_T2)
+    f.where_arg(n)
+    f.lget(L_T2)
+    f.push()
+    f.push_desc(dst, n)
+    f.rt("rt_unbox", 3)
+    return
+  }
+  if fi && ti { return }
+  a := g.cls(src, n)
+  b := g.cls(dst, n)
+  if a == "i" && b == "f" {
+    if kind_code(src) == 5 || kind_code(src) == 9 { f.op(0xBA) } else { f.op(0xB9) }
+    f.op(0xBD)
+    if types.dflt(dst) == "float32" { f.wrap_kind(10) }
+  } else if a == "f" && b == "f" && types.dflt(dst) == "float32" && types.dflt(src) != "float32" {
+    f.wrap_kind(10)
+  }
+}
+# value -> 0/1 (i64)
+fn (f: *Fn) truthy(t: str, n: *ast.Node) {
+  if f.g.is_iface_t(t) {
+    f.push()
+    f.rt("rt_truthy", 1)
+    return
+  }
+  c := f.g.cls(t, n)
+  if c == "f" {
+    f.op(0xBF)
+    f.b.byte(0x44)
+    f.b.u64(0)
+    f.op(0x62)
+    f.op(0xAD)
+    return
+  }
+  if c == "s" { f.load_at_off(0) }
+  f.i64c(0)
+  f.op(0x52)
+  f.op(0xAD)
+}
+# a condition as an i32
+fn (f: *Fn) cond(n: *ast.Node) {
+  if n.kind == "Paren" && n.expr.ty == "bool" && n.ty == "bool" {
+    f.cond(n.expr)
+    return
+  }
+  if n.kind == "Binary" && is_cmp(n.op) {
+    f.compare(n)
+    return
+  }
+  if n.kind == "Not" && n.arg.ty == "bool" {
+    f.cond(n.arg)
+    f.op(0x45)
+    return
+  }
+  f.expr(n)
+  f.truthy(n.ty, n)
+  f.wrap()
+}
+fn is_cmp(op: str) -> bool { return op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" }
+fn (f: *Fn) to_str(t: str, n: *ast.Node) {
+  c := f.g.cls(t, n)
+  if c == "s" { return }
+  f.push()
+  if c == "p" {
+    f.push_desc(t, n)
+    f.rt("rt_val_str", 2)
+    return
+  }
+  if c == "f" {
+    f.rt("rt_num_str", 1)
+  } else if types.dflt(t) == "bool" {
+    f.rt("rt_bool_str", 1)
+  } else if is_unsigned(t) {
+    f.rt("rt_uint_str", 1)
+  } else {
+    f.rt("rt_int_str", 1)
+  }
+}
+
+fn (f: *Fn) expr(n: *ast.Node) {
+  g := f.g
+  switch n.kind {
+  case "·tmp":
+    f.load_slot(f.tmp_load)
+    return
+  case "Number":
+    if g.cls(n.ty, n) == "f" {
+      f.i64c(math.bits(n.num_value))
+    } else if n.raw != "" {
+      f.i64c(parse_raw(n.raw))
+    } else {
+      f.i64c(int(n.num_value))
+    }
+    return
+  case "String":
+    f.addr_of(g.str_lit(n.str_value))
+    return
+  case "Bool":
+    if n.bool_value { f.i64c(1) } else { f.i64c(0) }
+    return
+  case "Nil":
+    f.i64c(0)
+    return
+  case "Paren":
+    f.expr(n.expr)
+    f.coerce(n.expr.ty, n.ty, n)
+    return
+  case "Var":
+    if n.fn_ref {
+      f.addr_of(g.static_closure(f.u, n.name, n))
+      return
+    }
+    f.load_v(f.lookup(n.name, n))
+    return
+  case "Neg":
+    if g.is_iface_t(n.arg.ty) {
+      f.where_arg(n)
+      f.expr(n.arg)
+      f.push()
+      f.rt("rt_dyn_neg", 2)
+      f.coerce("any", n.ty, n)
+      return
+    }
+    f.expr(n.arg)
+    if g.cls(n.ty, n) == "f" {
+      f.coerce(n.arg.ty, n.ty, n)
+      f.i64c(-9223372036854775807 - 1)
+      f.op(0x85)
+    } else {
+      f.lset(L_T)
+      f.i64c(0)
+      f.lget(L_T)
+      f.op(0x7D)
+      f.wrap_kind(kind_code(n.ty))
+    }
+    return
+  case "BitNot":
+    f.expr(n.arg)
+    f.i64c(-1)
+    f.op(0x85)
+    f.wrap_kind(kind_code(n.ty))
+    return
+  case "Not":
+    f.expr(n.arg)
+    f.truthy(n.arg.ty, n.arg)
+    f.i64c(1)
+    f.op(0x85)
+    return
+  case "Logical":
+    f.expr(n.left)
+    f.truthy(n.left.ty, n.left)
+    f.wrap()
+    f.if_i64()
+    if n.op == "and" {
+      f.expr(n.right)
+      f.truthy(n.right.ty, n.right)
+      f.else_()
+      f.i64c(0)
+    } else {
+      f.i64c(1)
+      f.else_()
+      f.expr(n.right)
+      f.truthy(n.right.ty, n.right)
+    }
+    f.end()
+    return
+  case "Binary":
+    f.binary(n)
+    return
+  case "Call":
+    f.call(n)
+    return
+  case "MethodCall":
+    f.method(n)
+    return
+  case "StructLit", "CompositeLit":
+    f.composite(n)
+    return
+  case "Field":
+    if n.bound_method != "" {
+      f.bound_method(n)
+      return
+    }
+    ot := n.obj.ty
+    if ot == "" { ot = "any" }
+    if types.loose(types.dflt(ot)) {
+      f.where_arg(n)
+      f.expr(n.obj)
+      f.push()
+      f.addr_of(g.str_lit(n.name))
+      f.push()
+      f.rt("rt_dyn_field", 3)
+      return
+    }
+    t := f.struct_obj(n.obj, n.field_path, n.name, n)
+    f.load_at_off(8 * g.field_index(t, n.name, n))
+    return
+  case "Index":
+    f.index(n)
+    return
+  case "SliceExpr":
+    f.slice_expr(n)
+    return
+  case "FuncLit":
+    f.make_closure(n.fn_, n)
+    return
+  case "CallValue":
+    f.call_value(n, 1, nil, n.fn_.ty, n.args)
+    return
+  case "TypeAssert":
+    f.where_arg(n)
+    f.expr(n.obj)
+    f.push()
+    f.push_desc(n.type, n)
+    if n.comma_ok { f.i64c(1) } else { f.i64c(0) }
+    f.push()
+    f.rt("rt_assert", 4)
+    if n.comma_ok {
+      f.g.m.addr32(f.b, "r.g.rt_ok", 0)
+      f.mem(0x29, 3, 0)
+      f.gset(G_AUX)
+    }
+    return
+  case "AddrOf":
+    f.address(n.arg, n)
+    return
+  case "Deref":
+    f.deref(n)
+    return
+  case "Conversion":
+    f.conversion(n, n.type, n.args[0])
+    return
+  }
+  nfail(n.kind + " is not supported yet", n)
+}
+
+fn dyn_op_code(op: str) -> int {
+  switch op {
+  case "+": return 0
+  case "-": return 1
+  case "*": return 2
+  case "/": return 3
+  case "%": return 4
+  case "**": return 5
+  case "<": return 6
+  case ">": return 7
+  case "<=": return 8
+  case ">=": return 9
+  }
+  return -1
+}
+fn (f: *Fn) dyn_op(n: *ast.Node, name: str) {
+  code := dyn_op_code(n.op)
+  if code < 0 { nfail("the operation \"" + n.op + "\" on any values is not supported yet", n) }
+  f.where_arg(n)
+  f.i64c(code)
+  f.push()
+  f.expr_to(n.left, "any")
+  f.push()
+  f.expr_to(n.right, "any")
+  f.push()
+  f.rt(name, 4)
+}
+# [a][b] -> a op b, integers of kind k
+fn (f: *Fn) int_op(op: str, k: int, n: *ast.Node) {
+  uns := k >= 5 && k <= 9
+  switch op {
+  case "+": f.op(0x7C)
+  case "-": f.op(0x7D)
+  case "*": f.op(0x7E)
+  case "&": f.op(0x83)
+  case "|": f.op(0x84)
+  case "^": f.op(0x85)
+  case "&^":
+    f.i64c(-1)
+    f.op(0x85)
+    f.op(0x83)
+  case "/", "%":
+    rb := f.new_local(W.I64)
+    ra := f.new_local(W.I64)
+    f.lset(rb)
+    f.lset(ra)
+    f.lget(rb)
+    f.op(0x50)
+    if op == "/" { f.fail_if(n, "Integer division by zero") } else { f.fail_if(n, "Remainder of integer division by zero") }
+    if uns {
+      f.lget(ra)
+      f.lget(rb)
+      if op == "/" { f.op(0x80) } else { f.op(0x82) }
+    } else {
+      f.lget(rb)
+      f.i64c(-1)
+      f.op(0x51)
+      f.if_i64()
+      if op == "/" {
+        f.i64c(0)
+        f.lget(ra)
+        f.op(0x7D)
+      } else {
+        f.i64c(0)
+      }
+      f.else_()
+      f.lget(ra)
+      f.lget(rb)
+      if op == "/" { f.op(0x7F) } else { f.op(0x81) }
+      f.end()
+    }
+  case "<<", ">>":
+    rb := f.new_local(W.I64)
+    ra := f.new_local(W.I64)
+    f.lset(rb)
+    f.lset(ra)
+    f.lget(rb)
+    f.i64c(0)
+    f.op(0x53)
+    f.fail_if(n, "Negative shift")
+    f.lget(rb)
+    f.i64c(64)
+    f.op(0x53)
+    f.if_i64()
+    f.lget(ra)
+    f.lget(rb)
+    if op == "<<" { f.op(0x86) } else if uns { f.op(0x88) } else { f.op(0x87) }
+    f.else_()
+    if op == "<<" || uns {
+      f.i64c(0)
+    } else {
+      f.lget(ra)
+      f.i64c(63)
+      f.op(0x87)
+    }
+    f.end()
+  default:
+    nfail("the operation \"" + op + "\" on integers is not supported yet", n)
+  }
+  f.wrap_kind(k)
+}
+# [a][b] (bits of two nums) -> bits of a op b
+fn (f: *Fn) float_op(op: str, n: *ast.Node) {
+  rb := f.new_local(W.F64)
+  f.op(0xBF)
+  f.lset(rb)
+  f.op(0xBF)
+  if op == "/" || op == "%" {
+    f.lget(rb)
+    f.b.byte(0x44)
+    f.b.u64(0)
+    f.op(0x61)
+    if op == "/" { f.fail_if(n, "Division by zero") } else { f.fail_if(n, "Remainder of division by zero") }
+  }
+  f.lget(rb)
+  switch op {
+  case "+": f.op(0xA0)
+  case "-": f.op(0xA1)
+  case "*": f.op(0xA2)
+  case "/": f.op(0xA3)
+  case "%": f.call_helper("imp.fmod")
+  default: nfail("the operation \"" + op + "\" on numbers is not supported yet", n)
+  }
+  f.op(0xBD)
+}
+fn cmp_op(op: str, uns: bool) -> int {
+  switch op {
+  case "==": return 0x51
+  case "!=": return 0x52
+  }
+  base := 0x53
+  switch op {
+  case "<": base = 0x53
+  case ">": base = 0x55
+  case "<=": base = 0x57
+  case ">=": base = 0x59
+  }
+  if uns { return base + 1 }
+  return base
+}
+fn fcmp_op(op: str) -> int {
+  switch op {
+  case "==": return 0x61
+  case "!=": return 0x62
+  case "<": return 0x63
+  case ">": return 0x64
+  case "<=": return 0x65
+  }
+  return 0x66
+}
+# comparison -> i32
+fn (f: *Fn) compare(n: *ast.Node) {
+  g := f.g
+  op := n.op
+  lt := n.left.ty
+  rtt := n.right.ty
+  if g.is_iface_t(lt) || g.is_iface_t(rtt) {
+    if op == "==" || op == "!=" {
+      f.expr_to(n.left, "any")
+      f.push()
+      f.expr_to(n.right, "any")
+      f.push()
+      f.rt("rt_dyn_eq", 2)
+      f.wrap()
+      if op == "!=" { f.op(0x45) }
+      return
+    }
+    f.dyn_op(n, "rt_dyn_cmp")
+    f.wrap()
+    return
+  }
+  lc := g.cls(lt, n)
+  rc := g.cls(rtt, n)
+  if lc == "s" || rc == "s" {
+    if lc != "s" || rc != "s" {
+      f.expr(n.left)
+      f.op(0x1A)
+      f.expr(n.right)
+      f.op(0x1A)
+      if op == "!=" { f.i32c(1) } else { f.i32c(0) }
+      return
+    }
+    f.expr(n.left)
+    f.push()
+    f.expr(n.right)
+    f.push()
+    if op == "==" || op == "!=" {
+      f.rt("rt_streq", 2)
+      f.i64c(0)
+      if op == "==" { f.op(0x52) } else { f.op(0x51) }
+      return
+    }
+    f.rt("rt_strcmp", 2)
+    f.i64c(0)
+    f.op(cmp_op(op, false))
+    return
+  }
+  if lc == "f" || rc == "f" {
+    f.expr_to(n.left, "num")
+    f.op(0xBF)
+    f.expr_to(n.right, "num")
+    f.op(0xBF)
+    f.op(fcmp_op(op))
+    return
+  }
+  vt := ""
+  if g.is_value_type(lt) { vt = lt } else if g.is_value_type(rtt) { vt = rtt }
+  if vt != "" && (op == "==" || op == "!=") {
+    f.expr(n.left)
+    f.push()
+    f.expr(n.right)
+    f.push()
+    f.push_desc(vt, n)
+    f.rt("rt_eq", 3)
+    f.wrap()
+    if op == "!=" { f.op(0x45) }
+    return
+  }
+  # integers, booleans and pointers: the left value is not a pointer that a call could lose
+  # (a pointer compared with == is only compared), but keep the order of evaluation
+  f.expr(n.left)
+  f.push()
+  f.expr(n.right)
+  f.lset(L_T2)
+  f.pop()
+  f.lget(L_T2)
+  f.op(cmp_op(op, is_unsigned(lt) || is_unsigned(rtt)))
+}
+fn (f: *Fn) binary(n: *ast.Node) {
+  g := f.g
+  op := n.op
+  if is_cmp(op) {
+    f.compare(n)
+    f.op(0xAD)
+    return
+  }
+  if op == "+" && g.cls(n.ty, n) == "s" {
+    f.expr(n.left)
+    f.to_str(n.left.ty, n.left)
+    f.push()
+    f.expr(n.right)
+    f.to_str(n.right.ty, n.right)
+    f.push()
+    f.rt("rt_concat", 2)
+    return
+  }
+  if g.is_iface_t(n.left.ty) || g.is_iface_t(n.right.ty) {
+    f.dyn_op(n, "rt_dyn_op")
+    f.coerce("any", n.ty, n)
+    return
+  }
+  if n.ik != ast.NONE && op != "**" {
+    f.expr(n.left)
+    f.expr(n.right)
+    f.int_op(op, n.ik, n)
+    return
+  }
+  f.expr_to(n.left, "num")
+  f.expr_to(n.right, "num")
+  if op == "**" {
+    f.lset(L_T2)
+    f.push()
+    f.lget(L_T2)
+    f.push()
+    f.rt("rt_pow", 2)
+  } else {
+    f.float_op(op, n)
+  }
+  if g.cls(n.ty, n) == "i" {
+    f.f2i()
+    f.wrap_kind(kind_code(n.ty))
+  } else if n.fk != ast.NONE {
+    f.wrap_kind(n.fk)
+  }
+}
+
+# ---- fields, indexes and pointers ----
+fn (f: *Fn) follow_path(t: str, path: []str, n: *ast.Node) -> str {
+  for _, p := range path {
+    f.nil_check(n, "Access to field \"" + p + "\" through a nil pointer")
+    f.load_at_off(8 * f.g.field_index(t, p, n))
+    t = strip_ptr(types.dflt(f.g.field_type(t, p)))
+  }
+  return t
+}
+fn (f: *Fn) struct_obj(obj: *ast.Node, path: []str, name: str, n: *ast.Node) -> str {
+  f.expr(obj)
+  t := strip_ptr(types.dflt(obj.ty))
+  t = f.follow_path(t, path, n)
+  f.nil_check(n, "Access to field \"" + name + "\" through a nil pointer")
+  return t
+}
+# index out of range: i (local) against the length (local)
+fn (f: *Fn) index_check(n: *ast.Node, ri: int, rl: int) {
+  f.lget(ri)
+  f.lget(rl)
+  f.op(0x5A)                                           # i64.ge_u
+  f.if_()
+  f.where_arg(n)
+  f.lget(ri)
+  f.push()
+  f.lget(rl)
+  f.push()
+  f.rt("rt_index_fail", 3)
+  f.end()
+}
+# obj[i] of a slice or an array: the elements on the stack; returns the local with the index
+fn (f: *Fn) elem_check(n: *ast.Node, write: bool) -> int {
+  ot := strip_ptr(types.dflt(n.obj.ty))
+  k := f.g.kind_of_t(ot)
+  ri := f.new_local(W.I64)
+  rl := f.new_local(W.I64)
+  f.expr(n.obj)
+  f.push()
+  f.expr_to(n.index, "int")
+  f.lset(ri)
+  f.pop()
+  if k == "array" {
+    f.i64c(types.tinfo(ot).n)
+    f.lset(rl)
+    f.index_check(n, ri, rl)
+    return ri
+  }
+  ro := f.new_local(W.I64)
+  f.lset(ro)
+  f.lget(ro)
+  f.op(0x50)
+  f.if_()
+  f.where_arg(n)
+  f.lget(ri)
+  f.push()
+  if write { f.i64c(1) } else { f.i64c(0) }
+  f.push()
+  f.rt("rt_nil_index", 3)
+  f.end()
+  f.lget(ro)
+  f.load_at_off(8)
+  f.lset(rl)
+  f.index_check(n, ri, rl)
+  f.lget(ro)
+  f.load_at_off(0)
+  return ri
+}
+fn (f: *Fn) elem_addr(n: *ast.Node, write: bool) {
+  ri := f.elem_check(n, write)
+  f.lget(ri)
+  if !f.g.byte_elems(n.obj.ty) {
+    f.i64c(3)
+    f.op(0x86)
+  }
+  f.op(0x7C)
+}
+fn (f: *Fn) str_index(n: *ast.Node) {
+  ri := f.new_local(W.I64)
+  rl := f.new_local(W.I64)
+  rs := f.new_local(W.I64)
+  f.expr(n.obj)
+  f.push()
+  f.expr_to(n.index, "int")
+  f.lset(ri)
+  f.pop()
+  f.ltee(rs)
+  f.load_at_off(0)
+  f.lset(rl)
+  f.index_check(n, ri, rl)
+  f.lget(rs)
+  f.lget(ri)
+  f.op(0x7C)
+  f.wrap()
+  f.mem(0x31, 0, 8)                                    # i64.load8_u offset 8
+}
+fn (f: *Fn) index(n: *ast.Node) {
+  ot := types.dflt(n.obj.ty)
+  if ot == "str" {
+    f.str_index(n)
+    return
+  }
+  if f.g.kind_of_t(ot) == "map" {
+    ti := types.tinfo(ot)
+    vt := ti.val
+    f.expr(n.obj)
+    f.push()
+    f.expr_to(n.index, ti.key)
+    f.push()
+    f.rt("rt_map_get", 2)
+    f.g.m.addr32(f.b, "r.g.rt_map_ok", 0)
+    f.mem(0x29, 3, 0)
+    f.gset(G_AUX)
+    if f.g.cls(vt, n) == "s" || f.g.is_value_type(vt) {
+      rv := f.new_local(W.I64)
+      f.lset(rv)
+      f.gget(G_AUX)
+      f.op(0x50)
+      f.if_i64()
+      f.push_desc(vt, n)
+      f.rt("rt_zero", 1)
+      f.i64c(0)
+      f.gset(G_AUX)
+      f.else_()
+      f.lget(rv)
+      f.end()
+    }
+    return
+  }
+  f.elem_addr(n, false)
+  if f.g.byte_elems(n.obj.ty) {
+    f.wrap()
+    f.mem(0x31, 0, 0)
+  } else {
+    f.load_at_off(0)
+  }
+}
+fn (f: *Fn) load_at(t: str) {
+  if types.dflt(t) == "bool" {
+    f.wrap()
+    f.mem(0x31, 0, 0)
+    return
+  }
+  f.load_at_off(0)
+}
+# the value on the stack goes to the address in local la
+fn (f: *Fn) store_at_l(t: str, la: int) {
+  f.lset(L_T)
+  f.lget(la)
+  f.wrap()
+  f.lget(L_T)
+  if types.dflt(t) == "bool" { f.mem(0x3C, 0, 0) } else { f.mem(0x37, 3, 0) }
+}
+fn (f: *Fn) address(a: *ast.Node, n: *ast.Node) {
+  if a.kind == "Paren" {
+    f.address(a.expr, n)
+    return
+  }
+  if a.kind == "StructLit" || a.kind == "CompositeLit" {
+    f.expr(a)
+    if !f.g.is_value_type(a.ty) {
+      f.push()
+      f.rt("rt_cell", 1)
+    }
+    return
+  }
+  if a.kind == "Deref" {
+    f.expr(a.arg)
+    return
+  }
+  if f.g.is_value_type(a.ty) {
+    f.expr(a)
+    return
+  }
+  if a.kind == "Var" {
+    v := f.lookup(a.name, a)
+    if v.celled {
+      f.load_slot(v)
+      return
+    }
+    if v.sym != "" {
+      f.addr_of(v.sym)
+      return
+    }
+    nfail("cannot take the address of \"" + types.bare(a.name) + "\"", n)
+  }
+  if a.kind == "Field" {
+    t := f.struct_obj(a.obj, a.field_path, a.name, a)
+    f.i64c(8 * f.g.field_index(t, a.name, a))
+    f.op(0x7C)
+    return
+  }
+  if a.kind == "Index" {
+    f.elem_addr(a, false)
+    return
+  }
+  nfail("cannot take the address of this expression", n)
+}
+fn (f: *Fn) deref(n: *ast.Node) {
+  f.expr(n.arg)
+  f.nil_check(n, "Nil pointer: it points to nothing")
+  if f.g.is_value_type(n.ty) { return }
+  f.load_at(n.ty)
+}
+# the value on the stack goes into the object on top of the memory stack, at off
+fn (f: *Fn) store_top(off: int, byte: bool) {
+  f.lset(L_T)
+  f.peek(0)
+  f.wrap()
+  f.lget(L_T)
+  if byte { f.mem(0x3C, 0, off) } else { f.mem(0x37, 3, off) }
+}
+fn (f: *Fn) composite(n: *ast.Node) {
+  g := f.g
+  if n.stype != "" {
+    fs := g.struct_fields(n.stype)
+    f.i64c(8 * len(fs) + 8)
+    f.push()
+    f.rt("rt_alloc", 1)
+    f.push()
+    for i, d := range fs {
+      let given: *ast.Node = nil
+      for _, sf := range n.sfields {
+        if sf.name == d.name {
+          given = sf
+          break
+        }
+      }
+      if given != nil {
+        f.bind_value(given.value, d.type)
+      } else if types.dflt(d.type) == "str" {
+        f.addr_of(g.str_lit(""))
+      } else if !g.is_value_type(d.type) {
+        continue
+      } else {
+        f.push_desc(d.type, n)
+        f.rt("rt_zero", 1)
+      }
+      f.store_top(8 * i, false)
+    }
+    f.pop()
+    return
+  }
+  ti := types.tinfo(types.dflt(n.type))
+  if ti.k == "slice" || ti.k == "array" {
+    cnt := len(n.elems)
+    if ti.k == "array" { cnt = ti.n }
+    be := g.byte_elems(n.type)
+    if be {
+      f.i64c(cnt + 8)
+      f.push()
+      f.rt("rt_alloc_ns", 1)
+    } else {
+      f.i64c(8 * cnt + 8)
+      f.push()
+      f.rt("rt_alloc", 1)
+    }
+    f.push()
+    for i := 0; i < cnt; i++ {
+      if be {
+        if i < len(n.elems) {
+          f.bind_value(n.elems[i].value, ti.elem)
+          f.store_top(i, true)
+        }
+        continue
+      }
+      if i < len(n.elems) {
+        f.bind_value(n.elems[i].value, ti.elem)
+      } else {
+        f.push_desc(ti.elem, n)
+        f.rt("rt_zero", 1)
+      }
+      f.store_top(8 * i, false)
+    }
+    if ti.k == "slice" {
+      f.i64c(cnt)
+      f.push()
+      f.i64c(cnt)
+      f.push()
+      f.rt("rt_hdr", 3)
+    } else {
+      f.pop()
+    }
+    return
+  }
+  if ti.k == "map" {
+    f.i64c(g.map_kinds(ti))
+    f.push()
+    f.rt("rt_map_new", 1)
+    f.push()
+    for _, e := range n.elems {
+      f.where_arg(n)
+      f.peek(1)
+      f.push()
+      f.expr_to(e.key, ti.key)
+      f.push()
+      f.bind_value(e.value, ti.val)
+      f.push()
+      f.rt("rt_map_set", 4)
+      f.op(0x1A)
+    }
+    f.pop()
+    return
+  }
+  nfail("this literal is not supported yet", n)
+}
+fn (f: *Fn) slice_expr(n: *ast.Node) {
+  ot := types.dflt(n.obj.ty)
+  k := "str"
+  if ot != "str" { k = f.g.kind_of_t(strip_ptr(ot)) }
+  f.where_arg(n)
+  f.expr(n.obj)
+  f.push()
+  if k == "array" {
+    f.i64c(types.tinfo(strip_ptr(ot)).n)
+    f.push()
+  }
+  if n.lo != nil { f.expr_to(n.lo, "int") } else { f.i64c(0) }
+  f.push()
+  if n.hi != nil { f.expr_to(n.hi, "int") } else { f.i64c(-1) }
+  f.push()
+  if k != "str" {
+    f.i64c(elem_size(f.g.byte_elems(ot)))
+    f.push()
+  }
+  if k == "str" { f.rt("rt_sub_str", 4) } else if k == "array" { f.rt("rt_sub_array", 6) } else { f.rt("rt_sub_slice", 5) }
+}
+
+# ---- calls ----
+fn (f: *Fn) call(n: *ast.Node) {
+  nm := n.name
+  if n.call_kind == "builtin" {
+    f.builtin(n)
+    return
+  }
+  if n.call_kind == "conv" {
+    f.conversion(n, n.conv_to, n.args[0])
+    return
+  }
+  if n.call_kind == "func" {
+    fd, ok := f.u.funcs[nm]
+    if !ok { nfail("function " + types.bare(nm) + " not found", n) }
+    pt := param_types(fd)
+    for i, a := range n.args {
+      f.bind_value(a, at_or(pt, i))
+      f.push()
+    }
+    f.call_user(nm, n, len(n.args))
+    return
+  }
+  if n.call_kind == "extern" {
+    nfail("DLL calls (" + f.u.externs[nm].symbol + ") only exist on Windows", n)
+  }
+  if n.call_kind == "value" {
+    v := f.lookup(nm, n)
+    f.call_value(n, 0, v, v.t, n.args)
+    return
+  }
+  nfail("calling " + types.bare(nm) + " is not supported yet", n)
+}
+fn (f: *Fn) load_fn(n: *ast.Node, mode: int, v: *Var) {
+  if mode == 0 {
+    f.load_v(v)
+  } else if mode == 1 {
+    f.expr(n.fn_)
+  } else {
+    st := f.struct_obj(n.obj, n.field_path, n.name, n)
+    f.load_at_off(8 * f.g.field_index(st, n.name, n))
+  }
+}
+fn (f: *Fn) call_value(n: *ast.Node, mode: int, v: *Var, ft: str, args: []*ast.Node) {
+  if !f.g.is_func_t(ft) { nfail("calling an any value as a function is not supported yet", n) }
+  ps := types.tinfo(types.dflt(ft)).params
+  h := f.hidden()
+  f.load_fn(n, mode, v)
+  f.store_slot(h)
+  f.load_slot(h)
+  f.op(0x50)
+  f.if_()
+  f.where_arg(n)
+  f.rt("rt_nil_call", 1)
+  f.end()
+  f.load_slot(h)
+  f.push()
+  for i, a := range args {
+    pt := ""
+    if i < len(ps) { pt = ps[i] }
+    f.bind_value(a, pt)
+    f.push()
+  }
+  f.depth_in(n)
+  f.call_closure(len(args))
+  f.depth_out()
+  f.pop_n(len(args) + 1)
+}
+fn (f: *Fn) field_owner(n: *ast.Node) -> str {
+  t := strip_ptr(types.dflt(n.obj.ty))
+  for _, p := range n.field_path { t = strip_ptr(types.dflt(f.g.field_type(t, p))) }
+  return t
+}
+fn (f: *Fn) method(n: *ast.Node) {
+  if n.call_kind == "errnew" {
+    f.expr_to(n.args[0], "str")
+    f.push()
+    f.addr_of(f.g.desc("·errstr", n))
+    f.push()
+    f.rt("rt_box", 2)
+    return
+  }
+  if n.field_call {
+    fty := f.g.field_type(f.field_owner(n), n.name)
+    f.call_value(n, 2, nil, fty, n.args)
+    return
+  }
+  fd, ok := f.u.funcs[n.target_name]
+  if n.target_name == "" || !ok {
+    f.iface_call(n)
+    return
+  }
+  pt := param_types(fd)
+  f.expr(n.obj)
+  t := f.follow_path(strip_ptr(types.dflt(n.obj.ty)), n.field_path, n)
+  if !n.recv_ptr && (!fresh(n.obj) || len(n.field_path) > 0) {
+    f.push()
+    f.push_desc(t, n)
+    f.rt("rt_copy_val", 2)
+  }
+  f.push()
+  for i, a := range n.args {
+    f.bind_value(a, at_or(pt, i + 1))
+    f.push()
+  }
+  f.call_user(n.target_name, n, len(n.args) + 1)
+}
+fn (f: *Fn) iface_ptypes(n: *ast.Node) -> []str {
+  it := types.dflt(n.obj.ty)
+  I := f.g.iface_info(it)
+  if I != nil { return I.methods[n.name].ptypes }
+  out := []str{}
+  for _, a := range n.args { out = append(out, a.ty) }
+  return out
+}
+fn (f: *Fn) iface_call(n: *ast.Node) {
+  it := types.dflt(n.obj.ty)
+  sig := f.iface_ptypes(n)
+  ho := f.hidden()
+  he := f.hidden()
+  f.expr(n.obj)
+  f.store_slot(ho)
+  arg_slots := []*Var{}
+  for i, a := range n.args {
+    f.bind_value(a, at_or(sig, i))
+    h := f.hidden()
+    f.store_slot(h)
+    arg_slots = append(arg_slots, h)
+  }
+  f.where_arg(n)
+  f.load_slot(ho)
+  f.push()
+  f.addr_of(f.g.str_lit(n.name))
+  f.push()
+  f.rt("rt_method", 3)
+  f.store_slot(he)
+  f.load_slot(ho)
+  f.push()
+  f.load_slot(he)
+  f.push()
+  f.rt("rt_method_recv", 2)
+  f.push()
+  for _, h := range arg_slots {
+    f.load_slot(h)
+    f.push()
+  }
+  f.depth_in(n)
+  # the code of the entry [name, code, ...]
+  f.load_slot(he)
+  f.load_at_off(8)
+  f.wrap()
+  f.op(0x11)
+  W.uleb(f.b, f.g.t0)
+  f.op(0)
+  f.depth_out()
+  f.pop_n(len(n.args) + 1)
+  if f.g.iface_info(it) == nil && f.g.is_iface_t(n.ty) {
+    rr := f.new_local(W.I64)
+    rd := f.new_local(W.I64)
+    f.lset(rr)
+    f.load_slot(he)
+    f.load_at_off(40)
+    f.lset(rd)
+    f.lget(rd)
+    f.op(0x50)
+    f.if_i64()
+    f.lget(rr)
+    f.else_()
+    f.lget(rr)
+    f.push()
+    f.lget(rd)
+    f.push()
+    f.rt("rt_box", 2)
+    f.end()
+  }
+}
+fn (f: *Fn) conversion(n: *ast.Node, dst: str, arg: *ast.Node) {
+  g := f.g
+  mode := n.conv_mode
+  if mode == "" && g.is_iface_t(arg.ty) {
+    if g.is_iface_t(dst) {
+      f.expr(arg)
+      return
+    }
+    if types.dflt(dst) == "str" {
+      mode = "fmt"
+    } else if in_kind_code(dst) || is_float_name(types.dflt(dst)) {
+      mode = "num"
+    } else {
+      f.expr_to(arg, dst)
+      return
+    }
+  }
+  f.expr(arg)
+  src := arg.ty
+  if g.is_iface_t(src) {
+    if mode == "num" {
+      f.lset(L_T2)
+      f.where_arg(n)
+      f.lget(L_T2)
+      f.push()
+      f.rt("rt_unbox_num", 2)
+      src = "num"
+    } else if mode != "fmt" {
+      nfail("this conversion of an any value is not supported yet", n)
+    }
+  }
+  fc := g.cls(src, arg)
+  switch mode {
+  case "fmt":
+    f.to_str(src, arg)
+    return
+  case "rune", "bytes", "runes", "tobytes", "torunes":
+    names := map[str]str{"rune": "rt_rune_str", "bytes": "rt_bytes_str", "runes": "rt_runes_str", "tobytes": "rt_str_bytes", "torunes": "rt_str_runes"}
+    f.push()
+    f.rt(names[mode], 1)
+    return
+  case "num":
+  default:
+    return
+  }
+  tc := g.cls(dst, n)
+  if fc == "i" && tc == "i" {
+    f.wrap_kind(kind_code(dst))
+  } else if fc == "i" && tc == "f" {
+    f.coerce(src, dst, n)
+  } else if fc == "f" && tc == "f" {
+    if types.dflt(dst) == "float32" { f.wrap_kind(10) }
+  } else if fc == "f" && tc == "i" {
+    f.call_helper("h.f2c")
+    f.wrap_kind(kind_code(dst))
+  }
+}
+fn is_simple_kind(k: str) -> bool { return k == "Number" || k == "String" || k == "Bool" || k == "Var" || k == "Nil" }
+# results of a call with several: hidden slots (the 1st from the stack, the others from g.ret)
+fn (f: *Fn) unpack_call(v: *ast.Node) -> []*Var {
+  f.expr(v)
+  k := len(results_of_t(v.ty))
+  hs := []*Var{}
+  for i := 0; i < k; i++ {
+    h := f.hidden()
+    if i > 0 { f.gret_load(i) }
+    f.store_slot(h)
+    hs = append(hs, h)
+  }
+  return hs
+}
+fn (f: *Fn) builtin(n: *ast.Node) {
+  g := f.g
+  nm := n.name
+  args := n.args
+  switch nm {
+  case "print":
+    vals := []*PVal{}
+    simple := true
+    for _, a := range args { if !is_simple_kind(a.kind) { simple = false } }
+    for _, a := range args {
+      if len(a.ty) > 0 && a.ty[0] == 40 {
+        items := results_of_t(a.ty)
+        for j, h := range f.unpack_call(a) { vals = append(vals, &PVal{h: h, t: items[j], n: a}) }
+      } else if simple {
+        vals = append(vals, &PVal{a: a, t: a.ty, n: a})
+      } else {
+        f.expr(a)
+        h := f.hidden()
+        f.store_slot(h)
+        vals = append(vals, &PVal{h: h, t: a.ty, n: a})
+      }
+    }
+    for i, pv := range vals {
+      if i > 0 {
+        f.call_fn(g.rt_call("rt_out_space"))
+        f.op(0x1A)
+      }
+      if pv.h != nil { f.load_slot(pv.h) } else { f.expr(pv.a) }
+      f.push()
+      c := g.cls(pv.t, pv.n)
+      if c == "p" {
+        f.push_desc(pv.t, pv.n)
+        f.rt("rt_out_val", 2)
+      } else if c == "s" {
+        f.rt("rt_out_str", 1)
+      } else if c == "f" {
+        f.rt("rt_out_num", 1)
+      } else if types.dflt(pv.t) == "bool" {
+        f.rt("rt_out_bool", 1)
+      } else if is_unsigned(pv.t) {
+        f.rt("rt_out_uint", 1)
+      } else {
+        f.rt("rt_out_int", 1)
+      }
+      f.op(0x1A)
+    }
+    f.call_fn(g.rt_call("rt_out_nl"))
+    return
+  case "sleep":
+    f.where_arg(n)
+    f.expr_to(args[0], "num")
+    f.push()
+    f.rt("rt_sleep", 2)
+    return
+  case "len", "cap":
+    t := strip_ptr(types.dflt(args[0].ty))
+    k := "str"
+    if t != "str" { k = g.kind_of_t(t) }
+    if k == "array" {
+      f.expr(args[0])
+      f.op(0x1A)
+      f.i64c(types.tinfo(t).n)
+      return
+    }
+    f.expr(args[0])
+    if k == "str" {
+      f.load_at_off(0)
+      return
+    }
+    if k == "slice" {
+      r := f.new_local(W.I64)
+      f.lset(r)
+      f.lget(r)
+      f.op(0x50)
+      f.if_i64()
+      f.i64c(0)
+      f.else_()
+      f.lget(r)
+      if nm == "len" { f.load_at_off(8) } else { f.load_at_off(16) }
+      f.end()
+      return
+    }
+    f.push()
+    if k == "map" { f.rt("rt_map_len", 1) } else if nm == "len" { f.rt("rt_slen", 1) } else { f.rt("rt_scap", 1) }
+    return
+  case "append":
+    ed := types.tinfo(types.dflt(n.append_t)).elem
+    if n.args_spread {
+      h := f.hidden()
+      f.expr(args[0])
+      f.push()
+      f.expr(args[1])
+      if types.dflt(args[1].ty) == "str" {
+        f.push()
+        f.rt("rt_str_bytes", 1)
+      }
+      f.store_slot(h)
+      f.load_slot(h)
+      f.push()
+      f.rt("rt_sdata", 1)
+      f.push()
+      f.load_slot(h)
+      f.push()
+      f.rt("rt_slen", 1)
+      f.push()
+      f.push_desc(ed, n)
+      f.rt("rt_append", 4)
+      return
+    }
+    na := len(args) - 1
+    be := types.dflt(ed) == "bool"
+    f.expr(args[0])
+    f.push()
+    if be { f.i64c(na + 8) } else { f.i64c(8 * na + 8) }
+    f.push()
+    f.rt("rt_alloc", 1)
+    f.push()
+    for i := 1; i < len(args); i++ {
+      f.bind_value(args[i], ed)
+      if be { f.store_top(i - 1, true) } else { f.store_top(8 * (i - 1), false) }
+    }
+    f.i64c(na)
+    f.push()
+    f.push_desc(ed, n)
+    f.rt("rt_append", 4)
+    return
+  case "copy":
+    f.expr(args[0])
+    f.push()
+    f.expr(args[1])
+    f.push()
+    if types.dflt(args[1].ty) == "str" {
+      f.rt("rt_copy_str", 2)
+      return
+    }
+    f.push_desc(types.tinfo(types.dflt(args[0].ty)).elem, n)
+    f.rt("rt_copy_slice", 3)
+    return
+  case "delete":
+    f.expr(args[0])
+    f.push()
+    f.expr_to(args[1], types.tinfo(types.dflt(args[0].ty)).key)
+    f.push()
+    f.rt("rt_map_del", 2)
+    return
+  case "make":
+    t := types.dflt(n.type_arg)
+    ti := types.tinfo(t)
+    if ti.k == "map" {
+      f.i64c(g.map_kinds(ti))
+      f.push()
+      f.rt("rt_map_new", 1)
+      return
+    }
+    if ti.k != "slice" { nfail("make(" + types.show_t(t) + ") is not supported yet", n) }
+    nh := f.hidden()
+    ch := f.hidden()
+    f.expr_to(args[0], "int")
+    f.store_slot(nh)
+    if len(args) > 1 { f.expr_to(args[1], "int") } else { f.load_slot(nh) }
+    f.store_slot(ch)
+    f.where_arg(n)
+    f.load_slot(nh)
+    f.push()
+    f.load_slot(ch)
+    f.push()
+    f.rt("rt_make_check", 3)
+    f.op(0x1A)
+    f.push_desc(ti.elem, n)
+    f.load_slot(nh)
+    f.push()
+    f.load_slot(ch)
+    f.push()
+    f.rt("rt_make_slice", 3)
+    return
+  case "new":
+    t := n.type_arg
+    f.push_desc(t, n)
+    f.rt("rt_zero", 1)
+    if !g.is_value_type(t) {
+      f.push()
+      f.rt("rt_cell", 1)
+    }
+    return
+  }
+  if nm == "panic" {
+    f.where_arg(n)
+    f.expr_to(args[0], "any")
+    f.push()
+    f.rt("rt_panic_val", 2)
+    return
+  }
+  if nm == "recover" {
+    f.rt("rt_recover", 0)
+    return
+  }
+  if !f.u.is_runtime && !n.privileged { nfail("the function " + nm + " is not supported yet", n) }
+  switch nm {
+  case "__load8":
+    f.expr(args[0])
+    f.wrap()
+    f.mem(0x31, 0, 0)
+    return
+  case "__load64":
+    f.expr(args[0])
+    f.load_at_off(0)
+    return
+  case "__load32":
+    f.expr(args[0])
+    f.wrap()
+    f.mem(0x35, 2, 0)                                  # i64.load32_u
+    return
+  case "__store8", "__store32", "__store64":
+    f.two(args)
+    if nm == "__store8" { f.mem(0x3C, 0, 0) } else if nm == "__store32" { f.mem(0x3E, 2, 0) } else { f.mem(0x37, 3, 0) }
+    f.i64c(0)
+    return
+  case "__strp", "__pstr", "__fbits", "__bitsf":
+    f.expr(args[0])
+    return
+  case "__argp":
+    f.i64c(ARGV)
+    return
+  case "__newstr":
+    f.expr(args[0])
+    f.push()
+    f.rt("rt_newstr", 1)
+    return
+  case "__flush":
+    f.rt("rt_flush", 0)
+    return
+  case "__anyp":
+    f.expr_to(args[0], "any")
+    return
+  case "__pany":
+    f.expr(args[0])
+    return
+  case "__alloc", "__zero", "__map_new":
+    f.expr(args[0])
+    f.push()
+    if nm == "__alloc" { f.rt("rt_alloc", 1) } else if nm == "__zero" { f.rt("rt_zero", 1) } else { f.rt("rt_map_new", 1) }
+    return
+  case "__make_slice", "__map_set":
+    if nm == "__map_set" { f.where_arg(n) }
+    for _, a := range args {
+      f.expr(a)
+      f.push()
+    }
+    if nm == "__map_set" { f.rt("rt_map_set", 4) } else { f.rt("rt_make_slice", 3) }
+    return
+  case "__exit":
+    f.expr(args[0])
+    f.push()
+    f.rt("rt_exit", 1)
+    return
+  case "__sp":
+    f.gget(G_SP)
+    f.op(0xAD)
+    return
+  case "__depth":
+    f.gget(G_DEPTH)
+    return
+  case "__set_depth":
+    f.expr(args[0])
+    f.gset(G_DEPTH)
+    f.i64c(0)
+    return
+  case "__sqrt":
+    f.expr(args[0])
+    f.op(0xBF)
+    f.op(0x9F)
+    f.op(0xBD)
+    return
+  case "__fmod":
+    f.expr(args[0])
+    f.op(0xBF)
+    f.expr(args[1])
+    f.op(0xBF)
+    f.call_helper("imp.fmod")
+    f.op(0xBD)
+    return
+  case "__calldefer":
+    f.expr(args[0])
+    f.push()
+    f.call_fn("rt.calldefer")
+    f.pop_n(1)
+    return
+  case "__jump":
+    # a recovered panic: to the function whose frame is the first argument (see gen_function)
+    f.expr(args[0])
+    f.expr(args[1])
+    f.op(0x1A)
+    f.op2(0x08, 0)                                     # throw $jump
+    f.i64c(0)
+    return
+  case "__syscall":
+    for _, a := range args {
+      f.expr(a)
+      f.push()
+    }
+    for i := len(args) - 1; i >= 0; i-- { f.peek(i) }
+    f.pop_n(len(args))
+    f.call_helper("imp.syscall")
+    return
+  }
+  nfail("the function " + nm + " is not supported yet", n)
+}
+# [address as i32][value] for a store (the address kept on the memory stack while the value is computed)
+fn (f: *Fn) two(args: []*ast.Node) {
+  if is_simple(args[1]) {
+    f.expr(args[0])
+    f.wrap()
+    f.expr(args[1])
+    return
+  }
+  f.expr(args[0])
+  f.push()
+  f.expr(args[1])
+  f.lset(L_T2)
+  f.pop()
+  f.wrap()
+  f.lget(L_T2)
+}
+fn (f: *Fn) make_closure(fnode: *ast.Node, n: *ast.Node) {
+  g := f.g
+  label := f.u.p + ".l." + str(len(g.lits))
+  caps_list := fnode.captures
+  cap_types := []str{}
+  for _, nm := range caps_list { cap_types = append(cap_types, f.lookup(nm, n).t) }
+  g.lits = append(g.lits, &Lit{u: f.u, label: label, fnode: fnode, cap_types: cap_types})
+  f.i64c(8 + 8 * len(caps_list))
+  f.push()
+  f.rt("rt_alloc", 1)
+  h := f.hidden()
+  f.store_slot(h)
+  f.load_slot(h)
+  f.wrap()
+  f.i64c(g.m.slot(label, g.t0))
+  f.mem(0x37, 3, 0)
+  for i, nm := range caps_list {
+    v := f.lookup(nm, n)
+    if !v.celled { nfail("\"" + types.bare(nm) + "\" could not be captured by the function", n) }
+    if v.sym != "" {
+      f.addr_of(v.sym)
+      f.push()
+      f.rt("rt_cellref", 1)
+    } else {
+      f.load_slot(v)
+    }
+    f.lset(L_T2)
+    f.load_slot(h)
+    f.wrap()
+    f.lget(L_T2)
+    f.mem(0x37, 3, 8 + 8 * i)
+  }
+  f.load_slot(h)
+}
+fn (f: *Fn) bound_method(n: *ast.Node) {
+  fd := f.u.funcs[n.bound_method]
+  f.expr(n.obj)
+  f.follow_path(strip_ptr(types.dflt(n.obj.ty)), n.field_path, n)
+  if !n.recv_ptr {
+    f.push()
+    f.push_desc(fd.ptypes[0], n)
+    f.rt("rt_copy_val", 2)
+  }
+  h := f.hidden()
+  f.store_slot(h)
+  f.i64c(16)
+  f.push()
+  f.rt("rt_alloc", 1)
+  r := f.new_local(W.I64)
+  f.lset(r)
+  f.lget(r)
+  f.wrap()
+  f.i64c(f.g.m.slot(f.g.bound_thunk(f.u, fd), f.g.t0))
+  f.mem(0x37, 3, 0)
+  f.lget(r)
+  f.wrap()
+  f.load_slot(h)
+  f.mem(0x37, 3, 8)
+  f.lget(r)
+}
+
+# ---- statements ----
+fn (f: *Fn) assign_var(name: str, value: *ast.Node, n: *ast.Node, decl: bool) {
+  if name == "_" {
+    f.expr(value)
+    f.op(0x1A)
+    return
+  }
+  v := f.lookup(name, n)
+  if !decl && f.g.is_value_type(v.t) {
+    f.load_v(v)
+    f.push()
+    f.bind_value(value, v.t)
+    f.push()
+    f.push_desc(v.t, n)
+    f.rt("rt_copy_into", 3)
+    f.op(0x1A)
+    return
+  }
+  if value == nil {
+    f.push_desc(v.t, n)
+    f.rt("rt_zero", 1)
+  } else {
+    f.bind_value(value, v.t)
+  }
+  f.store_v(v, decl)
+}
+fn (f: *Fn) prep_target(t: *ast.Node) -> *Target {
+  if t.kind == "Var" { return &Target{t: t} }
+  h := f.hidden()
+  if t.kind == "Index" {
+    if f.g.kind_of_t(types.dflt(t.obj.ty)) == "map" {
+      f.expr(t.obj)
+      f.store_slot(h)
+      k := f.hidden()
+      f.expr_to(t.index, types.tinfo(types.dflt(t.obj.ty)).key)
+      f.store_slot(k)
+      return &Target{t: t, map_: h, key: k}
+    }
+    f.elem_addr(t, true)
+    f.store_slot(h)
+    return &Target{t: t, addr: h}
+  }
+  if t.kind == "Field" {
+    st := f.struct_obj(t.obj, t.field_path, t.name, t)
+    f.i64c(8 * f.g.field_index(st, t.name, t))
+    f.op(0x7C)
+    f.store_slot(h)
+    return &Target{t: t, addr: h}
+  }
+  if t.kind == "Deref" {
+    f.expr(t.arg)
+    f.nil_check(t, "Nil pointer: it points to nothing")
+    f.store_slot(h)
+    return &Target{t: t, addr: h, deref: true}
+  }
+  nfail("this assignment target is not supported yet", t)
+  return nil
+}
+# stores the value on the stack in a prepared target
+fn (f: *Fn) store_target(p: *Target, decl: bool, n: *ast.Node) {
+  t := p.t
+  if t.kind == "Var" {
+    if t.name == "_" {
+      f.op(0x1A)
+      return
+    }
+    v := f.lookup(t.name, t)
+    if !decl && f.g.is_value_type(v.t) {
+      f.push()
+      f.load_v(v)
+      f.lset(L_T2)
+      f.pop()
+      f.lget(L_T2)
+      f.push()
+      f.push()
+      # (pushed: the value, then the destination: rt_copy_into(dst, src, desc) wants dst first)
+      f.swap_top2()
+      f.push_desc(v.t, t)
+      f.rt("rt_copy_into", 3)
+      f.op(0x1A)
+      return
+    }
+    f.store_v(v, decl)
+    return
+  }
+  if p.map_ != nil {
+    vv := f.new_local(W.I64)
+    f.push()                                           # (the value stays visible to the collector)
+    f.where_arg(n)
+    f.load_slot(p.map_)
+    f.push()
+    f.load_slot(p.key)
+    f.push()
+    f.peek(3)
+    f.lset(vv)
+    f.lget(vv)
+    f.push()
+    f.rt("rt_map_set", 4)
+    f.op(0x1A)
+    f.pop_n(1)
+    return
+  }
+  if f.g.is_value_type(t.ty) {
+    # rt_copy_into(dst, src, desc): dst is the object at the address (or the pointer itself)
+    f.push()
+    f.load_slot(p.addr)
+    if !p.deref { f.load_at_off(0) }
+    f.push()
+    f.swap_top2()
+    f.push_desc(t.ty, t)
+    f.rt("rt_copy_into", 3)
+    f.op(0x1A)
+    return
+  }
+  la := f.new_local(W.I64)
+  f.load_slot(p.addr)
+  f.lset(la)
+  f.store_at_l(t.ty, la)
+}
+# swaps the two words on top of the memory stack
+fn (f: *Fn) swap_top2() {
+  a := f.new_local(W.I64)
+  f.peek(0)
+  f.lset(a)
+  f.gget(G_SP)
+  f.peek(1)
+  f.mem(0x37, 3, 0)
+  f.gget(G_SP)
+  f.lget(a)
+  f.mem(0x37, 3, 8)
+}
+fn (f: *Fn) multi(targets: []*ast.Node, values: []*ast.Node, decl: bool, n: *ast.Node) {
+  prep := []*Target{}
+  for _, t := range targets { prep = append(prep, f.prep_target(t)) }
+  vals := []*Var{}
+  for i := 0; i < len(targets); i++ { vals = append(vals, f.hidden()) }
+  if len(values) == len(targets) {
+    for i, v := range values {
+      pt := prep[i].t
+      tt := pt.ty
+      if pt.kind == "Var" && pt.name != "_" { tt = f.lookup(pt.name, n).t }
+      f.bind_value(v, tt)
+      f.store_slot(vals[i])
+    }
+  } else {
+    v := values[0]
+    if (v.kind == "Index" || v.kind == "TypeAssert") && v.comma_ok {
+      f.expr(v)
+      f.store_slot(vals[0])
+      f.gget(G_AUX)
+      f.i64c(255)
+      f.op(0x83)
+      f.store_slot(vals[1])
+    } else if optional(v.unpack) {
+      items := results_of_t(v.ty)
+      for i, h := range f.unpack_call(v) {
+        pt := prep[i].t
+        tt := pt.ty
+        if pt.kind == "Var" {
+          if pt.name == "_" { tt = items[i] } else { tt = f.lookup(pt.name, n).t }
+        }
+        f.load_slot(h)
+        f.coerce(items[i], tt, n)
+        f.store_slot(vals[i])
+      }
+    } else {
+      nfail("multiple results from an any value are not supported yet", n)
+    }
+  }
+  for i, p := range prep {
+    f.load_slot(vals[i])
+    f.store_target(p, decl, n)
+  }
+}
+fn (f: *Fn) keep(parts: []*Var) -> []*Var {
+  h := f.hidden()
+  f.store_slot(h)
+  return append(parts, h)
+}
+fn (f: *Fn) defer_args(parts: []*Var, as: []*ast.Node, ts: []str, has_ts: bool) -> []*Var {
+  for i, a := range as {
+    t := a.ty
+    if has_ts { t = at_or(ts, i) }
+    f.bind_value(a, t)
+    parts = f.keep(parts)
+  }
+  return parts
+}
+fn clone_node(n: *ast.Node) -> *ast.Node {
+  c := *n
+  return &c
+}
+fn (f: *Fn) defer_stmt(n: *ast.Node) {
+  g := f.g
+  c := n.call
+  parts := []*Var{}
+  fd, is_fn := f.u.funcs[c.target_name]
+  if c.kind == "Call" && c.call_kind == "func" {
+    f.addr_of(g.static_closure(f.u, c.name, c))
+    parts = f.keep(parts)
+    parts = f.defer_args(parts, c.args, param_types(f.u.funcs[c.name]), true)
+  } else if c.kind == "Call" && c.call_kind == "value" {
+    v := f.lookup(c.name, c)
+    f.load_v(v)
+    parts = f.keep(parts)
+    if g.is_func_t(v.t) {
+      parts = f.defer_args(parts, c.args, types.tinfo(types.dflt(v.t)).params, true)
+    } else {
+      parts = f.defer_args(parts, c.args, []str{}, false)
+    }
+  } else if c.kind == "CallValue" {
+    f.expr(c.fn_)
+    parts = f.keep(parts)
+    if g.is_func_t(c.fn_.ty) {
+      parts = f.defer_args(parts, c.args, types.tinfo(types.dflt(c.fn_.ty)).params, true)
+    } else {
+      parts = f.defer_args(parts, c.args, []str{}, false)
+    }
+  } else if c.kind == "MethodCall" && c.target_name != "" && is_fn {
+    pt := param_types(fd)
+    f.addr_of(g.static_closure(f.u, c.target_name, c))
+    parts = f.keep(parts)
+    f.expr(c.obj)
+    t := f.follow_path(strip_ptr(types.dflt(c.obj.ty)), c.field_path, c)
+    if !c.recv_ptr && (!fresh(c.obj) || len(c.field_path) > 0) {
+      f.push()
+      f.push_desc(t, c)
+      f.rt("rt_copy_val", 2)
+    }
+    parts = f.keep(parts)
+    parts = f.defer_args(parts, c.args, pt[1:], true)
+  } else if c.kind == "MethodCall" && c.field_call {
+    fty := g.field_type(f.field_owner(c), c.name)
+    st := f.struct_obj(c.obj, c.field_path, c.name, c)
+    f.load_at_off(8 * g.field_index(st, c.name, c))
+    parts = f.keep(parts)
+    if g.is_func_t(fty) {
+      parts = f.defer_args(parts, c.args, types.tinfo(types.dflt(fty)).params, true)
+    } else {
+      parts = f.defer_args(parts, c.args, []str{}, false)
+    }
+  } else if c.kind == "MethodCall" && c.call_kind != "errnew" {
+    sig := f.iface_ptypes(c)
+    ho := f.hidden()
+    he := f.hidden()
+    f.expr(c.obj)
+    f.store_slot(ho)
+    f.where_arg(c)
+    f.load_slot(ho)
+    f.push()
+    f.addr_of(g.str_lit(c.name))
+    f.push()
+    f.rt("rt_method", 3)
+    f.store_slot(he)
+    f.i64c(8)
+    f.push()
+    f.rt("rt_alloc", 1)
+    r := f.new_local(W.I64)
+    f.lset(r)
+    f.lget(r)
+    f.wrap()
+    f.load_slot(he)
+    f.load_at_off(8)
+    f.mem(0x37, 3, 0)
+    f.lget(r)
+    parts = f.keep(parts)
+    f.load_slot(ho)
+    f.push()
+    f.load_slot(he)
+    f.push()
+    f.rt("rt_method_recv", 2)
+    parts = f.keep(parts)
+    parts = f.defer_args(parts, c.args, sig, true)
+  } else {
+    params := []str{}
+    ptys := []str{}
+    vargs := []*ast.Node{}
+    for i, a := range c.args {
+      pn := "·a" + str(i)
+      params = append(params, pn)
+      ptys = append(ptys, a.ty)
+      va := ast.new_node("Var", c.line, c.col)
+      va.name = pn
+      va.ty = a.ty
+      vargs = append(vargs, va)
+    }
+    cl := clone_node(c)
+    cl.args = vargs
+    wrapper := ast.new_node("Func", c.line, c.col)
+    wrapper.name = "·wrapper" + str(len(g.lits))
+    wrapper.params = params
+    wrapper.ptypes = ptys
+    wrapper.rtype = "void"
+    wrapper.ret_ty = "void"
+    es := ast.new_node("ExprStmt", c.line, c.col)
+    es.expr = cl
+    blk := ast.new_node("Block", 0, 0)
+    blk.stmts = []*ast.Node{es}
+    wrapper.body = blk
+    f.make_closure(wrapper, c)
+    parts = f.keep(parts)
+    parts = f.defer_args(parts, c.args, []str{}, false)
+  }
+  f.load_slot(parts[0])
+  f.op(0x50)
+  f.if_()
+  f.where_arg(n)
+  f.rt("rt_defer_nil", 1)
+  f.op(0x1A)
+  f.end()
+  k := len(parts) - 1
+  f.i64c(8 * (3 + k))
+  f.push()
+  f.rt("rt_alloc", 1)
+  nd := f.new_local(W.I64)
+  rc := f.new_local(W.I64)
+  f.lset(nd)
+  f.rec_addr()
+  f.lset(rc)
+  # node.next = rec.list; rec.list = node
+  f.lget(nd)
+  f.wrap()
+  f.lget(rc)
+  f.load_at_off(8)
+  f.mem(0x37, 3, 0)
+  f.lget(rc)
+  f.wrap()
+  f.lget(nd)
+  f.mem(0x37, 3, 8)
+  f.lget(nd)
+  f.wrap()
+  f.load_slot(parts[0])
+  f.mem(0x37, 3, 8)
+  f.lget(nd)
+  f.wrap()
+  f.i64c(k)
+  f.mem(0x37, 3, 16)
+  for i := 0; i < k; i++ {
+    f.lget(nd)
+    f.wrap()
+    f.load_slot(parts[i + 1])
+    f.mem(0x37, 3, 24 + 8 * i)
+  }
+}
+fn (f: *Fn) find_loop(n: *ast.Node) -> *Loop {
+  if n.label != "" {
+    for i := len(f.loops) - 1; i >= 0; i-- { if f.loops[i].label == n.label { return f.loops[i] } }
+    return nil
+  }
+  if n.kind == "Continue" {
+    for i := len(f.loops) - 1; i >= 0; i-- { if f.loops[i].cont >= 0 { return f.loops[i] } }
+    return nil
+  }
+  if len(f.loops) == 0 { return nil }
+  return f.loops[len(f.loops) - 1]
+}
+fn (f: *Fn) push_loop(brk: int, cont: int, label: str) { f.loops = append(f.loops, &Loop{brk: brk, cont: cont, label: label}) }
+fn (f: *Fn) pop_loop() { f.loops = f.loops[:len(f.loops) - 1] }
+
+fn (f: *Fn) stmt(n: *ast.Node) {
+  g := f.g
+  switch n.kind {
+  case "ExprStmt":
+    f.expr(n.expr)
+    f.op(0x1A)
+    return
+  case "Block", "Module":
+    for _, s := range n.stmts { f.stmt(s) }
+    return
+  case "Func", "Extern", "Struct", "Interface", "Fallthrough", "Import":
+    return
+  case "Assign":
+    f.assign_var(n.name, n.value, n, n.decl != "")
+    return
+  case "VarDecl":
+    ts := []*ast.Node{}
+    for _, nm := range n.names {
+      vn := ast.new_node("Var", n.line, 0)
+      vn.name = nm
+      ts = append(ts, vn)
+    }
+    if len(n.values) == 0 {
+      for _, nm := range n.names { if nm != "_" { f.assign_var(nm, nil, n, true) } }
+      return
+    }
+    f.multi(ts, n.values, true, n)
+    return
+  case "MultiAssign":
+    if len(n.targets) == 1 && len(n.values) == 1 {
+      p := f.prep_target(n.targets[0])
+      tt := n.targets[0].ty
+      if n.targets[0].kind == "Var" && n.targets[0].name != "_" { tt = f.lookup(n.targets[0].name, n).t }
+      f.bind_value(n.values[0], tt)
+      f.store_target(p, false, n)
+      return
+    }
+    f.multi(n.targets, n.values, false, n)
+    return
+  case "FieldAssign":
+    t := f.struct_obj(n.obj, n.field_path, n.name, n)
+    off := 8 * g.field_index(t, n.name, n)
+    if g.is_value_type(n.fty) {
+      f.load_at_off(off)
+      f.push()
+      f.bind_value(n.value, n.fty)
+      f.push()
+      f.push_desc(n.fty, n)
+      f.rt("rt_copy_into", 3)
+      f.op(0x1A)
+      return
+    }
+    f.push()
+    f.bind_value(n.value, n.fty)
+    f.lset(L_T2)
+    f.pop()
+    f.wrap()
+    f.lget(L_T2)
+    f.mem(0x37, 3, off)
+    return
+  case "OpAssign":
+    tg := n.target
+    if tg.kind == "Var" {
+      v := f.lookup(tg.name, n)
+      fake := ast.new_node("Binary", n.line, n.col)
+      fake.op = n.op
+      fake.left = tg
+      fake.right = n.value
+      fake.ik = n.ik
+      fake.fk = n.fk
+      fake.ty = v.t
+      f.expr(fake)
+      f.store_v(v, false)
+      return
+    }
+    p := f.prep_target(tg)
+    cur := f.hidden()
+    if p.map_ != nil {
+      f.load_slot(p.map_)
+      f.push()
+      f.load_slot(p.key)
+      f.push()
+      f.rt("rt_map_find", 2)
+      fi := f.new_local(W.I64)
+      f.lset(fi)
+      f.lget(fi)
+      f.i64c(0)
+      f.op(0x53)
+      f.if_i64()
+      f.push_desc(tg.ty, n)
+      f.rt("rt_zero", 1)
+      f.else_()
+      f.load_slot(p.map_)
+      f.push()
+      f.lget(fi)
+      f.push()
+      f.rt("rt_map_val", 2)
+      f.end()
+    } else {
+      f.load_slot(p.addr)
+      f.load_at(tg.ty)
+    }
+    f.store_slot(cur)
+    f.tmp_load = cur
+    tnode := ast.new_node("·tmp", 0, 0)
+    tnode.ty = tg.ty
+    fake := ast.new_node("Binary", n.line, n.col)
+    fake.op = n.op
+    fake.left = tnode
+    fake.right = n.value
+    fake.ik = n.ik
+    fake.fk = n.fk
+    fake.ty = tg.ty
+    f.expr(fake)
+    f.store_target(p, false, n)
+    return
+  case "If":
+    if n.init != nil { f.stmt(n.init) }
+    f.cond(n.cond)
+    f.if_()
+    f.stmt(n.then)
+    if n.otherwise != nil {
+      f.else_()
+      f.stmt(n.otherwise)
+    }
+    f.end()
+    return
+  case "While":
+    brk := f.block()
+    top := f.loop_()
+    if !always_true(n.cond) {
+      f.cond(n.cond)
+      f.op(0x45)
+      f.br_if(brk)
+    }
+    cont := f.block()
+    f.push_loop(brk, cont, n.label)
+    f.stmt(n.body)
+    f.pop_loop()
+    f.end()
+    f.br(top)
+    f.end()
+    f.end()
+    return
+  case "ForC":
+    if n.init != nil { f.stmt(n.init) }
+    brk := f.block()
+    top := f.loop_()
+    if n.cond != nil && !always_true(n.cond) {
+      f.cond(n.cond)
+      f.op(0x45)
+      f.br_if(brk)
+    }
+    cont := f.block()
+    f.push_loop(brk, cont, n.label)
+    f.stmt(n.body)
+    f.pop_loop()
+    f.end()
+    # a loop variable captured by a closure gets a new cell every turn (Go 1.22)
+    lv := []str{}
+    if n.init != nil {
+      if n.init.kind == "Assign" && n.init.decl != "" { lv = []str{n.init.name} } else if n.init.kind == "VarDecl" { lv = n.init.names }
+    }
+    for _, nm := range lv {
+      if nm != "_" {
+        v := f.lookup(nm, n)
+        if v.celled {
+          f.load_v(v)
+          f.push()
+          f.rt("rt_cell", 1)
+          f.store_slot(v)
+        }
+      }
+    }
+    if n.post != nil { f.stmt(n.post) }
+    f.br(top)
+    f.end()
+    f.end()
+    return
+  case "ForTo":
+    f.for_to(n)
+    return
+  case "Defer":
+    f.defer_stmt(n)
+    return
+  case "Range":
+    f.range_(n)
+    return
+  case "Break", "Continue":
+    l := f.find_loop(n)
+    if l == nil || (n.kind == "Continue" && l.cont < 0) { nfail("break or continue outside a loop", n) }
+    if n.kind == "Break" { f.br(l.brk) } else { f.br(l.cont) }
+    return
+  case "Switch":
+    f.switch_(n)
+    return
+  case "TypeSwitch":
+    f.type_switch(n)
+    return
+  case "Return":
+    f.return_(n)
+    return
+  }
+  nfail(n.kind + " is not supported yet", n)
+}
+fn always_true(c: *ast.Node) -> bool {
+  while c.kind == "Paren" { c = c.expr }
+  return c.kind == "Bool" && c.bool_value
+}
+fn (f: *Fn) return_(n: *ast.Node) {
+  if f.is_top { nfail("return outside a function", n) }
+  vals := n.values
+  want := results_of_t(f.ret_t)
+  if len(vals) == 0 && f.has_rn {
+    f.load_results()
+    f.ret_jump(n)
+    return
+  }
+  if len(vals) == 0 {
+    f.i64c(0)
+    f.ret_jump(n)
+    return
+  }
+  if len(want) <= 1 && len(vals) == 1 && !optional(vals[0].unpack) {
+    f.bind_value(vals[0], f.ret_t)
+    if f.has_rn {
+      f.store_v(f.lookup(f.rnames[0], n), false)
+      f.load_v(f.lookup(f.rnames[0], n))
+    }
+    f.ret_jump(n)
+    return
+  }
+  hs := []*Var{}
+  if len(vals) == 1 && optional(vals[0].unpack) {
+    items := results_of_t(vals[0].ty)
+    hs = f.unpack_call(vals[0])
+    for i, h := range hs {
+      f.load_slot(h)
+      f.coerce(items[i], at_or(want, i), n)
+      f.store_slot(h)
+    }
+  } else {
+    for i, rv := range vals {
+      f.bind_value(rv, at_or(want, i))
+      h := f.hidden()
+      f.store_slot(h)
+      hs = append(hs, h)
+    }
+  }
+  if f.has_rn {
+    for i, h := range hs {
+      f.load_slot(h)
+      f.store_v(f.lookup(f.rnames[i], n), false)
+    }
+  }
+  for i := len(hs) - 1; i >= 1; i-- {
+    f.load_slot(hs[i])
+    f.gret_store(i)
+  }
+  f.load_slot(hs[0])
+  f.ret_jump(n)
+}
+# the cases' bodies follow the ends of nested blocks: leaving block i lands on body i, and a body
+# that does not end with fallthrough leaves the whole switch
+fn (f: *Fn) switch_(n: *ast.Node) {
+  if n.init != nil { f.stmt(n.init) }
+  tag_t := "bool"
+  if n.tag != nil { tag_t = n.tag.ty }
+  tmp := f.hidden()
+  if n.tag != nil {
+    f.expr(n.tag)
+    f.store_slot(tmp)
+  }
+  nc := len(n.cases)
+  end := f.block()
+  ids := []int{}
+  for i := nc - 1; i >= 0; i-- { ids = append(ids, f.block()) }
+  # ids[nc-1-i] is the block of case i (case 0 innermost)
+  def_idx := -1
+  for i, c := range n.cases {
+    if c.is_default {
+      def_idx = i
+      continue
+    }
+    for _, e := range c.exprs {
+      if n.tag != nil {
+        f.tmp_load = tmp
+        left := ast.new_node("·tmp", 0, 0)
+        left.ty = tag_t
+        cmp := ast.new_node("Binary", e.line, e.col)
+        cmp.op = "=="
+        cmp.left = left
+        cmp.right = e
+        cmp.ty = "bool"
+        f.compare(cmp)
+      } else {
+        f.cond(e)
+      }
+      f.br_if(ids[nc - 1 - i])
+    }
+  }
+  if def_idx >= 0 { f.br(ids[nc - 1 - def_idx]) } else { f.br(end) }
+  f.push_loop(end, -1, n.label)
+  for i, c := range n.cases {
+    f.end()                                            # block of case i: its body comes next
+    for _, s := range c.stmts { if s.kind != "Fallthrough" { f.stmt(s) } }
+    ft := len(c.stmts) > 0 && c.stmts[len(c.stmts) - 1].kind == "Fallthrough"
+    if !(ft && i + 1 < nc) && i + 1 < nc { f.br(end) }
+  }
+  f.pop_loop()
+  f.end()
+}
+fn (f: *Fn) type_switch(n: *ast.Node) {
+  g := f.g
+  if n.init != nil { f.stmt(n.init) }
+  sv := f.hidden()
+  f.expr_to(n.subject, "any")
+  f.store_slot(sv)
+  nc := len(n.cases)
+  end := f.block()
+  ids := []int{}
+  for i := nc - 1; i >= 0; i-- { ids = append(ids, f.block()) }
+  def_idx := -1
+  for i, c := range n.cases {
+    if c.is_default {
+      def_idx = i
+      continue
+    }
+    for _, t := range c.types {
+      f.load_slot(sv)
+      if t != "nil" {
+        f.push()
+        f.push_desc(t, c)
+        f.rt("rt_type_is", 2)
+        f.i64c(0)
+        f.op(0x52)
+      } else {
+        f.op(0x50)
+      }
+      f.br_if(ids[nc - 1 - i])
+    }
+  }
+  if def_idx >= 0 { f.br(ids[nc - 1 - def_idx]) } else { f.br(end) }
+  f.push_loop(end, -1, n.label)
+  for i, c := range n.cases {
+    f.end()
+    if n.bind != "" && n.bind != "_" {
+      f.load_slot(sv)
+      t := ""
+      if !c.is_default && len(c.types) == 1 { t = c.types[0] }
+      if t != "" && t != "nil" && !g.is_iface_t(t) { f.load_at_off(8) }
+      f.store_v(f.lookup(n.bind, n), true)
+    }
+    for _, s := range c.stmts { f.stmt(s) }
+    if i + 1 < nc { f.br(end) }
+  }
+  f.pop_loop()
+  f.end()
+}
+fn (f: *Fn) for_to(n: *ast.Node) {
+  v := f.lookup(n.name, n)
+  t := v.t
+  fl := f.g.cls(t, n) == "f"
+  c := f.hidden()
+  e := f.hidden()
+  s := f.hidden()
+  f.expr_to(n.from_, t)
+  f.store_slot(c)
+  f.expr_to(n.to_, t)
+  f.store_slot(e)
+  # going up when from <= to
+  f.load_slot(c)
+  if fl { f.op(0xBF) }
+  f.load_slot(e)
+  if fl {
+    f.op(0xBF)
+    f.op(0x65)
+  } else {
+    f.op(0x57)
+  }
+  f.op(0xAD)
+  f.store_slot(s)
+  brk := f.block()
+  top := f.loop_()
+  # leave when past the end (in the direction of the loop)
+  f.load_slot(s)
+  f.op(0x50)
+  f.if_()
+  f.load_slot(c)
+  if fl { f.op(0xBF) }
+  f.load_slot(e)
+  if fl {
+    f.op(0xBF)
+    f.op(0x63)                                         # f64.lt: c < e (NaN: also leave, below)
+    f.load_slot(c)
+    f.op(0xBF)
+    f.load_slot(c)
+    f.op(0xBF)
+    f.op(0x62)
+    f.op(0x72)                                         # i32.or
+  } else {
+    f.op(0x53)
+  }
+  f.br_if(brk)
+  f.else_()
+  f.load_slot(c)
+  if fl { f.op(0xBF) }
+  f.load_slot(e)
+  if fl {
+    f.op(0xBF)
+    f.op(0x64)                                         # c > e
+    f.load_slot(c)
+    f.op(0xBF)
+    f.load_slot(c)
+    f.op(0xBF)
+    f.op(0x62)
+    f.op(0x72)
+  } else {
+    f.op(0x55)
+  }
+  f.br_if(brk)
+  f.end()
+  f.load_slot(c)
+  f.store_v(v, true)
+  cont := f.block()
+  f.push_loop(brk, cont, n.label)
+  f.stmt(n.body)
+  f.pop_loop()
+  f.end()
+  f.load_slot(c)
+  if fl { f.op(0xBF) }
+  f.load_slot(s)
+  f.op(0x50)
+  if fl {
+    f.if_i64()
+    f.b.byte(0x44)
+    f.b.u64(-4616189618054758400)                       # -1.0
+    f.op(0xBD)
+    f.else_()
+    f.b.byte(0x44)
+    f.b.u64(0x3FF0000000000000)                         # 1.0
+    f.op(0xBD)
+    f.end()
+    f.op(0xBF)
+    f.op(0xA0)
+    f.op(0xBD)
+  } else {
+    f.if_i64()
+    f.i64c(-1)
+    f.else_()
+    f.i64c(1)
+    f.end()
+    f.op(0x7C)
+  }
+  f.store_slot(c)
+  f.br(top)
+  f.end()
+  f.end()
+}
+fn (f: *Fn) range_put(target: *ast.Node, src_t: str, n: *ast.Node) {
+  if target == nil || target.name == "_" {
+    f.op(0x1A)
+    return
+  }
+  tt := target.ty
+  if target.kind == "Var" { tt = f.lookup(target.name, n).t }
+  f.coerce(src_t, tt, n)
+  f.store_target(&Target{t: target}, n.define, n)
+}
+fn (f: *Fn) range_(n: *ast.Node) {
+  g := f.g
+  st := strip_ptr(types.dflt(n.subject.ty))
+  rk := ""
+  if st == "str" { rk = "str" } else if in_kind_code(st) { rk = "int" } else { rk = g.kind_of_t(st) }
+  obj := f.hidden()
+  i := f.hidden()
+  lim := f.hidden()
+  rdata := f.hidden()
+  f.expr(n.subject)
+  if rk == "array" && !fresh(n.subject) {
+    f.push()
+    f.push_desc(st, n)
+    f.rt("rt_copy_val", 2)
+  }
+  f.store_slot(obj)
+  f.i64c(0)
+  f.store_slot(i)
+  if rk == "slice" {
+    f.load_slot(obj)
+    f.op(0x50)
+    f.if_()
+    f.i64c(0)
+    f.store_slot(rdata)
+    f.i64c(0)
+    f.store_slot(lim)
+    f.else_()
+    f.load_slot(obj)
+    f.load_at_off(0)
+    f.store_slot(rdata)
+    f.load_slot(obj)
+    f.load_at_off(8)
+    f.store_slot(lim)
+    f.end()
+  } else if rk == "array" {
+    f.i64c(types.tinfo(st).n)
+    f.store_slot(lim)
+  } else if rk == "str" {
+    f.load_slot(obj)
+    f.load_at_off(0)
+    f.store_slot(lim)
+  } else if rk == "map" {
+    f.load_slot(obj)
+    f.push()
+    f.rt("rt_map_used", 1)
+    f.store_slot(lim)
+  } else if rk == "int" {
+    f.load_slot(obj)
+    f.store_slot(lim)
+  } else {
+    nfail("range over " + types.show_t(n.subject.ty) + " is not supported yet", n)
+  }
+  let kv: *ast.Node = nil
+  let vv: *ast.Node = nil
+  if len(n.vars) > 0 { kv = n.vars[0] }
+  if len(n.vars) > 1 { vv = n.vars[1] }
+  k_t := "int"
+  v_t := ""
+  if rk == "str" {
+    v_t = "int32"
+  } else if rk == "map" {
+    ti := types.tinfo(st)
+    k_t = ti.key
+    v_t = ti.val
+  } else if rk != "int" {
+    v_t = types.tinfo(st).elem
+  }
+  step := f.hidden()
+  brk := f.block()
+  top := f.loop_()
+  f.load_slot(i)
+  f.load_slot(lim)
+  f.op(0x59)                                           # i >= lim: leave
+  f.br_if(brk)
+  cont := f.block()
+  f.push_loop(brk, cont, n.label)
+  if rk == "map" {
+    f.load_slot(obj)
+    f.push()
+    f.load_slot(i)
+    f.push()
+    f.rt("rt_map_live", 2)
+    f.op(0x50)
+    f.br_if(cont)
+    if vv != nil && vv.name != "_" {
+      f.load_slot(obj)
+      f.push()
+      f.load_slot(i)
+      f.push()
+      f.rt("rt_map_val", 2)
+      f.range_put(vv, v_t, n)
+    }
+    if kv != nil && kv.name != "_" {
+      f.load_slot(obj)
+      f.push()
+      f.load_slot(i)
+      f.push()
+      f.rt("rt_map_key", 2)
+      f.range_put(kv, k_t, n)
+    }
+  } else if rk == "str" {
+    f.load_slot(obj)
+    f.i64c(8)
+    f.op(0x7C)
+    f.push()
+    f.load_slot(i)
+    f.push()
+    f.rt("rt_rune_at", 2)
+    if vv != nil && vv.name != "_" { f.range_put(vv, v_t, n) } else { f.op(0x1A) }
+    f.g.m.addr32(f.b, "r.g.rt_rune_n", 0)
+    f.mem(0x29, 3, 0)
+    f.store_slot(step)
+    if kv != nil && kv.name != "_" {
+      f.load_slot(i)
+      f.range_put(kv, k_t, n)
+    }
+  } else {
+    if vv != nil && vv.name != "_" {
+      if rk == "int" { nfail("range over a number only has an index", n) }
+      if rk == "slice" { f.load_slot(rdata) } else { f.load_slot(obj) }
+      f.load_slot(i)
+      if g.byte_elems(st) {
+        f.op(0x7C)
+        f.wrap()
+        f.mem(0x31, 0, 0)
+      } else {
+        f.i64c(3)
+        f.op(0x86)
+        f.op(0x7C)
+        f.load_at_off(0)
+      }
+      if g.is_value_type(vv.ty) {
+        f.push()
+        f.push_desc(vv.ty, n)
+        f.rt("rt_copy_val", 2)
+      }
+      f.range_put(vv, v_t, n)
+    }
+    if kv != nil && kv.name != "_" {
+      f.load_slot(i)
+      f.range_put(kv, k_t, n)
+    }
+  }
+  f.stmt(n.body)
+  f.pop_loop()
+  f.end()
+  f.load_slot(i)
+  if rk == "str" { f.load_slot(step) } else { f.i64c(1) }
+  f.op(0x7C)
+  f.store_slot(i)
+  f.br(top)
+  f.end()
+  f.end()
+}

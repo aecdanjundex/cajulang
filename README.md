@@ -1,8 +1,9 @@
 # Caju
 
 Uma linguagem de programação inspirada em Go, que compila direto para código de máquina x86-64
-(Linux e Windows). O compilador e o runtime são escritos na própria Caju, e o compilador compila
-a si mesmo.
+(Linux e Windows) e para WebAssembly. O compilador e o runtime são escritos na própria Caju, e o
+compilador compila a si mesmo, também em WebAssembly: é ele que roda no
+[playground](https://cajulang.vercel.app/en/playground), dentro do navegador.
 
 ```
 fn greet(name: str) -> str {
@@ -32,6 +33,26 @@ caju build -o programa programa.caju
 caju test                           # roda os *_test.caju do diretório
 caju version
 ```
+
+## WebAssembly
+
+```sh
+caju build --target wasm -o programa.wasm programa.caju
+node tools/wasm/run.mjs programa.wasm       # no Node (o hospedeiro faz as chamadas de sistema)
+```
+
+Cada release traz `caju-wasm.tar.gz`: o compilador compilado para WebAssembly (`caju.wasm`), a
+biblioteca padrão e o runtime (`caju-files.json`) e `caju-browser.mjs`, que compila e roda
+programas num navegador:
+
+```js
+import { loadCaju } from "./caju-browser.mjs"
+const caju = await loadCaju({ wasm: await fetch("caju.wasm"), files: await (await fetch("caju-files.json")).json() })
+const c = await caju.compile('print("Olá")')
+if (c.ok) await caju.run(c.wasm, { stdout: (b) => console.log(new TextDecoder().decode(b)) })
+```
+
+Detalhes em `docs/wasm.md`.
 
 ## Biblioteca padrão
 
@@ -93,6 +114,7 @@ describe("strings.split", fn() {
 - `docs/testing.md`: testes com `caju test` e `std/testing`.
 - `docs/compiler-port.md`: como o compilador foi portado de JavaScript para Caju.
 - `docs/arquitetura-nativo.md`: como o compilador nativo funciona por dentro.
+- `docs/wasm.md`: o alvo WebAssembly e o compilador no navegador.
 - `docs/plano-compilador-nativo.md`: o plano das fases.
 - `docs/historico.md`: o que foi feito até aqui e por quê.
 - `docs/releasing.md`: como publicar uma versão nova.

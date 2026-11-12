@@ -1,6 +1,6 @@
 # caju: the command line of the Caju compiler.
 #
-#   caju build [-o output] [--target linux|windows] file.caju
+#   caju build [-o output] [--target linux|windows|wasm] file.caju
 #   caju run file.caju [arguments...]      compile in memory and run (nothing written to disk)
 #   caju test [-v] [--run text] [--record] [dir|file ...]          run the test suite (tests/*)
 #   caju bench [--runs=N] [--note=text] [--history] [filter]
@@ -16,13 +16,14 @@ import "std/bytes"
 import "ast"
 import "project"
 import "native"
+import "wasm"
 import "pkg"
 import "std/fs"
 import filepath "std/path"
 
 
 fn usage() {
-  os.stderr("usage:\n  caju build [-o output] [--target linux|windows] file.caju\n  caju run file.caju [arguments...]\n  caju test [-v] [--run text] [--record] [dir|file ...]\n  caju bench [--runs=N] [--note=text] [--history] [filter]\n  caju pkg init|add|remove|update|install|verify|tree|hash ...\n  caju version\n")
+  os.stderr("usage:\n  caju build [-o output] [--target linux|windows|wasm] file.caju\n  caju run file.caju [arguments...]\n  caju test [-v] [--run text] [--record] [--target wasm] [dir|file ...]\n  caju bench [--runs=N] [--note=text] [--history] [filter]\n  caju pkg init|add|remove|update|install|verify|tree|hash ...\n  caju version\n")
   os.exit(2)
 }
 
@@ -87,6 +88,10 @@ fn compile_as(entry: str, target: str, test: bool) -> (image: *bytes.Buffer, mes
     }
     files[0].src = files[0].src + "\nimport __caju_testing \"std/testing\"\n__caju_testing.finish()\n"
   }
+  if target == "wasm" {
+    image = wasm.compile_wasm(files, rt_sources(target))
+    return
+  }
   image = native.compile_native(files, rt_sources(target), target)
   return
 }
@@ -119,10 +124,11 @@ fn cmd_build(args: []str) {
     i++
   }
   if entry == "" { usage() }
-  if target != "linux" && target != "windows" { die("unknown target \"" + target + "\" (linux or windows)") }
+  if target != "linux" && target != "windows" && target != "wasm" { die("unknown target \"" + target + "\" (linux, windows or wasm)") }
   if out == "" {
     out = base_name(entry)
     if target == "windows" { out = out + ".exe" }
+    if target == "wasm" { out = out + ".wasm" }
   }
   image, msg := compile(entry, target)
   if image == nil {
@@ -220,12 +226,16 @@ fn cmd_test(args: []str) {
   record := false
   verbose := false
   filter := ""
+  target := "linux"
   paths := []str{}
   i := 0
   while i < len(args) {
     a := args[i]
     if a == "--record" { record = true } else if a == "-v" { verbose = true } else if a == "--run" && i + 1 < len(args) {
       filter = args[i + 1]
+      i++
+    } else if a == "--target" && i + 1 < len(args) {
+      target = args[i + 1]
       i++
     } else if strings.has_prefix(a, "-") { usage() } else { paths = append(paths, a) }
     i++
@@ -237,13 +247,16 @@ fn cmd_test(args: []str) {
   tmp, err := fs.temp_dir("", "caju-test-")
   if err != nil { die(err.Error()) }
   bin := tmp + "/t"
-  env := env_with([]str{"CAJU_BIN=" + os.executable(), "CAJU_ROOT=" + root(), "CAJU_SKIP_SLEEP=1", "CAJU_TEST_RUN=" + filter})
+  vars := []str{"CAJU_BIN=" + os.executable(), "CAJU_ROOT=" + root(), "CAJU_SKIP_SLEEP=1", "CAJU_TEST_RUN=" + filter}
+  # wasm: the programs that the tests run are compiled to wasm too
+  if target == "wasm" { vars = []str{"CAJU_BIN=" + root() + "/tools/wasm/caju-wasm.sh", "CAJU_WASM_COMPILER=" + os.executable(), "CAJU_ROOT=" + root(), "CAJU_SKIP_SLEEP=1", "CAJU_TEST_RUN=" + filter} }
+  env := env_with(vars)
   tp := 0
   tf := 0
   ts := 0
   bad_files := []str{}
   for _, f := range files {
-    image, msg := compile_as(f, "linux", true)
+    image, msg := compile_as(f, target, true)
     if image == nil {
       if strings.contains(msg, "not supported yet") {
         print("skip " + f + ": " + msg)
@@ -255,7 +268,10 @@ fn cmd_test(args: []str) {
     }
     err = os.write_file(bin, image.string(), 0o755)
     if err != nil { die(err.Error()) }
-    p, err2 := os.run([]str{"sh", "-c", "cd \"$1\" && exec timeout 120 \"$2\"", "sh", filepath.dir(f), bin}, env, true)
+    cmd := []str{"sh", "-c", "cd \"$1\" && exec timeout 120 \"$2\"", "sh", filepath.dir(f), bin}
+    # wasm: the module runs in Node (tools/wasm/run.mjs gives it the system calls)
+    if target == "wasm" { cmd = []str{"sh", "-c", "cd \"$1\" && exec timeout 120 node \"$3\" \"$2\"", "sh", filepath.dir(f), bin, root() + "/tools/wasm/run.mjs"} }
+    p, err2 := os.run(cmd, env, true)
     if err2 != nil { die(err2.Error()) }
     np, nf, ns, ok := parse_summary(p.output)
     tp += np

@@ -18,7 +18,8 @@ compiler/*.caju      o compilador, em Caju (ver docs/compiler-port.md, tabela de
   dump_main.caju       imprime a árvore de um estágio (parse, link, check) para comparar com o JS
   *_test.caju          testes do compilador nativo, do runtime, do pkg e do alvo Windows
   testdata/            programas auxiliares desses testes
-rt/*.caju            runtime dos programas: core, gc, values, dynamic, panic, linux, windows
+  wasm.caju, wasmenc.caju  o alvo WebAssembly (`--target wasm`, docs/wasm.md)
+rt/*.caju            runtime dos programas: core, gc, values, dynamic, panic, linux, windows, wasm
 lib/*.caju           biblioteca padrão (import "std/x"): strings, strconv, math, bytes, os, fs, path,
                      net, http, toml, json, crypto, hash, hex, base64, testing; cada uma com seu _test.caju
 bootstrap/*.js       o compilador original em JavaScript (léxico, parser, tipos, ligador, VM, native.js)
@@ -27,6 +28,8 @@ examples/            exemplos da linguagem; examples_test.caju roda cada um e co
 bench/               programs/*.caju + run.js; history.jsonl guarda a evolução da velocidade
 tools/compare-compilers.sh   JS × compilador em Caju: binários idênticos em todos os programas
 tools/release.sh     monta dist/caju-linux-x86_64.tar.gz (docs/releasing.md); install.sh na raiz instala
+tools/wasm/          hospedeiro dos programas em wasm (Node e navegador) e package.sh (caju-wasm.tar.gz,
+                     o compilador em wasm que o playground do site usa)
 .github/workflows/   ci.yml (cadeia + suíte a cada push) e release.yml (tag v* → GitHub Release)
 docs/                packages.md, testing.md, compiler-port.md, arquitetura-nativo.md, plano, histórico
 build/, dist/        gerados (não versionar)
@@ -42,6 +45,8 @@ build/caju2 build -o build/caju3 compiler/main.caju && cmp build/caju2 build/caj
 build/caju test                   # todos os *_test.caju (≈30 s); -v mostra cada teste
 build/caju test lib/fs_test.caju --run "mkdir_all"
 build/caju run programa.caju      # compila em memória e roda
+build/caju test --target wasm tests/lang lib examples   # a suíte com os programas em wasm (Node)
+CAJU=build/caju tools/wasm/package.sh                   # caju.wasm compila a si mesmo igual + teste de navegador
 ```
 
 **Testes** (docs/testing.md): estilo Go na organização (`x_test.caju` ao lado de `x.caju`,
@@ -49,6 +54,10 @@ auxiliares em `testdata/`) e BDD na escrita: `describe("assunto", fn() { it("fra
 comportamento", fn() { expect(v).to_equal(w) }) })`. Não existem arquivos `.out`. Erros de
 compilação/execução de um programa inteiro: `run_file("testdata/x.caju")` → `r.output`, `r.code`.
 Bug conhecido ainda não corrigido: escreva o teste certo com `skip("... (known bug)", ...)`.
+
+Em wasm (`--target wasm tests/lang lib examples`) passa tudo menos `net` e `http` (sem sockets).
+Mudou o gerador nativo ou o `rt/`? Rode também a suíte em wasm: `compiler/wasm.caju` repete a
+semântica de `native.caju` (sem as otimizações) e usa o mesmo runtime.
 
 Resultado esperado hoje: **811 passam, 0 falham, 9 pulados** (goroutines, alloc/peek/poke,
 programas Windows das fases 6 e 7, e 3 bugs conhecidos em `tests/lang`: variável lida antes de
