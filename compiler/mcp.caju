@@ -78,14 +78,7 @@ fn diags_json(ds: []*Diagnostic) -> str {
   return "[" + strings.join(parts, ",") + "]"
 }
 # `caju check [--json] file.caju`: exit 0 when the program compiles
-export fn command_check(args: []str, lib_dir: str) {
-  as_json := false
-  entry := ""
-  for _, a := range args { if a == "--json" { as_json = true } else { entry = a } }
-  if entry == "" {
-    os.eprintln("usage: caju check [--json] file.caju")
-    os.exit(2)
-  }
+export fn command_check(entry: str, as_json: bool, lib_dir: str) {
   ds := diagnose(entry, lib_dir)
   if as_json {
     os.stdout("{\"ok\":" + str(len(ds) == 0) + ",\"diagnostics\":" + diags_json(ds) + "}\n")

@@ -1,17 +1,11 @@
-# caju: the command line of the Caju compiler.
-#
-#   caju build [-o output] [--target linux|windows|wasm] file.caju
-#   caju run file.caju [arguments...]      compile in memory and run (nothing written to disk)
-#   caju test [-v] [--run text] [--record] [dir|file ...]          run the test suite (tests/*)
-#   caju bench [--runs=N] [--note=text] [--history] [filter]
-#   caju check [--json] file.caju          type-check without generating code (exit 1 on errors)
-#   caju mcp                               a Model Context Protocol server on stdin/stdout (compiler/mcp.caju)
-#   caju version
+# caju: the command line of the Caju compiler. The commands, flags and help are declared with
+# std/cli at the end of this file (`caju --help`, `caju help <command>`).
 #
 # The installation root (CAJU_ROOT, default: the directory above the one holding this program)
 # has lib/ (the standard library), rt/ (the runtime, written in Caju) and tests/ and bench/.
 
 import "std/os"
+import "std/cli"
 import "std/strings"
 import "std/strconv"
 import "std/bytes"
@@ -24,11 +18,6 @@ import "mcp"
 import "std/fs"
 import filepath "std/path"
 
-
-fn usage() {
-  os.stderr("usage:\n  caju build [-o output] [--target linux|windows|wasm] file.caju\n  caju run file.caju [arguments...]\n  caju test [-v] [--run text] [--record] [--target wasm] [dir|file ...]\n  caju bench [--runs=N] [--note=text] [--history] [filter]\n  caju check [--json] file.caju\n  caju pkg init|add|remove|update|install|verify|tree|hash ...\n  caju mcp\n  caju version\n")
-  os.exit(2)
-}
 
 fn root() -> str {
   r := os.getenv("CAJU_ROOT")
@@ -105,29 +94,7 @@ fn base_name(path: str) -> str {
   return strings.trim_suffix(b, ".caju")
 }
 
-fn cmd_build(args: []str) {
-  out := ""
-  target := "linux"
-  entry := ""
-  i := 0
-  while i < len(args) {
-    a := args[i]
-    if a == "-o" && i + 1 < len(args) {
-      out = args[i + 1]
-      i += 2
-      continue
-    }
-    if a == "--target" && i + 1 < len(args) {
-      target = args[i + 1]
-      i += 2
-      continue
-    }
-    if entry != "" || strings.has_prefix(a, "-") { usage() }
-    entry = a
-    i++
-  }
-  if entry == "" { usage() }
-  if target != "linux" && target != "windows" && target != "wasm" { die("unknown target \"" + target + "\" (linux, windows or wasm)") }
+fn cmd_build(out: str, target: str, entry: str) {
   if out == "" {
     out = base_name(entry)
     if target == "windows" { out = out + ".exe" }
@@ -142,8 +109,9 @@ fn cmd_build(args: []str) {
   if err != nil { die(err.Error()) }
 }
 
-fn cmd_run(args: []str) {
-  if len(args) == 0 { usage() }
+fn cmd_run(entry: str, program_args: []str) {
+  args := []str{entry}
+  for _, x := range program_args { args = append(args, x) }
   image, msg := compile(args[0], "linux")
   if image == nil {
     os.eprintln(msg)
@@ -225,24 +193,7 @@ fn parse_summary(out: str) -> (p: int, f: int, s: int, ok: bool) {
   return nums[0], nums[1], nums[2], true
 }
 
-fn cmd_test(args: []str) {
-  record := false
-  verbose := false
-  filter := ""
-  target := "linux"
-  paths := []str{}
-  i := 0
-  while i < len(args) {
-    a := args[i]
-    if a == "--record" { record = true } else if a == "-v" { verbose = true } else if a == "--run" && i + 1 < len(args) {
-      filter = args[i + 1]
-      i++
-    } else if a == "--target" && i + 1 < len(args) {
-      target = args[i + 1]
-      i++
-    } else if strings.has_prefix(a, "-") { usage() } else { paths = append(paths, a) }
-    i++
-  }
+fn cmd_test(record: bool, verbose: bool, filter: str, target: str, paths: []str) {
   if len(paths) == 0 { paths = []str{"."} }
   files := []str{}
   for _, dir := range paths { for _, f := range find_tests(dir) { files = append(files, f) } }
@@ -319,20 +270,11 @@ fn pad_right(s: str, n: int) -> str {
   return s
 }
 
-fn cmd_bench(args: []str) {
-  runs := 3
-  note := ""
-  filter := ""
-  for _, a := range args {
-    if strings.has_prefix(a, "--runs=") {
-      runs, _ = strconv.atoi(a[7:])
-    } else if strings.has_prefix(a, "--note=") {
-      note = a[7:]
-    } else if a == "--history" {
-      p, err := os.run([]str{"cat", root() + "/bench/history.jsonl"}, nil, false)
-      if err == nil { os.stdout(p.output) }
-      return
-    } else { filter = a }
+fn cmd_bench(runs: int, note: str, history: bool, filter: str) {
+  if history {
+    p, err := os.run([]str{"cat", root() + "/bench/history.jsonl"}, nil, false)
+    if err == nil { os.stdout(p.output) }
+    return
   }
   dir := root() + "/bench/programs/"
   p, err := os.run([]str{"ls", "-1", dir}, nil, false)
@@ -385,24 +327,46 @@ fn cmd_bench(args: []str) {
   if bad > 0 { os.exit(1) }
 }
 
-let argv = os.args()
-if len(argv) < 2 { usage() }
-cmd := argv[1]
-rest := argv[2:]
-if cmd == "build" {
-  cmd_build(rest)
-} else if cmd == "run" {
-  cmd_run(rest)
-} else if cmd == "test" {
-  cmd_test(rest)
-} else if cmd == "bench" {
-  cmd_bench(rest)
-} else if cmd == "pkg" {
-  pkg.command(rest)
-} else if cmd == "check" {
-  mcp.command_check(rest, root() + "/lib")
-} else if cmd == "mcp" {
-  mcp.serve(root(), os.executable())
-} else if cmd == "version" || cmd == "--version" {
-  print("caju " + pkg.VERSION)
-} else { usage() }
+# ---------------------------------------------------------------- the command line
+
+let app = cli.app("caju", "The Caju compiler: build, run and test Caju programs").version(pkg.VERSION)
+
+let c_build = app.sub("build", "Compile a program to an executable")
+c_build.flag_str("output", "o", "file", "", "where to write the executable").default_text("the file's name, with .exe or .wasm")
+c_build.flag_str("target", "", "target", "linux", "what to compile for").choices([]str{"linux", "windows", "wasm"})
+c_build.arg("file", "the entry .caju file")
+c_build.example("caju build -o hello hello.caju", "a Linux executable")
+c_build.example("caju build --target wasm hello.caju", "hello.wasm (run it with tools/wasm/run.mjs)")
+c_build.action(fn(m: *cli.Match) { cmd_build(m.str("output"), m.str("target"), m.arg("file")) })
+
+let c_run = app.sub("run", "Compile in memory and run (nothing is written to disk)")
+c_run.arg("file", "the entry .caju file")
+c_run.args("arguments", "passed to the program, flags included").raw()
+c_run.action(fn(m: *cli.Match) { cmd_run(m.arg("file"), m.args("arguments")) })
+
+let c_test = app.sub("test", "Run the *_test.caju files")
+c_test.flag_bool("verbose", "v", "show every test")
+c_test.flag_str("run", "", "text", "", "only the tests whose name contains this text")
+c_test.flag_bool("record", "", "add the result to tests/history.jsonl").hidden()
+c_test.flag_str("target", "", "target", "linux", "compile the tests for").choices([]str{"linux", "wasm"})
+c_test.args("paths", "test files or directories (default: the current directory)")
+c_test.action(fn(m: *cli.Match) { cmd_test(m.bool("record"), m.bool("verbose"), m.str("run"), m.str("target"), m.args("paths")) })
+
+let c_bench = app.sub("bench", "Run the benchmarks of bench/programs and record them")
+c_bench.flag_int("runs", "", "n", 3, "runs of each program (the fastest counts)")
+c_bench.flag_str("note", "", "text", "", "a note saved with the results")
+c_bench.flag_bool("history", "", "print bench/history.jsonl instead")
+c_bench.arg_opt("filter", "only the programs whose name contains this text (not recorded)")
+c_bench.action(fn(m: *cli.Match) { cmd_bench(m.int("runs"), m.str("note"), m.bool("history"), m.arg("filter")) })
+
+let c_check = app.sub("check", "Type-check a program without generating code (exit 1 on errors)")
+c_check.flag_bool("json", "", "print the diagnostics as JSON")
+c_check.arg("file", "the entry .caju file")
+c_check.action(fn(m: *cli.Match) { mcp.command_check(m.arg("file"), m.bool("json"), root() + "/lib") })
+
+pkg.register(app)
+
+app.sub("mcp", "Serve the Model Context Protocol on stdin/stdout, for AI assistants").action(fn(m: *cli.Match) { mcp.serve(root(), os.executable()) })
+app.sub("version", "Show the version").action(fn(m: *cli.Match) { print("caju " + pkg.VERSION) })
+
+app.run(os.args()[1:])

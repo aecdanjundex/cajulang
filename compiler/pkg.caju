@@ -17,9 +17,10 @@ import "std/path"
 import "std/strings"
 import "std/toml"
 import "std/crypto"
+import "std/cli"
 import "project"
 
-export const VERSION = "0.4.0"     # the version of the compiler (caju version)
+export const VERSION = "0.5.0"     # the version of the compiler (caju version)
 const LOCK_VERSION = 1
 
 # ---------------------------------------------------------------- versions (semver)
@@ -949,11 +950,6 @@ fn die(msg: str) {
   os.exit(1)
 }
 
-fn pkg_usage() {
-  os.stderr("usage:\n  caju pkg init [name]               create caju.toml (name: github.com/owner/repo)\n  caju pkg add name[@version]         add a dependency (default: the latest release)\n  caju pkg remove name                remove a dependency\n  caju pkg update [name]              move dependencies to their latest release\n  caju pkg install                    download what caju.lock lists (resolving again if caju.toml changed)\n  caju pkg verify                     check the cached packages against the hashes in caju.lock\n  caju pkg tree                       show the dependency tree\n  caju pkg hash [dir]                 the hash of a package directory\n  caju pkg cache list                 the downloaded packages, shared by every project\n  caju pkg cache verify               check every cached package against the hash recorded when downloaded\n  caju pkg cache clean [name[@ver]]   remove cached packages (all, one package, or one version)\n  caju pkg cache dir                  where the cache is\n")
-  os.exit(2)
-}
-
 fn project_root() -> str {
   r := find_root(".")
   if r == "" { die("no caju.toml here or in a parent directory (create one with caju pkg init)") }
@@ -965,10 +961,9 @@ fn print_or_die(out: str, err: error) {
   if out != "" { print(out) }
 }
 
-fn cmd_init(args: []str) {
+fn cmd_init(name: str) {
   if os.exists("caju.toml") { die("caju.toml already exists") }
-  name := ""
-  if len(args) > 0 { name = args[0] } else {
+  if name == "" {
     out, err := git([]str{"remote", "get-url", "origin"})
     if err == nil {
       u := strings.trim_suffix(out, ".git")
@@ -986,52 +981,85 @@ fn cmd_init(args: []str) {
   print("created caju.toml for " + name)
 }
 
-fn cmd_cache(args: []str) {
-  sub := "list"
-  if len(args) > 0 { sub = args[0] }
-  if sub == "list" || sub == "verify" {
-    out, bad := cache_report(sub == "verify")
-    print(out)
-    if bad > 0 { os.exit(1) }
-  } else if sub == "clean" {
-    name := ""
-    version := ""
-    if len(args) > 1 { name, version = split_at(args[1]) }
+fn print_report(out: str, bad: int) {
+  print(out)
+  if bad > 0 { os.exit(1) }
+}
+
+# `caju pkg ...`, declared under the program's command line
+export fn register(app: *cli.Command) {
+  p := app.sub("pkg", "Manage the packages of a project (caju.toml, caju.lock)")
+  p.describe("Packages are GitHub repositories (github.com/owner/repo) with releases tagged vX.Y.Z.\nDownloads go to a cache shared by every project and are reused only if their files\nstill have the hash recorded when they were downloaded (docs/packages.md).")
+
+  c_init := p.sub("init", "Create caju.toml")
+  c_init.arg_opt("name", "github.com/owner/repo (default: from the git origin remote)")
+  c_init.action(fn(m: *cli.Match) { cmd_init(m.arg("name")) })
+
+  c_add := p.sub("add", "Add a dependency and install it")
+  c_add.arg("package", "github.com/owner/repo, optionally @version (default: the latest release)")
+  c_add.example("caju pkg add github.com/aecdanjundex/web", "the latest release")
+  c_add.example("caju pkg add github.com/acme/greet@0.2.0", "a given version")
+  c_add.action(fn(m: *cli.Match) {
+    out, err := add(project_root(), m.arg("package"))
+    print_or_die(out, err)
+  })
+
+  c_rm := p.sub("remove", "Remove a dependency")
+  c_rm.arg("package", "github.com/owner/repo")
+  c_rm.action(fn(m: *cli.Match) {
+    out, err := remove(project_root(), m.arg("package"))
+    print_or_die(out, err)
+  })
+
+  c_up := p.sub("update", "Move dependencies to their latest release")
+  c_up.arg_opt("package", "only this one (default: all)")
+  c_up.action(fn(m: *cli.Match) {
+    out, err := update(project_root(), m.arg("package"))
+    print_or_die(out, err)
+  })
+
+  p.sub("install", "Download what caju.lock lists (resolving again if caju.toml changed)").action(fn(m: *cli.Match) {
+    out, err := install_report(project_root())
+    print_or_die(out, err)
+  })
+  p.sub("verify", "Check the cached packages against the hashes in caju.lock").action(fn(m: *cli.Match) {
+    out, bad, err := verify(project_root())
+    if err != nil { die(err.Error()) }
+    print_report(out, bad)
+  })
+  p.sub("tree", "Show the dependency tree").action(fn(m: *cli.Match) {
+    out, err := tree(project_root())
+    print_or_die(out, err)
+  })
+  h := p.sub("hash", "Print the hash of a package directory")
+  h.arg_opt("dir", "the directory (default: the current one)")
+  h.action(fn(m: *cli.Match) {
+    dir := m.arg("dir")
+    if dir == "" { dir = "." }
+    out, err := hash_dir(dir)
+    print_or_die(out, err)
+  })
+
+  c := p.sub("cache", "The downloaded packages, shared by every project (default: list)")
+  c.action(fn(m: *cli.Match) {
+    out, bad := cache_report(false)
+    print_report(out, bad)
+  })
+  c.sub("list", "List the cached packages with their commit and size").action(fn(m: *cli.Match) {
+    out, bad := cache_report(false)
+    print_report(out, bad)
+  })
+  c.sub("verify", "Check every cached package against the hash recorded when it was downloaded").action(fn(m: *cli.Match) {
+    out, bad := cache_report(true)
+    print_report(out, bad)
+  })
+  cl := c.sub("clean", "Remove cached packages")
+  cl.arg_opt("package", "name or name@version (default: everything)")
+  cl.action(fn(m: *cli.Match) {
+    name, version := split_at(m.arg("package"))
     n, err := cache_clean(name, version)
     if err != nil { die(err.Error()) }
     print("removed " + str(n) + " cached packages")
-  } else if sub == "dir" { print(path.join(home(), "pkg")) } else { pkg_usage() }
-}
-
-export fn command(args: []str) {
-  if len(args) == 0 { pkg_usage() }
-  sub := args[0]
-  rest := args[1:]
-  out := ""
-  let err: error = nil
-  if sub == "init" {
-    cmd_init(rest)
-    return
-  } else if sub == "cache" {
-    cmd_cache(rest)
-    return
-  } else if sub == "verify" {
-    report, bad, err2 := verify(project_root())
-    if err2 != nil { die(err2.Error()) }
-    print(report)
-    if bad > 0 { os.exit(1) }
-    return
-  } else if sub == "add" || sub == "remove" {
-    if len(rest) != 1 { pkg_usage() }
-    if sub == "add" { out, err = add(project_root(), rest[0]) } else { out, err = remove(project_root(), rest[0]) }
-  } else if sub == "update" {
-    only := ""
-    if len(rest) > 0 { only = rest[0] }
-    out, err = update(project_root(), only)
-  } else if sub == "install" { out, err = install_report(project_root()) } else if sub == "tree" { out, err = tree(project_root()) } else if sub == "hash" {
-    dir := "."
-    if len(rest) > 0 { dir = rest[0] }
-    out, err = hash_dir(dir)
-  } else { pkg_usage() }
-  print_or_die(out, err)
+  })
+  c.sub("dir", "Print where the cache is").action(fn(m: *cli.Match) { print(path.join(home(), "pkg")) })
 }
