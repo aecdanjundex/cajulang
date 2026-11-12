@@ -1,184 +1,186 @@
-# Compilador nativo da Caju: como está feito (fases 1 a 5)
+# Caju native compiler: how it is built (phases 1 to 5)
 
-Referência técnica para quem continua o trabalho. O código está em `bootstrap/native.js` (o
-compilador, em JavaScript) e em
-`rt/*.caju` (o runtime, escrito em Caju e compilado junto com cada programa).
+Technical reference for whoever continues the work. The code lives in `bootstrap/native.js` (the
+compiler, in JavaScript) and in
+`rt/*.caju` (the runtime, written in Caju and compiled together with each program).
 
-## Visão geral
+## Overview
 
 ```
-compileNative(files, { target: "linux" | "windows" })  →  Uint8Array (ELF ou PE)
+compileNative(files, { target: "linux" | "windows" })  →  Uint8Array (ELF or PE)
 ```
 
-1. O programa do usuário passa por `link(files)` e `compile(ast)` (o compilador de bytecode):
-   assim todos os erros de tipo/compilação são os mesmos da VM, e a árvore fica **anotada** pelo
-   verificador (`n.ty`, `n.ik`, `callKind`, `convMode`, `celled`, `captures`, ...).
-2. O runtime: `NATIVE_RT.comum + gc + valores + dinamico + panico + (linux | windows)` vira um
-   arquivo só, `link` + `typecheck(ast, { intrinsics: true })`.
-3. Duas "unidades": `r` (runtime) e `u` (usuário). Símbolos: funções `r.f.nome` / `u.f.nome`,
-   globais `r.g.nome` / `u.g.nome`, código de topo `r.top` / `u.top`, closures `u.l.N`,
-   closures fixas de funções com nome `u.c.nome`, "thunks" de método preso `u.t.Tipo.metodo`,
-   descritores `desc.N`, tabelas de métodos `mt.N`, textos `str.N`.
-4. Gera código **direto da árvore** (sem IR), com um montador x86-64 próprio (`class X64`), e
-   escreve ELF (base 0x400000, código no offset 0x1000) ou PE32+ (ImageBase 0x140000000, sem
-   relocations, 2 seções, pilha de 64 MB, importação estática das DLLs dos `extern`).
+1. The user's program goes through `link(files)` and `compile(ast)` (the bytecode compiler), so
+   all type/compile errors are the same as in the VM, and the tree comes out **annotated** by the
+   checker (`n.ty`, `n.ik`, `callKind`, `convMode`, `celled`, `captures`, ...).
+2. The runtime: `NATIVE_RT.comum + gc + valores + dinamico + panico + (linux | windows)` becomes a
+   single file, then `link` + `typecheck(ast, { intrinsics: true })`.
+3. Two "units": `r` (runtime) and `u` (user). Symbols: functions `r.f.nome` / `u.f.nome`,
+   globals `r.g.nome` / `u.g.nome`, top-level code `r.top` / `u.top`, closures `u.l.N`,
+   fixed closures of named functions `u.c.nome`, bound-method "thunks" `u.t.Tipo.metodo`,
+   descriptors `desc.N`, method tables `mt.N`, strings `str.N`.
+4. Generates code **directly from the tree** (no IR), with its own x86-64 assembler (`class X64`),
+   and writes ELF (base 0x400000, code at offset 0x1000) or PE32+ (ImageBase 0x140000000, no
+   relocations, 2 sections, 64 MB stack, static import of the DLLs used by `extern`).
 
-Entrada (`start`): no Linux guarda RSP em `g.argp`; alinha a pilha; `call r.top` (globais do
-runtime); grava `rt_stack_top`, `rt_data_lo/hi` (para o coletor); `rt_init`; grava os
-descritores que o runtime usa (`rt_d_int`, `rt_d_num`, `rt_d_bool`, `rt_d_str`, `rt_d_any`,
+Entry point (`start`): on Linux, saves RSP in `g.argp`; aligns the stack; `call r.top` (runtime
+globals); stores `rt_stack_top`, `rt_data_lo/hi` (for the collector); `rt_init`; stores the
+descriptors the runtime uses (`rt_d_int`, `rt_d_num`, `rt_d_bool`, `rt_d_str`, `rt_d_any`,
 `rt_d_err`); `call u.top`; `rt_exit(0)`.
 
-## Convenção de chamada e quadros
+## Calling convention and frames
 
-- Todo valor cabe em 64 bits e cada expressão deixa o resultado em **RAX**. Floats viajam como
-  bits em RAX e vão para XMM0/XMM1 só na conta.
-- Argumentos empilhados da esquerda para a direita; quem chama tira. Parâmetro i (de n) fica em
-  `[rbp + 16 + 8*(n-1-i)]`. Locais em `[rbp - 8k]`. O tamanho do quadro é corrigido no fim
+- Every value fits in 64 bits, and each expression leaves its result in **RAX**. Floats travel as
+  bits in RAX and move to XMM0/XMM1 only for the arithmetic.
+- Arguments are pushed left to right; the caller pops them. Parameter i (of n) is at
+  `[rbp + 16 + 8*(n-1-i)]`. Locals are at `[rbp - 8k]`. The frame size is patched at the end
   (`frameAt`).
-- **Vários resultados:** o 1º em RAX, os outros em `g.ret + 8*i` (globais); quem chama copia
-  para lugares escondidos logo depois da chamada (`unpackCall`).
-- **Closure** = ponteiro para `[código, célula1, célula2, ...]`. Chamar um valor função: empilha o
-  objeto da closure **antes** dos argumentos, chama `[obj]`, tira n+1. A closure lê as células em
-  `[rbp + 16 + 8*nparams]`. Funções com nome ignoram esse argumento extra, por isso servem de
-  closure "fixa" (`u.c.nome` nos dados = `[u.f.nome]`).
-- Profundidade de chamadas em `r.g.rt_depth` (inc/dec em volta de cada chamada do usuário);
-  passou de 10.000 → "Recursão demais: mais de 10.000 chamadas de função abertas ao mesmo tempo".
-- `extern` no Windows: um thunk por função converte para a convenção Win64 (RCX, RDX, R8, R9,
-  XMM0-3, 32 bytes de sombra, pilha alinhada) e chama `[iat.dll.símbolo]`.
-- Lugares escondidos (`hidden()`): slot no quadro, ou um símbolo de dados no código de topo.
-- Variáveis com célula (capturadas por closure ou com endereço tomado com `&`): o slot guarda o
-  ponteiro da célula; `loadV`/`storeV` dereferenciam. Laço `for i := ...` com variável capturada
-  ganha célula nova a cada volta (como Go 1.22 e a VM: `REBOX`).
+- **Multiple results:** the 1st in RAX, the others in `g.ret + 8*i` (globals); the caller copies
+  them into hidden slots right after the call (`unpackCall`).
+- **Closure** = pointer to `[code, cell1, cell2, ...]`. Calling a function value: push the
+  closure object **before** the arguments, call `[obj]`, pop n+1. The closure reads its cells from
+  `[rbp + 16 + 8*nparams]`. Named functions ignore this extra argument, so they work as a
+  "fixed" closure (`u.c.nome` in data = `[u.f.nome]`).
+- Call depth is tracked in `r.g.rt_depth` (inc/dec around each user call); past 10,000 →
+  "Recursão demais: mais de 10.000 chamadas de função abertas ao mesmo tempo".
+- `extern` on Windows: one thunk per function converts to the Win64 convention (RCX, RDX, R8, R9,
+  XMM0-3, 32 bytes of shadow space, aligned stack) and calls `[iat.dll.símbolo]`.
+- Hidden slots (`hidden()`): a slot in the frame, or a data symbol in top-level code.
+- Celled variables (captured by a closure or with their address taken with `&`): the slot holds
+  the cell pointer; `loadV`/`storeV` dereference it. A `for i := ...` loop with a captured variable
+  gets a new cell on each iteration (like Go 1.22 and the VM: `REBOX`).
 
-## Representação dos valores (uma palavra de 8 bytes cada)
+## Value representation (one 8-byte word each)
 
-| Tipo | Na palavra |
+| Type | In the word |
 |---|---|
-| int, int8..int64, uint..., bool | o inteiro (os menores dão a volta: `wrapKind`) |
-| num, float32 | bits do double (float32 arredondado com cvtsd2ss/cvtss2sd) |
-| str | ponteiro para `[tamanho:8][bytes UTF-8][0]` (imutável; literais nos dados) |
-| []T | 0 (nil) ou ponteiro para o cabeçalho `[dados, tamanho, capacidade]` |
-| [N]T e struct | ponteiro para um objeto com N palavras (array) / uma palavra por campo |
-| *Struct, *[N]T | o próprio objeto (mesmo ponteiro do valor) |
-| *T (outros) | endereço de uma palavra (célula, global, campo, elemento) |
-| map[K]V | 0 ou ponteiro para a tabela do runtime (ordem de inserção + índice aberto) |
-| fn(...) | 0 ou ponteiro para a closure |
-| any, interface, error | 0 (nil) ou ponteiro para a caixa `[descritor, valor]` |
+| int, int8..int64, uint..., bool | the integer (smaller ones wrap around: `wrapKind`) |
+| num, float32 | the double's bits (float32 rounded with cvtsd2ss/cvtss2sd) |
+| str | pointer to `[length:8][UTF-8 bytes][0]` (immutable; literals in data) |
+| []T | 0 (nil) or pointer to the header `[data, length, capacity]` |
+| [N]T and struct | pointer to an object with N words (array) / one word per field |
+| *Struct, *[N]T | the object itself (same pointer as the value) |
+| *T (others) | address of a word (cell, global, field, element) |
+| map[K]V | 0 or pointer to the runtime table (insertion order + open-addressed index) |
+| fn(...) | 0 or pointer to the closure |
+| any, interface, error | 0 (nil) or pointer to the box `[descriptor, value]` |
 
-Cópia como na VM (`bindValue`): struct/array são copiados ao atribuir/passar/devolver quando a
-expressão não é "nova" (`fresh`: variável, campo, índice, deref, x.(T) não são novos);
-atribuir por cima de uma struct que já existe usa `rt_copy_into` (ponteiros para ela continuam).
+Copying works as in the VM (`bindValue`): structs/arrays are copied on assignment/pass/return when
+the expression is not "new" (`fresh`: variables, fields, indexes, derefs and x.(T) are not new);
+assigning over an existing struct uses `rt_copy_into` (pointers to it stay valid).
 
-### Descritor de tipo (8 palavras, nos dados, um por tipo canônico)
+### Type descriptor (8 words, in data, one per canonical type)
 
-`[0] tipo, [8] n (campos/elementos), [16] elemento (ou valor do map), [24] chave, [32] nome (texto),
-[40] tabela de campos ([nome, descritor, é-valor?] × n), [48] código do inteiro (KIND_CODE),
-[56] tabela de métodos (struct, *struct, erro) ou lista de nomes de métodos (interface)`.
-Tipos: 1 int, 2 uint, 3 num, 4 bool, 5 str, 6 slice, 7 array, 8 struct, 9 ponteiro, 10 map,
-11 any, 12 interface, 13 erro de errors.New, 14 função, 15 outro.
-As palavras com endereço são "data relocations" (`dataRelocs`), resolvidas na escrita do arquivo.
+`[0] kind, [8] n (fields/elements), [16] element (or map value), [24] key, [32] name (string),
+[40] field table ([name, descriptor, is-value?] × n), [48] integer code (KIND_CODE),
+[56] method table (struct, *struct, error) or list of method names (interface)`.
+Kinds: 1 int, 2 uint, 3 num, 4 bool, 5 str, 6 slice, 7 array, 8 struct, 9 pointer, 10 map,
+11 any, 12 interface, 13 errors.New error, 14 function, 15 other.
+Words holding addresses are "data relocations" (`dataRelocs`), resolved when the file is written.
 
-Tabela de métodos: `[n]` e n entradas de 48 bytes `[nome, código, caminho, descritor-da-cópia,
-por-valor?, descritor-do-resultado]`. `caminho` = `[n, índice de campo...]` pelos campos
-embutidos até o receptor. Chamada por interface: `rt_method` acha a entrada comparando o
-**ponteiro** do nome (textos iguais são o mesmo literal), `rt_method_recv` segue o caminho e
-copia se for por valor, e o código chama `[entrada+8]`. Num `any`, o resultado ganha caixa com o
-descritor do resultado.
+Method table: `[n]` followed by n 48-byte entries `[name, code, path, copy-descriptor,
+by-value?, result-descriptor]`. `path` = `[n, field index...]` through the embedded fields down to
+the receiver. Interface call: `rt_method` finds the entry by comparing the name **pointer** (equal
+strings are the same literal), `rt_method_recv` follows the path and copies if by value, and the
+code calls `[entry+8]`. In an `any`, the result is boxed with the result descriptor.
 
-### any e as regras da VM
+### any and the VM rules
 
-A VM guarda números do JS: inteiro "cru" é `int`, número com parte decimal é `num`, e
-int8/uint/num-inteiro/*struct vão numa caixa. O nativo reproduz pelo descritor da caixa:
-- conta com `any` (`rt_dyn_op`): em double; resultado inteiro (cabe em int64) vira `int`, senão
-  `num`; `+` com texto concatena o `fmt` dos dois; erros com as mensagens da VM;
-- verdade (`rt_truthy`): só `int` (descritor `rt_d_int`), `bool` e `str` são avaliados; qualquer
-  outra caixa (num, int8, uint...) conta como verdadeira, como a caixa da VM;
-- `==` (`rt_dyn_eq`): mesmo descritor e mesmo valor; `*struct` compara campo a campo (como a VM);
-- caixas prontas para inteiros de -128 a 1023 e para true/false (`rt_box_int`, `rt_box_bool`);
-- `any` indo para um tipo concreto (tipagem gradual) passa por `rt_unbox`; a VM não confere, o
-  nativo dá erro se o tipo não bater (única diferença intencional);
-- `x.(T)` (`rt_assert`) e o switch de tipos (`rt_type_is`) usam o descritor; a mensagem de erro
-  é a da VM (`x.(T): o valor guardado é U, não T`).
+The VM stores JS numbers: a "raw" integer is `int`, a number with a fractional part is `num`, and
+int8/uint/integral-num/*struct go in a box. The native compiler reproduces this through the box
+descriptor:
+- arithmetic on `any` (`rt_dyn_op`): done in double; an integral result (fitting in int64) becomes
+  `int`, otherwise `num`; `+` with a string concatenates the `fmt` of both; errors use the VM's
+  messages;
+- truthiness (`rt_truthy`): only `int` (descriptor `rt_d_int`), `bool` and `str` are evaluated;
+  any other box (num, int8, uint...) counts as true, like the VM's box;
+- `==` (`rt_dyn_eq`): same descriptor and same value; `*struct` compares field by field (like the VM);
+- prebuilt boxes for integers from -128 to 1023 and for true/false (`rt_box_int`, `rt_box_bool`);
+- `any` flowing into a concrete type (gradual typing) goes through `rt_unbox`; the VM does not
+  check, the native compiler raises an error if the type does not match (the only intentional
+  difference);
+- `x.(T)` (`rt_assert`) and the type switch (`rt_type_is`) use the descriptor; the error message
+  is the VM's (`x.(T): o valor guardado é U, não T`).
 
-## Runtime em Caju (`rt/`)
+## Runtime in Caju (`rt/`)
 
-| Arquivo | Conteúdo |
+| File | Contents |
 |---|---|
-| comum.caju | init, textos (concat, comparação), números em texto (12 algarismos, como o JS), bignums, pow/log/exp, saída com buffer, `rt_fatal`, sleep |
-| gc.caju | alocador (arena de 16 GB reservada, páginas de 64 KB, 40 classes de 16 a 16384 bytes, objetos maiores em páginas inteiras) e o coletor |
-| valores.caju | zero/cópia/igualdade por descritor, slices, append, sub-slices, UTF-8, conversões texto↔bytes↔runas, maps, `rt_fmt` (o print de valores compostos) |
-| dinamico.caju | caixas, contas com any, `x.(T)`, métodos por nome, `rt_unbox` |
-| panico.caju | defer, panic, recover, `rt_fail` (erro ao rodar = panic) |
-| linux.caju / windows.caju | escrever, memória (`rt_os_mem`, `rt_os_reserve`, `rt_os_commit`), dormir, sair |
+| comum.caju | init, strings (concat, comparison), number formatting (12 digits, like JS), bignums, pow/log/exp, buffered output, `rt_fatal`, sleep |
+| gc.caju | allocator (16 GB reserved arena, 64 KB pages, 40 classes from 16 to 16384 bytes, larger objects in whole pages) and the collector |
+| valores.caju | zero/copy/equality by descriptor, slices, append, sub-slices, UTF-8, string↔bytes↔runes conversions, maps, `rt_fmt` (printing of composite values) |
+| dinamico.caju | boxes, arithmetic on any, `x.(T)`, methods by name, `rt_unbox` |
+| panico.caju | defer, panic, recover, `rt_fail` (runtime error = panic) |
+| linux.caju / windows.caju | write, memory (`rt_os_mem`, `rt_os_reserve`, `rt_os_commit`), sleep, exit |
 
-### Coletor (fase 4)
+### Collector (phase 4)
 
-Marcar e varrer, sem mover, **conservador** em tudo: qualquer palavra na pilha (de `__sp()` até
-`rt_stack_top`), nas globais (`g.data_lo`..`g.data_hi`, que inclui `g.ret` e os lugares
-escondidos do topo) ou dentro de um objeto, que aponte para **dentro** de um objeto em uso, o
-mantém vivo. Página pequena: 2 KB de cabeçalho com bits de marca (+0), em uso (+512) e sem
-ponteiros (+1024); objetos a partir de +2048. Página grande: `rt_pg_kind` 2/3, marca em
-`rt_pg_flag`. Coleta quando o alocado desde a última passa do que sobreviveu (mínimo 8 MB).
-Invariantes: ver "Cuidados" no CLAUDE.md (nada vivo só em registrador; +8 bytes nos arrays;
-textos `rt_alloc_ns`). O teste de estresse é rodar a suíte com o mínimo em 64 KB.
+Mark and sweep, non-moving, **conservative** everywhere: any word on the stack (from `__sp()` to
+`rt_stack_top`), in the globals (`g.data_lo`..`g.data_hi`, which includes `g.ret` and the
+top-level hidden slots) or inside an object that points **into** a live object keeps it alive.
+Small page: 2 KB header with mark bits (+0), in-use bits (+512) and no-pointers bits (+1024);
+objects start at +2048. Large page: `rt_pg_kind` 2/3, mark in `rt_pg_flag`. A collection runs when
+the amount allocated since the last one exceeds what survived it (minimum 8 MB).
+Invariants: see "Cuidados" in CLAUDE.md (nothing live only in a register; +8 bytes on arrays;
+strings via `rt_alloc_ns`). The stress test is running the suite with the minimum set to 64 KB.
 
-### defer, panic, recover (fase 5)
+### defer, panic, recover (phase 5)
 
-Função com `defer` tem um registro de 6 palavras no quadro:
-`[0] anterior, [8] lista de defers, [16] RBP, [24] endereço "recuperado", [32] rt_depth, [40] livre`,
-ligado em `rt_dtop`. Cada `defer` cria o nó `[próximo, closure, n, argumentos...]` (função e
-argumentos avaliados na hora; chamada de builtin vira uma função de embrulho; método por
-interface é resolvido na hora). `rt.calldefer` (assembly gerado) chama o nó.
-- Volta normal: o resultado é guardado, `rt_run_defers` roda a lista, resultados com nome são
-  relidos (o defer pode mudá-los).
-- `panic(v)` / erro ao rodar (`rt_fail`): `rt_panic` roda os defers dos registros do mais novo para
-  o mais antigo, com `rt_depth` = profundidade daquela função. `recover()` só vale se
-  `rt_depth == rt_pdepth` (chamado direto pela função adiada, como na VM). Recuperado:
-  `__jump(rbp, recuperado)`; o código do "recuperado" refaz RSP, religa `rt_dtop`, restaura a
-  profundidade, zera os resultados sem nome e segue para a volta normal (que roda os defers que
-  sobraram). Ninguém recuperou: `rt_fatal` com a mensagem do último panic.
-- Valor de um erro ao rodar = caixa de erro com a mensagem; `panic(v)` imprime `panic: <fmt(v)>`.
+A function with `defer` has a 6-word record in its frame:
+`[0] previous, [8] defer list, [16] RBP, [24] "recovered" address, [32] rt_depth, [40] free`,
+linked into `rt_dtop`. Each `defer` creates the node `[next, closure, n, arguments...]` (function
+and arguments are evaluated immediately; a builtin call becomes a wrapper function; an interface
+method is resolved immediately). `rt.calldefer` (generated assembly) calls the node.
+- Normal return: the result is saved, `rt_run_defers` runs the list, and named results are
+  reloaded (the defer may change them).
+- `panic(v)` / runtime error (`rt_fail`): `rt_panic` runs the defers of the records from newest to
+  oldest, with `rt_depth` = that function's depth. `recover()` only works if
+  `rt_depth == rt_pdepth` (called directly by the deferred function, as in the VM). Recovered:
+  `__jump(rbp, recovered)`; the "recovered" code restores RSP, relinks `rt_dtop`, restores the
+  depth, zeroes the unnamed results and falls through to the normal return (which runs the
+  remaining defers). Nobody recovered: `rt_fatal` with the message of the last panic.
+- The value of a runtime error = an error box with the message; `panic(v)` prints `panic: <fmt(v)>`.
 
-## Fase 6: goroutines e canais (próxima)
+## Phase 6: goroutines and channels (next)
 
-Leia na página (`web/caju.html`, procure `async function runVM`): `newG`, `schedule`, `runq`,
-`sleepers`, `GO_SLICE = 2000`, e os casos `CHAN_SEND`, `CHAN_RECV`, `CHAN_CLOSE`, `SELECT`, `GO`.
-A VM é **determinística**: fila de prontas FIFO, troca a cada 2000 instruções de bytecode,
-relógio virtual para o `sleep` (com `skipSleep` não espera de verdade; a ordem continua a do
-relógio), deadlock = nenhuma pronta e nenhuma dormindo → "Todas as goroutines estão bloqueadas,
-esperando umas pelas outras (deadlock)" na linha onde a main parou. Canal com buffer, fila de
-envio e de recebimento; `select` com `default`; envio num canal fechado é erro na goroutine que
-espera ("Envio num canal fechado").
+Read in the page (`web/caju.html`, search for `async function runVM`): `newG`, `schedule`, `runq`,
+`sleepers`, `GO_SLICE = 2000`, and the cases `CHAN_SEND`, `CHAN_RECV`, `CHAN_CLOSE`, `SELECT`, `GO`.
+The VM is **deterministic**: FIFO ready queue, switches every 2000 bytecode instructions, virtual
+clock for `sleep` (with `skipSleep` it does not actually wait; the order still follows the
+clock), deadlock = nothing ready and nothing sleeping → "Todas as goroutines estão bloqueadas,
+esperando umas pelas outras (deadlock)" at the line where main stopped. Channels have a buffer, a
+send queue and a receive queue; `select` with `default`; sending on a closed channel is an error in
+the waiting goroutine ("Envio num canal fechado").
 
-Sugestão de desenho (do plano): cada goroutine com pilha própria (reservar 1 MB, como a arena do
-coletor), troca de pilha por um trecho de assembly gerado (salva RSP/RBP, carrega os da próxima),
-pontos de troca nas voltas de laço e nas chamadas (um contador; o plano aceita que os pontos de
-troca não sejam os mesmos da VM, então programas que dependem de preempção, como
-`runtime/tests/go/o_preempt.caju`, ficam fora da comparação). Para o coletor: varrer a pilha de
-**todas** as goroutines (de RSP salvo até o topo de cada uma). Para o panic: `rt_dtop` e a
-profundidade passam a ser por goroutine; panic não recuperado numa goroutine termina o programa.
-`sleep` passa pelo escalonador (relógio virtual quando `CAJU_SKIP_SLEEP=1`, que os testes usam).
-Testes-alvo: exemplo "Go: goroutines e canais", `runtime/tests/go/f_go`, `i_deadlock`,
+Suggested design (from the plan): each goroutine with its own stack (reserve 1 MB, like the
+collector's arena), stack switching by a piece of generated assembly (save RSP/RBP, load the next
+one's), switch points at loop back-edges and calls (a counter; the plan accepts that the switch
+points will not be the same as the VM's, so programs that depend on preemption, such as
+`runtime/tests/go/o_preempt.caju`, are left out of the comparison). For the collector: scan the
+stacks of **all** goroutines (from each one's saved RSP to its top). For panic: `rt_dtop` and the
+depth become per-goroutine; an unrecovered panic in a goroutine ends the program.
+`sleep` goes through the scheduler (virtual clock when `CAJU_SKIP_SLEEP=1`, which the tests use).
+Target tests: the "Go: goroutines e canais" example, `runtime/tests/go/f_go`, `i_deadlock`,
 `j_fechado`, `k_workers`.
 
-## Fases 7 a 9
+## Phases 7 to 9
 
-- **7 Windows:** `alloc/free/peek*/poke*/readstr/readwstr` (a VM simula a memória; o nativo usa
-  memória de verdade, mas as mensagens de erro para ponteiro nulo/inválido devem continuar as
-  mesmas onde der), `extern` completo (cdecl, wstr, ptr), `dllexport` e gerar uma DLL nativa
-  (diretório de exportação: a página já tem esse código para o runtime em Rust). Testes:
-  `build/ffi-test.js` (adaptar para o nativo), exemplos "Windows: ..." e "DLL: calculadora" no Wine.
-- **8 Na página:** opção "Nativo (x64)" no diálogo "Gerar .exe / .dll" (procure `buildExe` e a
-  interface), recursos de versão/assinatura (a página já assina os .exe do runtime em Rust), e a
-  comparação de velocidade. Meta: os 135 casos de `build/parity.js` passando no nativo.
-- **9 Compilador em Caju:** reescrever léxico, parser, verificador, gerador e montador em Caju;
-  estágio 2 e estágio 3 idênticos byte a byte.
+- **7 Windows:** `alloc/free/peek*/poke*/readstr/readwstr` (the VM simulates memory; the native
+  compiler uses real memory, but the error messages for null/invalid pointers should stay the same
+  where possible), full `extern` (cdecl, wstr, ptr), `dllexport` and generating a native DLL
+  (export directory: the page already has this code for the Rust runtime). Tests:
+  `build/ffi-test.js` (adapt it for native), the "Windows: ..." and "DLL: calculadora" examples under Wine.
+- **8 In the page:** a "Nativo (x64)" option in the "Gerar .exe / .dll" dialog (search for
+  `buildExe` and the UI), version resources/signing (the page already signs the Rust runtime's
+  .exe files), and the speed comparison. Goal: all 135 cases of `build/parity.js` passing natively.
+- **9 Compiler in Caju:** rewrite the lexer, parser, checker, code generator and assembler in Caju;
+  stage 2 and stage 3 identical byte for byte.
 
-## Números de referência (Linux, fim da fase 5)
+## Reference numbers (Linux, end of phase 5)
 
-| Programa | Runtime em Rust | Nativo |
+| Program | Rust runtime | Native |
 |---|---|---|
 | Benchmark | ~140 ms | ~8 ms (18x) |
-| fib(26) sem tipos | ~70 ms | ~18 ms (4x) |
-| 1 milhão de append + map | ~580 ms | ~210 ms (2,7x) |
-| tests/gc3m.caju (3 milhões de objetos) | — | 18 MB de memória máxima |
+| untyped fib(26) | ~70 ms | ~18 ms (4x) |
+| 1 million appends + map | ~580 ms | ~210 ms (2.7x) |
+| tests/gc3m.caju (3 million objects) | — | 18 MB peak memory |

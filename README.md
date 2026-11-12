@@ -1,9 +1,9 @@
 # Caju
 
-Uma linguagem de programação inspirada em Go, que compila direto para código de máquina x86-64
-(Linux e Windows) e para WebAssembly. O compilador e o runtime são escritos na própria Caju, e o
-compilador compila a si mesmo, também em WebAssembly: é ele que roda no
-[playground](https://cajulang.vercel.app/en/playground), dentro do navegador.
+A Go-inspired programming language that compiles straight to x86-64 machine code (Linux and
+Windows) and to WebAssembly. The compiler and the runtime are written in Caju itself, and the
+compiler compiles itself, to WebAssembly too: that is what runs in the
+[playground](https://cajulang.vercel.app/en/playground), inside the browser.
 
 ```
 fn greet(name: str) -> str {
@@ -13,24 +13,24 @@ fn greet(name: str) -> str {
 print(greet("world"))
 ```
 
-## Instalação
+## Installation
 
-Linux x86-64 (no Windows, use o WSL; o `caju` do Linux também gera `.exe` com `--target windows`):
+Linux x86-64 (on Windows, use WSL; the Linux `caju` can also build `.exe` files with `--target windows`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aecdanjundex/cajulang/main/install.sh | sh
 ```
 
-O instalador baixa a última release, confere o SHA-256, instala em `~/.caju` e cria o comando
-`~/.local/bin/caju`. Variáveis: `CAJU_VERSION=0.1.0` (uma versão específica), `CAJU_HOME`,
-`CAJU_BIN_DIR`. Para instalar à mão, baixe `caju-linux-x86_64.tar.gz` em
-[Releases](https://github.com/aecdanjundex/cajulang/releases), extraia e ponha `caju-<versão>/bin` no
-`PATH`. Para desinstalar: `rm -rf ~/.caju ~/.local/bin/caju`.
+The installer downloads the latest release, checks its SHA-256, installs it in `~/.caju` and creates
+the `~/.local/bin/caju` command. Variables: `CAJU_VERSION=0.1.0` (a specific version), `CAJU_HOME`,
+`CAJU_BIN_DIR`. To install by hand, download `caju-linux-x86_64.tar.gz` from
+[Releases](https://github.com/aecdanjundex/cajulang/releases), extract it and put `caju-<version>/bin`
+on your `PATH`. To uninstall: `rm -rf ~/.caju ~/.local/bin/caju`.
 
 ```sh
-caju run programa.caju              # compila em memória e roda
+caju run programa.caju              # compiles in memory and runs
 caju build -o programa programa.caju
-caju test                           # roda os *_test.caju do diretório
+caju test                           # runs the *_test.caju files in the directory
 caju version
 ```
 
@@ -38,12 +38,12 @@ caju version
 
 ```sh
 caju build --target wasm -o programa.wasm programa.caju
-node tools/wasm/run.mjs programa.wasm       # no Node (o hospedeiro faz as chamadas de sistema)
+node tools/wasm/run.mjs programa.wasm       # in Node (the host handles the system calls)
 ```
 
-Cada release traz `caju-wasm.tar.gz`: o compilador compilado para WebAssembly (`caju.wasm`), a
-biblioteca padrão e o runtime (`caju-files.json`) e `caju-browser.mjs`, que compila e roda
-programas num navegador:
+Each release ships `caju-wasm.tar.gz`: the compiler compiled to WebAssembly (`caju.wasm`), the
+standard library and the runtime (`caju-files.json`), and `caju-browser.mjs`, which compiles and
+runs programs in a browser:
 
 ```js
 import { loadCaju } from "./caju-browser.mjs"
@@ -52,50 +52,50 @@ const c = await caju.compile('print("Olá")')
 if (c.ok) await caju.run(c.wasm, { stdout: (b) => console.log(new TextDecoder().decode(b)) })
 ```
 
-Detalhes em `docs/wasm.md`.
+Details in `docs/wasm.md`.
 
-## Biblioteca padrão
+## Standard library
 
 `import "std/x"`: `strings`, `strconv`, `math`, `bytes`, `os`, `fs`, `path`, `net`, `http`, `json`,
 `toml`, `crypto`, `hash`, `hex`, `base64`, `testing`.
 
-- `std/json`: `json.marshal(v)` / `json.unmarshal(texto, &v)` para structs, listas, mapas e `any`,
-  no estilo do `encoding/json` do Go (a chave é o nome do campo), e `json.parse` para uma árvore.
-- `std/http`: servidor HTTP/1.1 com keep-alive e laço de eventos (epoll); vários processos na mesma
-  porta com `http.listen_and_serve_workers(host, porta, n)`.
+- `std/json`: `json.marshal(v)` / `json.unmarshal(text, &v)` for structs, lists, maps and `any`,
+  in the style of Go's `encoding/json` (the key is the field name), and `json.parse` for a tree.
+- `std/http`: an HTTP/1.1 server with keep-alive and an event loop (epoll); several processes on the
+  same port with `http.listen_and_serve_workers(host, port, n)`.
 
-Para APIs REST há o framework no estilo Gin [`github.com/aecdanjundex/web`](https://github.com/aecdanjundex/web):
+For REST APIs there is a Gin-style framework, [`github.com/aecdanjundex/web`](https://github.com/aecdanjundex/web):
 
 ```sh
 caju pkg add github.com/aecdanjundex/web
 ```
 
-## Desempenho
+## Performance
 
-Executáveis nativos de ~50–300 KB, sem dependências. Comparações com Go, Rust e Python em
-`bench/compare/RESULTS.md` (fib, sieve, nbody, mandelbrot, matmul, sort, maps) e servidor HTTP
-em `bench/http/RESULTS.md`. Um exemplo (API JSON, 1 CPU, req/s):
+Native executables of ~50–300 KB, with no dependencies. Comparisons with Go, Rust and Python are in
+`bench/compare/RESULTS.md` (fib, sieve, nbody, mandelbrot, matmul, sort, maps), and the HTTP server
+in `bench/http/RESULTS.md`. An example (JSON API, 1 CPU, req/s):
 
-| rota | Caju + web | Go + Gin | Go net/http |
+| route | Caju + web | Go + Gin | Go net/http |
 |---|--:|--:|--:|
-| GET /users/:id | **72.468** | 33.424 | 32.687 |
-| GET /users (50 itens) | **41.463** | 18.824 | 21.054 |
-| POST /users | **65.638** | 29.354 | 31.434 |
+| GET /users/:id | **72,468** | 33,424 | 32,687 |
+| GET /users (50 items) | **41,463** | 18,824 | 21,054 |
+| POST /users | **65,638** | 29,354 | 31,434 |
 
-## Compilando do código-fonte
+## Building from source
 
-Precisa de Node 22+ só para o primeiro estágio (o compilador original em JavaScript):
+You need Node 22+ only for the first stage (the original compiler, written in JavaScript):
 
 ```sh
-node bootstrap/caju.js build -o build/caju compiler/main.caju   # gera o compilador
-build/caju run examples/hello-server.caju                       # compila e roda (servidor na porta 3200)
-build/caju build -o hello programa.caju                         # gera um executável Linux
-build/caju build --target windows programa.caju                 # gera um .exe
-build/caju test                                                 # todos os *_test.caju
-build/caju pkg add github.com/dono/pacote                       # adiciona uma dependência
+node bootstrap/caju.js build -o build/caju compiler/main.caju   # builds the compiler
+build/caju run examples/hello-server.caju                       # compiles and runs (server on port 3200)
+build/caju build -o hello programa.caju                         # builds a Linux executable
+build/caju build --target windows programa.caju                 # builds an .exe
+build/caju test                                                 # all *_test.caju files
+build/caju pkg add github.com/dono/pacote                       # adds a dependency
 ```
 
-Testes no estilo BDD, ao lado do código (`strings_test.caju` junto de `strings.caju`):
+BDD-style tests, next to the code (`strings_test.caju` alongside `strings.caju`):
 
 ```
 import { describe, it, expect } from "std/testing"
@@ -107,18 +107,18 @@ describe("strings.split", fn() {
 })
 ```
 
-## Documentos
+## Documents
 
-- `CLAUDE.md`: mapa do projeto, como trabalhar, estado e cuidados.
-- `docs/packages.md`: o gerenciador de pacotes (caju.toml, caju.lock, hashes).
-- `docs/testing.md`: testes com `caju test` e `std/testing`.
-- `docs/compiler-port.md`: como o compilador foi portado de JavaScript para Caju.
-- `docs/arquitetura-nativo.md`: como o compilador nativo funciona por dentro.
-- `docs/wasm.md`: o alvo WebAssembly e o compilador no navegador.
-- `docs/plano-compilador-nativo.md`: o plano das fases.
-- `docs/historico.md`: o que foi feito até aqui e por quê.
-- `docs/releasing.md`: como publicar uma versão nova.
+- `CLAUDE.md`: project map, how to work on it, current state and pitfalls.
+- `docs/packages.md`: the package manager (caju.toml, caju.lock, hashes).
+- `docs/testing.md`: testing with `caju test` and `std/testing`.
+- `docs/compiler-port.md`: how the compiler was ported from JavaScript to Caju.
+- `docs/native-architecture.md`: how the native compiler works internally.
+- `docs/wasm.md`: the WebAssembly target and the in-browser compiler.
+- `docs/native-compiler-plan.md`: the phase plan.
+- `docs/history.md`: what has been done so far, and why.
+- `docs/releasing.md`: how to publish a new version.
 
-## Licença
+## License
 
-MIT (ver `LICENSE`).
+MIT (see `LICENSE`).

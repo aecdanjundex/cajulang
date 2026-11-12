@@ -1,109 +1,108 @@
-# std/json: velocidade (ns por operação, menos é melhor)
+# std/json: speed (ns per operation, lower is better)
 
-Microbenchmark `bench/json/bench.caju` e o equivalente em Go, `bench/json/bench.go`
-(`encoding/json`, Go 1.27). Ryzen 7 5700G, WSL2; melhor de 5 rodadas.
+Microbenchmark `bench/json/bench.caju` and its Go equivalent, `bench/json/bench.go`
+(`encoding/json`, Go 1.27). Ryzen 7 5700G, WSL2; best of 5 runs.
 
 ```sh
 CAJU_ROOT=$PWD build/caju build -o /tmp/jb bench/json/bench.caju && /tmp/jb
 cd bench/json && go run bench.go
 ```
 
-| caso | Caju antes | Caju depois | Go | ganho | Caju ÷ Go |
+| case | Caju before | Caju after | Go | gain | Caju ÷ Go |
 |---|--:|--:|--:|--:|--:|
-| marshal de []User com 50 itens | 95.108 | **12.544** | 11.179 | 7,6× | 1,12 |
-| marshal de map[str]any pequeno | 2.400 | **1.194** | 936 | 2,0× | 1,28 |
-| unmarshal de um User | 4.353 | **1.058** | 498 | 4,1× | 2,12 |
-| unmarshal de []User com 50 itens | 737.255 | **36.395** | 23.219 | 20,3× | 1,57 |
-| parse de um documento médio (Go: em `any`) | 178.033 | **65.218** | 35.808 | 2,7× | 1,82 |
-| unmarshal do documento médio numa struct | 217.372 | **20.822** | 12.092 | 10,4× | 1,72 |
-| marshal do documento médio | 55.045 | **8.082** | 5.950 | 6,8× | 1,36 |
+| marshal of []User with 50 items | 95,108 | **12,544** | 11,179 | 7.6× | 1.12 |
+| marshal of a small map[str]any | 2,400 | **1,194** | 936 | 2.0× | 1.28 |
+| unmarshal of one User | 4,353 | **1,058** | 498 | 4.1× | 2.12 |
+| unmarshal of []User with 50 items | 737,255 | **36,395** | 23,219 | 20.3× | 1.57 |
+| parse of a medium document (Go: into `any`) | 178,033 | **65,218** | 35,808 | 2.7× | 1.82 |
+| unmarshal of the medium document into a struct | 217,372 | **20,822** | 12,092 | 10.4× | 1.72 |
+| marshal of the medium document | 55,045 | **8,082** | 5,950 | 6.8× | 1.36 |
 
-User = {id int, name str, email str, active bool}. O documento médio tem texto com escape,
-inteiro, número quebrado, lista de textos, um User, 20 Users e um map[str]int.
+User = {id int, name str, email str, active bool}. The medium document has a string with escapes,
+an integer, a floating-point number, a list of strings, a User, 20 Users and a map[str]int.
 
-## O que mudou (lib/json.caju)
+## What changed (lib/json.caju)
 
 **marshal**
-- Plano por tipo de struct (`Plan`, em cache por descritor): nomes já entre aspas (`"nome":` e
-  `,"nome":`), descritores e campos embutidos calculados uma vez (antes: `embedded()` comparava
-  nomes de tipo a cada campo de cada item).
-- Buffer próprio (`Enc.mem`) que copia de 8 em 8 bytes e é reaproveitado entre chamadas
-  (`spare_mem`; um marshal dentro de um método `Error` usa outro). O `strings.Builder` copiava
-  byte a byte e crescia 256 → 4 KB a cada chamada.
-- Inteiros escritos direto no buffer; texto sem escape copiado de uma vez; `str`, `int` e `bool`
-  tratados no laço dos campos, sem passar por `word`.
-- `e.err != ""` virava uma chamada de comparação de texto a cada campo: agora `len(e.err) != 0`.
-- `&first` alocava uma célula por struct: agora é valor de retorno.
-- Números quebrados: caminho rápido (`short_fixed`, menor número de casas que relê igual,
-  conferido com `parse_float`) antes do `toml.format_float` exato, que usa números grandes.
-  Igual ao antigo em 131.815 valores aleatórios.
-- Mapas: chaves e valores em duas listas ordenadas juntas (antes: um mapa auxiliar).
+- A plan per struct type (`Plan`, cached per descriptor): names already quoted (`"name":` and
+  `,"name":`), descriptors and embedded fields computed once (before: `embedded()` compared type
+  names for every field of every item).
+- Its own buffer (`Enc.mem`) that copies 8 bytes at a time and is reused across calls
+  (`spare_mem`; a marshal inside an `Error` method uses another one). `strings.Builder` copied
+  byte by byte and grew 256 → 4 KB on every call.
+- Integers written straight into the buffer; strings without escapes copied in one go; `str`,
+  `int` and `bool` handled in the field loop, without going through `word`.
+- `e.err != ""` turned into a string comparison call for every field: now `len(e.err) != 0`.
+- `&first` allocated a cell per struct: it is now a return value.
+- Floating-point numbers: a fast path (`short_fixed`, the fewest digits that read back the same,
+  checked with `parse_float`) before the exact `toml.format_float`, which uses big numbers.
+  Identical to the old one on 131,815 random values.
+- Maps: keys and values in two lists sorted together (before: an auxiliary map).
 
 **unmarshal**
-- Antes: montava a árvore `json.Value` inteira (um objeto por valor, um mapa por objeto, uma
-  cópia com validação UTF-8 por texto) e depois a percorria.
-- Agora, duas passadas sobre o texto, sem árvore:
-  1. `vtyped` valida a sintaxe (a mesma gramática e limites de `parse`) e confere que cada
-     valor cabe no seu lugar pelo tipo de destino: tipo, faixa dos inteiros, chaves com escape,
-     campos repetidos, structs com campo embutido... Anota a quantidade de itens de cada lista e,
-     para cada chave de struct, o campo escolhido e onde o valor começa.
-  2. `Fast` decodifica direto na memória seguindo os descritores, sem reler as chaves.
-  Se a primeira passada recusa, roda o decodificador antigo pela árvore, que dá as mesmas
-  mensagens de erro de antes. Como a recusa vem antes de qualquer escrita, um texto com erro de
-  sintaxe continua sem mexer no valor de destino.
-- `parse`: `p.word("true")` fazia `p.s[p.i:]` (copiava e revalidava o resto inteiro do texto a
-  cada true/false/null); textos e números ASCII sem a revalidação de UTF-8.
+- Before: built the whole `json.Value` tree (one object per value, one map per object, one copy
+  with UTF-8 validation per string) and then walked it.
+- Now, two passes over the text, with no tree:
+  1. `vtyped` validates the syntax (the same grammar and limits as `parse`) and checks that each
+     value fits its place according to the target type: type, integer range, keys with escapes,
+     repeated fields, structs with an embedded field... It records the number of items in each
+     list and, for each struct key, the chosen field and where the value starts.
+  2. `Fast` decodes straight into memory following the descriptors, without rereading the keys.
+  If the first pass rejects the input, the old tree-based decoder runs, which gives the same
+  error messages as before. Since the rejection comes before any write, text with a syntax error
+  still leaves the target value untouched.
+- `parse`: `p.word("true")` did `p.s[p.i:]` (copying and revalidating the whole rest of the text
+  on every true/false/null); ASCII strings and numbers skip the UTF-8 revalidation.
 
-## Como foi verificado
-- `lib/json_test.caju`: 9 testes novos (cada tipo de campo, nil, listas de bool de 1 byte,
-  faixas de int8..uint32, chaves repetidas e sem diferenciar maiúsculas, escapes em chaves,
-  erro de sintaxe sem escrita parcial, marshal dentro de `Error`); os 37 testes passam também
-  com a biblioteca antiga.
-- Teste diferencial (fora do repositório): 100 mil documentos JSON gerados (tipos certos e
-  errados, chaves repetidas e com maiúsculas, escapes, UTF-8, espaços, documentos cortados)
-  decodificados pelo caminho novo e pelo decodificador da árvore, em valores zerados e
-  pré-preenchidos e em []T, map[str]*T e any: nenhuma diferença, também com coleta de lixo a
-  cada 64 KB. A saída do marshal e do marshal_indent de 6 mil valores (884 mil linhas) é
-  idêntica à da versão anterior.
-- Suíte inteira: 794 passam, 0 falham, 9 pulados.
+## How it was verified
+- `lib/json_test.caju`: 9 new tests (each field type, nil, 1-byte bool lists, int8..uint32
+  ranges, repeated and case-insensitive keys, escapes in keys, syntax error without a partial
+  write, marshal inside `Error`); all 37 tests also pass with the old library.
+- Differential test (outside the repository): 100 thousand generated JSON documents (right and
+  wrong types, repeated and uppercase keys, escapes, UTF-8, whitespace, truncated documents)
+  decoded by the new path and by the tree decoder, into zeroed and pre-filled values and into
+  []T, map[str]*T and any: no differences, also with garbage collection every 64 KB. The output
+  of marshal and marshal_indent for 6 thousand values (884 thousand lines) is identical to the
+  previous version's.
+- Full suite: 794 pass, 0 fail, 9 skipped.
 
-## O que ainda separa do Go
-O resto é principalmente o código gerado (cada acesso a campo passa pela memória com teste de
-nil, chamadas pequenas não são expandidas no lugar): ver `tools/disasm.sh`. `parse` em árvore
-paga uma alocação por valor e um mapa por objeto, inerente ao formato `json.Value`.
+## What still separates it from Go
+The rest is mostly the generated code (each field access goes through memory with a nil check,
+small calls are not inlined): see `tools/disasm.sh`. The tree-based `parse` pays one allocation
+per value and one map per object, inherent to the `json.Value` format.
 
-## Rodada 2: funções-folha e tabelas reaproveitadas (2026-11-11)
+## Round 2: leaf functions and reused tables (2026-11-11)
 
-Ponto de partida já inclui a rodada 26 de alocação (OPTIMIZATION.md), que baixou tudo um pouco.
-Melhor de 5 rodadas, ns por operação:
+The starting point already includes allocation round 26 (OPTIMIZATION.md), which lowered
+everything a little. Best of 5 runs, ns per operation:
 
-| caso | Caju antes | Caju depois | Go | Caju ÷ Go |
+| case | Caju before | Caju after | Go | Caju ÷ Go |
 |---|--:|--:|--:|--:|
-| marshal de []User com 50 itens | 11.672 | **7.859** | 10.701 | 0,73 |
-| marshal de map[str]any pequeno | 549 | **549** | 896 | 0,61 |
-| unmarshal de um User | 648 | **473** | 490 | 0,97 |
-| unmarshal de []User com 50 itens | 27.301 | **18.653** | 22.320 | 0,84 |
-| parse de um documento médio | 31.579 | **31.613** | 34.197 | 0,92 |
-| unmarshal do documento médio | 14.278 | **10.498** | 11.685 | 0,90 |
-| marshal do documento médio | 6.348 | **4.801** | 5.757 | 0,83 |
+| marshal of []User with 50 items | 11,672 | **7,859** | 10,701 | 0.73 |
+| marshal of a small map[str]any | 549 | **549** | 896 | 0.61 |
+| unmarshal of one User | 648 | **473** | 490 | 0.97 |
+| unmarshal of []User with 50 items | 27,301 | **18,653** | 22,320 | 0.84 |
+| parse of a medium document | 31,579 | **31,613** | 34,197 | 0.92 |
+| unmarshal of the medium document | 14,278 | **10,498** | 11,685 | 0.90 |
+| marshal of the medium document | 6,348 | **4,801** | 5,757 | 0.83 |
 
-No servidor HTTP (bench/http, 1 CPU, `split.sh`), `GET /users` (50 itens): CPU de usuário por
-requisição 20,1 → 15,2 µs, 34,1 → 37,2–38,9 mil req/s; `POST /users`: 7,2 → 5,4 µs.
+In the HTTP server (bench/http, 1 CPU, `split.sh`), `GET /users` (50 items): user CPU per
+request 20.1 → 15.2 µs, 34.1k → 37.2k–38.9k req/s; `POST /users`: 7.2 → 5.4 µs.
 
-Hipóteses:
+Hypotheses:
 
-| | ideia | resultado |
+| | idea | result |
 |---|---|---|
-| J1 | structs "planas" (só str, int e bool, sem embutidos) no marshal compacto: espaço do objeto inteiro reservado uma vez, escrita por funções-folha (`wcopy`, `wquote` com 8 bytes por vez/SWAR, `wint`) sem chamadas, logo com as variáveis em registradores (`Enc.flat`); a lista de structs planas chama `flat` direto | aceita: 11.672 → 7.859 |
-| J2a | conferência (VScan) dos valores de campos str/int/bool por funções-folha (`plain_end` SWAR, `int_end`, `bool_end`) no lugar de `typed()` | aceita: 27,3 → 24,2 mil |
-| J2b | o mesmo no lado que escreve (Fast: `int_at`, bool direto) | rejeitada (empate); fica só `plain_end` no `str_word` |
-| J2c | objeto de struct plana validado inteiro numa função-folha (`vflat`): chaves exatas pela dica e depois pela lista, cada campo uma vez, valores simples; grava os pares [campo, posição] direto no bloco de `keys`; qualquer outra coisa (null, chave desconhecida ou com outra caixa, escape, número que não é inteiro simples) volta ao caminho geral | aceita: 24,2 → 21,7 mil |
-| J2d | tabelas `keys` e `arrs` do VScan reaproveitadas entre chamadas (`spare_keys`, `spare_arrs`) | aceita: 21,7 → 18,7 mil; um User: 540 → 473 |
-| J3 | mudanças no gerador (expandir funções pequenas, menos testes de nil) | não feita: as funções-folha na biblioteca já passaram o Go sem mexer no compilador |
-| J4 | árvore do parse com menos alocações | não feita: o parse já está abaixo do Go (31,6 contra 34,2 mil) |
+| J1 | "flat" structs (only str, int and bool, no embedded fields) in compact marshal: space for the whole object reserved once, written by call-free leaf functions (`wcopy`, `wquote` with 8 bytes at a time/SWAR, `wint`), hence with the variables in registers (`Enc.flat`); a list of flat structs calls `flat` directly | accepted: 11,672 → 7,859 |
+| J2a | checking (VScan) of str/int/bool field values by leaf functions (`plain_end` SWAR, `int_end`, `bool_end`) instead of `typed()` | accepted: 27.3k → 24.2k |
+| J2b | the same on the writing side (Fast: `int_at`, bool directly) | rejected (tie); only `plain_end` in `str_word` stays |
+| J2c | a flat struct object validated entirely in a leaf function (`vflat`): exact keys by the hint and then by the list, each field once, simple values; writes the [field, position] pairs straight into the `keys` block; anything else (null, unknown key or key with different case, escape, number that is not a simple integer) falls back to the general path | accepted: 24.2k → 21.7k |
+| J2d | VScan's `keys` and `arrs` tables reused across calls (`spare_keys`, `spare_arrs`) | accepted: 21.7k → 18.7k; one User: 540 → 473 |
+| J3 | generator changes (inline small functions, fewer nil checks) | not done: the leaf functions in the library already beat Go without touching the compiler |
+| J4 | parse tree with fewer allocations | not done: parse is already below Go (31.6k vs. 34.2k) |
 
-Conferência: os 42 testes de lib/json_test.caju (5 novos para os caminhos planos) passam também
-com a biblioteca antiga; um teste diferencial de 26 mil linhas (structs planas aleatórias com
-escapes e UTF-8, 20 mil objetos JSON aleatórios com espaços, chaves fora de ordem, desconhecidas,
-com outra caixa, null, números inválidos e erros) sai idêntico ao da biblioteca antiga, também com
-coleta a cada 64 KB.
+Verification: the 42 tests in lib/json_test.caju (5 new ones for the flat paths) also pass with
+the old library; a 26-thousand-line differential test (random flat structs with escapes and
+UTF-8, 20 thousand random JSON objects with whitespace, out-of-order keys, unknown keys, keys with
+different case, null, invalid numbers and errors) produces output identical to the old library's,
+also with a collection every 64 KB.

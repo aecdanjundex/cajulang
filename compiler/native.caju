@@ -3,7 +3,7 @@
 # Turns the project straight into machine code: an ELF executable (Linux) or PE (Windows). The
 # runtime (rt/*.caju) is compiled along with the program as a second unit. Every value fits in
 # 64 bits and each expression leaves its value in RAX; arguments are pushed left to right and
-# the caller pops them. See docs/arquitetura-nativo.md for the conventions.
+# the caller pops them. See docs/native-architecture.md for the conventions.
 #
 # The JavaScript keeps the state in closures inside compileNative and genFunction; here the
 # program-wide state is Gen and the state of one function is Fn (its methods are the closures).

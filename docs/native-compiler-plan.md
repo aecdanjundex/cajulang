@@ -1,109 +1,110 @@
-# Compilador nativo da Caju: plano
+# Caju native compiler: plan
 
-Cópia do documento de planejamento (Claude Doc "Compilador nativo da Caju: plano"), com o
-andamento até a fase 5. Onde a implementação decidiu diferente do plano original, vale o que está
-em `docs/arquitetura-nativo.md` (marcado aqui como "decidido na fase N").
+Copy of the planning document (Claude Doc "Compilador nativo da Caju: plano"), with progress up to
+phase 5. Where the implementation decided differently from the original plan,
+`docs/native-architecture.md` is authoritative (marked here as "decided in phase N").
 
-## Objetivo e escopo
+## Goal and scope
 
-O compilador nativo transforma um projeto Caju direto em código de máquina x86-64, sem a VM no
-meio. O runtime (alocador, coletor de lixo, goroutines, maps, print, panic) é escrito na própria
-Caju, com um núcleo mínimo em assembly. A VM de bytecode continua rodando na página, e o runtime
-em Rust continua servindo o .exe x86 e servindo de referência nos testes.
+The native compiler turns a Caju project directly into x86-64 machine code, with no VM in
+between. The runtime (allocator, garbage collector, goroutines, maps, print, panic) is written in
+Caju itself, with a minimal assembly core. The bytecode VM keeps running in the page, and the Rust
+runtime keeps serving the x86 .exe and acting as the reference in the tests.
 
-Entra:
-- programas e DLLs x64 para Windows (PE), e executáveis ELF x86-64 para Linux, usados só nos testes;
-- toda a linguagem que a VM roda: tipos, structs, interfaces, slices, maps, closures, defer/panic,
-  ponteiros, goroutines, canais, extern e dllexport;
-- um runtime em Caju, com assembly só para a entrada do programa, a troca de pilha entre
-  goroutines e a chamada de funções do Windows por ponteiro.
+In scope:
+- x64 programs and DLLs for Windows (PE), and x86-64 ELF executables for Linux, used only in tests;
+- the whole language the VM runs: types, structs, interfaces, slices, maps, closures, defer/panic,
+  pointers, goroutines, channels, extern and dllexport;
+- a runtime in Caju, with assembly only for the program entry point, stack switching between
+  goroutines and calling Windows functions through pointers.
 
-Fica de fora, por enquanto: x86 de 32 bits (continua pela VM); o interpretador da árvore;
-otimizações pesadas (inlining, alocação global de registradores), que entram depois que tudo
-estiver correto.
+Out of scope for now: 32-bit x86 (stays on the VM); the tree interpreter; heavy optimizations
+(inlining, global register allocation), which come after everything is correct.
 
-Meta de desempenho: o exemplo Benchmark pelo menos 10 vezes mais rápido que no runtime em Rust
-(hoje: ~18 a 22 vezes).
+Performance goal: the Benchmark example at least 10 times faster than on the Rust runtime
+(currently: ~18 to 22 times).
 
-## Arquitetura
+## Architecture
 
-O front end que já existe (léxico, parser, ligador e verificador de tipos) alimenta um caminho
-novo que termina num .exe, ao lado do caminho de bytecode. O runtime em Caju passa pelo mesmo
-front end e é compilado junto com cada programa. Nas fases 1 a 8 as partes novas são escritas em
-JavaScript dentro da página; na fase 9 passam para Caju.
+The existing front end (lexer, parser, linker and type checker) feeds a new path that ends in an
+.exe, alongside the bytecode path. The Caju runtime goes through the same front end and is
+compiled together with each program. In phases 1 to 8 the new parts are written in JavaScript
+inside the page; in phase 9 they move to Caju.
 
-## Representação dos valores
+## Value representation
 
-Plano original: o mesmo layout do Go (campos no lugar, slices de 24 bytes, interfaces de 16 bytes).
-**Decidido nas fases 1 a 3:** todo valor ocupa uma palavra de 8 bytes; texto é um ponteiro para
-`[tamanho][bytes][0]`; struct e array são objetos no heap (uma palavra por campo) e `*T` aponta
-para o próprio objeto; slice é um ponteiro para `[dados, tamanho, capacidade]`; any/interface é 0
-ou ponteiro para uma caixa `[descritor, valor]`. Variáveis capturadas ou com `&x` moram numa célula.
+Original plan: the same layout as Go (fields inline, 24-byte slices, 16-byte interfaces).
+**Decided in phases 1 to 3:** every value takes one 8-byte word; a string is a pointer to
+`[length][bytes][0]`; structs and arrays are heap objects (one word per field) and `*T` points to
+the object itself; a slice is a pointer to `[data, length, capacity]`; any/interface is 0 or a
+pointer to a box `[descriptor, value]`. Captured variables and variables with `&x` live in a cell.
 
-## Geração de código
+## Code generation
 
-Plano: representação intermediária de três endereços, alocação de registradores (linear scan),
-convenção interna com resultados na pilha, pilhas de goroutine de 1 MB com verificação no
-prólogo, pontos de troca nas voltas de laço e chamadas, verificações (índice, nil, divisão) que
-saltam para o runtime, montador próprio, PE com recursos de versão e assinatura, ELF para testes.
-**Decidido na fase 1:** sem IR por enquanto (código direto da árvore anotada), resultado em RAX,
-resultados extras em `g.ret`; a IR entra junto com o alocador de registradores.
+Plan: three-address intermediate representation, register allocation (linear scan), an internal
+convention with results on the stack, 1 MB goroutine stacks with a check in the prologue, switch
+points at loop back-edges and calls, checks (index, nil, division) that jump to the runtime, our
+own assembler, PE with version resources and signing, ELF for tests.
+**Decided in phase 1:** no IR for now (code straight from the annotated tree), result in RAX,
+extra results in `g.ret`; the IR comes together with the register allocator.
 
-## Runtime em Caju
+## Runtime in Caju
 
-Plano: arquivos os, mem, gc, sched, chan, map, str, fmt, iface, panic, asm. **Como ficou:** comum,
-gc, valores, dinamico, panico, linux, windows (sched/chan vêm na fase 6). Os arquivos do runtime
-podem usar operações de baixo nível (`__load64`, `__store64`, `__syscall`...), proibidas fora dele.
+Plan: files os, mem, gc, sched, chan, map, str, fmt, iface, panic, asm. **What it became:** comum,
+gc, valores, dinamico, panico, linux, windows (sched/chan come in phase 6). Runtime files may use
+low-level operations (`__load64`, `__store64`, `__syscall`...), which are forbidden outside it.
 
-## Mudanças na linguagem
+## Language changes
 
-1. Inteiros de 64 bits exatos no nativo (a VM é exata só até 2^53; diferença aceita).
-2. Operações de baixo nível só nos arquivos do runtime (feito como funções `__nome`, não `unsafe`).
-3. Marcas para o compilador (`//caju:nogc` etc.): ainda não foram necessárias.
+1. Exact 64-bit integers in native code (the VM is exact only up to 2^53; accepted difference).
+2. Low-level operations only in the runtime files (done as `__nome` functions, not `unsafe`).
+3. Compiler annotations (`//caju:nogc` etc.): not needed yet.
 
-A tipagem gradual continua: parâmetro sem tipo vira `any` e funciona, mais devagar.
+Gradual typing stays: an untyped parameter becomes `any` and works, just slower.
 
-## Fases e entregas
+## Phases and deliverables
 
-1. **Base.** Montador, PE/ELF, números, booleanos, funções, if/while/for/switch, print.
-   Pronta quando o grupo Primeiros passos sai igual. — **pronta**
-2. **Memória.** Textos, slices, arrays, structs, ponteiros, maps; erros ao rodar com a linha.
-   Pronta quando os exemplos Go de slices, maps e ponteiros saem iguais. — **pronta**
-3. **Tipos dinâmicos e funções como valores.** any, interfaces, x.(T), switch de tipos,
-   closures, vários resultados, error, métodos e embutidas. — **pronta**
-4. **Coletor de lixo.** Marcar e varrer, classes de tamanho. Pronta quando o teste de 3 milhões
-   de objetos roda com memória limitada (18 MB). — **pronta**
-5. **defer, panic e recover.** Pronta quando o exemplo de erros, defer e panic sai igual. — **pronta**
-6. **Goroutines e canais.** Escalonador, canais, select, sleep, deadlock. Pronta quando o exemplo de
-   goroutines e os testes de canais saem iguais (programas com corrida de dados ficam de fora).
-7. **Windows.** extern com a convenção x64, alloc/peek/poke, dllexport e a DLL. Pronta quando o
-   teste de FFI e o exemplo da calculadora rodam no Wine.
-8. **Na página.** Opção "Nativo (x64)" no Gerar .exe / .dll, comparação de velocidade, referência
-   atualizada. Pronta quando os 135 casos de paridade passam no nativo.
-9. **Compilador em Caju.** Pronta quando o compilador compilado por ele mesmo gera, de novo, um
-   arquivo idêntico byte a byte.
+1. **Foundation.** Assembler, PE/ELF, numbers, booleans, functions, if/while/for/switch, print.
+   Done when the "Primeiros passos" group produces the same output. — **done**
+2. **Memory.** Strings, slices, arrays, structs, pointers, maps; runtime errors with the line.
+   Done when the Go examples for slices, maps and pointers produce the same output. — **done**
+3. **Dynamic types and functions as values.** any, interfaces, x.(T), type switches,
+   closures, multiple results, error, methods and embedding. — **done**
+4. **Garbage collector.** Mark and sweep, size classes. Done when the 3-million-object test runs
+   with limited memory (18 MB). — **done**
+5. **defer, panic and recover.** Done when the errors, defer and panic example produces the same
+   output. — **done**
+6. **Goroutines and channels.** Scheduler, channels, select, sleep, deadlock. Done when the
+   goroutines example and the channel tests produce the same output (programs with data races are
+   left out).
+7. **Windows.** extern with the x64 convention, alloc/peek/poke, dllexport and the DLL. Done when
+   the FFI test and the calculator example run under Wine.
+8. **In the page.** "Nativo (x64)" option in Gerar .exe / .dll, speed comparison, updated
+   reference. Done when the 135 parity cases pass natively.
+9. **Compiler in Caju.** Done when the compiler, compiled by itself, again produces a byte-for-byte
+   identical file.
 
-## Testes
+## Tests
 
-Cada exemplo e cada programa de `runtime/tests/go` roda na VM e no nativo, e as saídas têm que ser
-idênticas. Linux primeiro (rápido); Wine no fim de cada fase. Programas com corrida de dados ficam
-fora da comparação. Estresse: coletor com milhões de objetos (e a suíte com coleta a cada 64 KB),
-recursão profunda, milhares de goroutines, maps com muitas remoções. Fase 9: estágios 2 e 3 do
-compilador idênticos byte a byte.
+Every example and every program in `runtime/tests/go` runs on the VM and natively, and the outputs
+must be identical. Linux first (fast); Wine at the end of each phase. Programs with data races are
+left out of the comparison. Stress: collector with millions of objects (and the suite with a
+collection every 64 KB), deep recursion, thousands of goroutines, maps with many deletions.
+Phase 9: compiler stages 2 and 3 identical byte for byte.
 
-## Decisões (tomadas com o dono do projeto)
+## Decisions (made with the project owner)
 
-| Decisão | Escolha |
+| Decision | Choice |
 |---|---|
-| Inteiros acima de 2^53 | aceitar a diferença entre VM e nativo e documentar |
-| Alvos do nativo | só Windows x64 (+ ELF para testes); o x86 continua pela VM |
-| Compilador em Caju (fase 9) | meta, depois que a fase 8 estiver estável |
-| Runtime em Rust | manter: serve o x86 e é a referência dos testes |
+| Integers above 2^53 | accept the difference between VM and native, and document it |
+| Native targets | Windows x64 only (+ ELF for tests); x86 stays on the VM |
+| Compiler in Caju (phase 9) | a goal, once phase 8 is stable |
+| Rust runtime | keep it: it serves x86 and is the test reference |
 
-## Riscos
+## Risks
 
-- Coletor conservador: um número que parece ponteiro segura um objeto (gasta memória, não erra).
-- panic/recover: a parte mais delicada (feita na fase 5, com testes de panic dentro de defer).
-- Formato dos números: 12 algarismos exatos como a VM (feito na fase 1, em aritmética inteira).
-- Código sem tipos ganha pouco (cada operação passa pelo runtime; ~4x mais rápido que o Rust).
-- Programas que dependem da ordem exata de preempção entre goroutines vão diferir da VM.
+- Conservative collector: a number that looks like a pointer keeps an object alive (wastes memory, never wrong).
+- panic/recover: the most delicate part (done in phase 5, with tests of panic inside defer).
+- Number formatting: exactly 12 digits like the VM (done in phase 1, with integer arithmetic).
+- Untyped code gains little (every operation goes through the runtime; ~4x faster than Rust).
+- Programs that depend on the exact preemption order between goroutines will differ from the VM.

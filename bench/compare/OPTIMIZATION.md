@@ -1,53 +1,53 @@
-# Otimizando o gerador de código nativo
+# Optimizing the native code generator
 
-Registro das rodadas de otimização do compilador (`compiler/native.caju`, `compiler/x64.caju`) e
-do runtime (`rt/`). Cada rodada: uma hipótese tirada da leitura do código de máquina gerado, a
-mudança, os testes (`caju test`, 518 passando) e a autocompilação (estágio 2 == estágio 3), e a
-medição com `bench/compare/run.py --langs=caju`.
+A log of the optimization rounds of the compiler (`compiler/native.caju`, `compiler/x64.caju`) and
+the runtime (`rt/`). Each round: a hypothesis drawn from reading the generated machine code, the
+change, the tests (`caju test`, 518 passing) and self-compilation (stage 2 == stage 3), and the
+measurement with `bench/compare/run.py --langs=caju`.
 
-**Onde está cada coisa**
+**Where things are**
 
-- `rounds/roundN.json`: as 21 medições (7 desafios × 3 tamanhos) de cada rodada.
-- `rounds/table.py`: gera a tabela completa abaixo a partir dos JSON.
-- `rounds/roundN-sieve.asm`: o código de máquina da função `work` de `rounds/sieve_kernel.caju`
-  (o laço do crivo) naquela rodada, para comparar antes e depois (`tools/disasm.sh`).
-- O código de cada rodada está no histórico do git (um commit por rodada a partir da 4; as
-  rodadas 1 a 3 estão juntas num commit).
+- `rounds/roundN.json`: the 21 measurements (7 challenges × 3 sizes) of each round.
+- `rounds/table.py`: generates the full table below from the JSON files.
+- `rounds/roundN-sieve.asm`: the machine code of the `work` function in `rounds/sieve_kernel.caju`
+  (the sieve loop) in that round, to compare before and after (`tools/disasm.sh`).
+- The code of each round is in the git history (one commit per round from round 4 on; rounds 1
+  to 3 share one commit).
 
-**Decisão:** as otimizações entram só no compilador em Caju. O compilador em JavaScript
-(`bootstrap/`) continua gerando o código antigo e serve só para compilar o primeiro estágio; a
-comparação byte a byte entre os dois (`tools/compare-compilers.sh`) deixa de valer. A correção é
-garantida pela suíte de testes e pela autocompilação.
+**Decision:** optimizations go only into the Caju compiler. The JavaScript compiler
+(`bootstrap/`) keeps generating the old code and is used only to compile the first stage; the
+byte-for-byte comparison between the two (`tools/compare-compilers.sh`) no longer applies.
+Correctness is guaranteed by the test suite and by self-compilation.
 
-## Resumo (maior tamanho de cada desafio)
+## Summary (largest size of each challenge)
 
-| rodada | mudança | fib 35 | sieve 10M | nbody 1M | mandelbrot 1k | matmul 300 | sort 2M | maps 3M |
+| round | change | fib 35 | sieve 10M | nbody 1M | mandelbrot 1k | matmul 300 | sort 2M | maps 3M |
 |---|---|--:|--:|--:|--:|--:|--:|--:|
-| 0 | antes: máquina de pilha, todo operando empilhado e desempilhado | 126 ms | 435 ms | 737 ms | 243 ms | 256 ms | 637 ms | 2.00 s |
-| 1 | codificação mais curta (disp8, imm8) | 125 ms | 424 ms | 735 ms | 243 ms | 253 ms | 626 ms | 2.02 s |
-| 2 | operando direito simples direto no RCX; condições viram cmp + jcc; &&, \|\|, ! viram desvios | 94 ms | 370 ms | 725 ms | 251 ms | 209 ms | 484 ms | 1.65 s |
-| 3 | a[i] com índice simples e leitura num só mov; atribuição única sem temporários; constantes como imediato; teste de int sem normalizar para 0/1 | 92 ms | 317 ms | 576 ms | 237 ms | 212 ms | 390 ms | 1.60 s |
-| 4 | expressões num avaliadas em registradores XMM; comparações de num viram ucomisd + jcc | 91 ms | 320 ms | 532 ms | 127 ms | 214 ms | 397 ms | 1.60 s |
-| 5 | profundidade de chamadas no registrador R15 em vez de uma global em memória | 65 ms | 304 ms | 516 ms | 128 ms | 213 ms | 394 ms | 1.53 s |
-| 6 | variáveis locais inteiras, bool e num mais usadas em RBX, R12, R13, R14 | 66 ms | 218 ms | 449 ms | 125 ms | 210 ms | 287 ms | 1.28 s |
-| 7 | variáveis do nível de cima que nenhuma função usa viram locais (e podem ir para registradores) | 66 ms | 185 ms | 438 ms | 92 ms | 202 ms | 280 ms | 1.33 s |
-| 8 | a[i] op= v direto; lado composto sem chamadas calculado primeiro (sem push/pop) | 65 ms | 185 ms | 435 ms | 93 ms | 133 ms | 283 ms | 1.21 s |
-| 9 | inline de funções `return E` pequenas; `__sqrt` vira sqrtsd no registrador | 66 ms | 187 ms | 427 ms | 94 ms | 136 ms | 287 ms | 1.26 s |
-| 10 | mapas: caminho de chave inteira sem chamadas; leitura `m[k]` numa só chamada | 69 ms | 188 ms | 419 ms | 94 ms | 145 ms | 284 ms | 966 ms |
-| 11 | listas em laço: tamanho e dados lidos uma vez; `a[i]` sem verificação em `for i := 0; i < len(a); i++` | 64 ms | 144 ms | 425 ms | 90 ms | 108 ms | 234 ms | 833 ms |
-| 12 | `[]bool` e `[N]bool` com 1 byte por elemento | 64 ms | 70 ms | 396 ms | 90 ms | 107 ms | 229 ms | 852 ms |
-| 13–16 | mapas com etiqueta; listas globais em laços; operações direto em registradores; `num` em XMM; RSI/RDI/R8–R11 | 62 ms | 29 ms | 175 ms | 37 ms | 35 ms | 184 ms | 605 ms |
-| 17–18 | laços com teste no fim, código frio, desvios curtos; divisão e resto por constante sem `idiv` | 57 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
-| 19 | guarda antes do prólogo; `leave`; profundidade contando para baixo | 41 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
-| 20–25 | recursão com acumulador; limites fora de laços constantes; argumentos em registradores; laços versionados e vetorizados; índices já conferidos; mapas com `op=` numa sondagem | 26 ms | 22 ms | 65 ms | 40 ms | 14 ms | 140 ms | 632 ms |
+| 0 | before: stack machine, every operand pushed and popped | 126 ms | 435 ms | 737 ms | 243 ms | 256 ms | 637 ms | 2.00 s |
+| 1 | shorter encoding (disp8, imm8) | 125 ms | 424 ms | 735 ms | 243 ms | 253 ms | 626 ms | 2.02 s |
+| 2 | simple right operand straight into RCX; conditions become cmp + jcc; &&, \|\|, ! become branches | 94 ms | 370 ms | 725 ms | 251 ms | 209 ms | 484 ms | 1.65 s |
+| 3 | a[i] with a simple index and the load in a single mov; single assignment without temporaries; constants as immediates; int tests without normalizing to 0/1 | 92 ms | 317 ms | 576 ms | 237 ms | 212 ms | 390 ms | 1.60 s |
+| 4 | num expressions evaluated in XMM registers; num comparisons become ucomisd + jcc | 91 ms | 320 ms | 532 ms | 127 ms | 214 ms | 397 ms | 1.60 s |
+| 5 | call depth in register R15 instead of a global in memory | 65 ms | 304 ms | 516 ms | 128 ms | 213 ms | 394 ms | 1.53 s |
+| 6 | most-used int, bool and num local variables in RBX, R12, R13, R14 | 66 ms | 218 ms | 449 ms | 125 ms | 210 ms | 287 ms | 1.28 s |
+| 7 | top-level variables that no function uses become locals (and can go into registers) | 66 ms | 185 ms | 438 ms | 92 ms | 202 ms | 280 ms | 1.33 s |
+| 8 | a[i] op= v directly; call-free compound side computed first (no push/pop) | 65 ms | 185 ms | 435 ms | 93 ms | 133 ms | 283 ms | 1.21 s |
+| 9 | inlining of small `return E` functions; `__sqrt` becomes sqrtsd in a register | 66 ms | 187 ms | 427 ms | 94 ms | 136 ms | 287 ms | 1.26 s |
+| 10 | maps: call-free integer-key path; `m[k]` read in a single call | 69 ms | 188 ms | 419 ms | 94 ms | 145 ms | 284 ms | 966 ms |
+| 11 | lists in loops: length and data read once; `a[i]` unchecked in `for i := 0; i < len(a); i++` | 64 ms | 144 ms | 425 ms | 90 ms | 108 ms | 234 ms | 833 ms |
+| 12 | `[]bool` and `[N]bool` with 1 byte per element | 64 ms | 70 ms | 396 ms | 90 ms | 107 ms | 229 ms | 852 ms |
+| 13–16 | maps with tags; global lists in loops; operations directly on registers; `num` in XMM; RSI/RDI/R8–R11 | 62 ms | 29 ms | 175 ms | 37 ms | 35 ms | 184 ms | 605 ms |
+| 17–18 | loops with the test at the end, cold code, short branches; division and remainder by a constant without `idiv` | 57 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
+| 19 | guard before the prologue; `leave`; depth counting down | 41 ms | 21 ms | 175 ms | 37 ms | 33 ms | 164 ms | 607 ms |
+| 20–25 | recursion with an accumulator; bounds hoisted out of constant loops; arguments in registers; versioned and vectorized loops; already-checked indexes; maps with `op=` in a single probe | 26 ms | 22 ms | 65 ms | 40 ms | 14 ms | 140 ms | 632 ms |
 
-**Ganho total (rodada 0 → 10), maior tamanho:** fib 1,8×, sieve 2,3×, nbody 1,8×, mandelbrot 2,6×,
-matmul 1,8×, sort 2,2×, maps 2,1×.
+**Total gain (round 0 → 10), largest size:** fib 1.8×, sieve 2.3×, nbody 1.8×, mandelbrot 2.6×,
+matmul 1.8×, sort 2.2×, maps 2.1×.
 
-**Contra as outras linguagens** (mesma máquina, `RESULTS.md`, maior tamanho, depois da rodada 25;
-maps 3M remedido intercalado, porque a rodada do RESULTS.md pegou uma variação da máquina):
+**Against the other languages** (same machine, `RESULTS.md`, largest size, after round 25;
+maps 3M remeasured interleaved, because the RESULTS.md run caught a fluctuation in the machine):
 
-| desafio | Caju antes | Caju depois | Go | Rust | Python | Caju ÷ Go | Caju ÷ Rust |
+| challenge | Caju before | Caju after | Go | Rust | Python | Caju ÷ Go | Caju ÷ Rust |
 |---|--:|--:|--:|--:|--:|--:|--:|
 | fib 35 | 126 ms | 26 ms | 40 ms | 21 ms | 1.22 s | 0.7× | 1.3× |
 | sieve 10M | 435 ms | 22 ms | 20 ms | 21 ms | 2.12 s | 1.1× | 1.0× |
@@ -58,11 +58,11 @@ maps 3M remedido intercalado, porque a rodada do RESULTS.md pegou uma variação
 | maps 1M | — | 111 ms | 182 ms | 104 ms | 607 ms | 0.6× | 1.1× |
 | maps 3M | 2.00 s | 632 ms | 607 ms | 334 ms | 1.91 s | 1.0× | 1.9× |
 
-Contra Python, a Caju passou de 3 a 25 vezes mais rápida para 2 a 70 vezes (e nos mapas, de empate
-para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuções (o matmul variou de
-133 a 145 ms sem mudança no código dele).
+Against Python, Caju went from 3 to 25 times faster to 2 to 70 times faster (and on maps, from a
+tie to 2× faster). Times have a few percent of noise between runs (matmul varied from 133 to
+145 ms with no change to its code).
 
-## Todas as medições
+## All measurements
 
 <!-- python3 bench/compare/rounds/table.py -->
 | challenge | n | round 0 | round 1 | round 2 | round 3 | round 4 | round 5 | round 6 | round 7 | round 8 | round 9 | round 10 | round 11 | round 12 | round 16 | round 18 | total gain |
@@ -89,14 +89,14 @@ para 2× mais rápida). Os tempos têm ruído de alguns por cento entre execuç�
 | maps | 1,000,000 | 561 ms | 538 ms | — | 438 ms | 405 ms | 374 ms | 300 ms | 332 ms | 317 ms | 334 ms | 253 ms | 176 ms | 191 ms | 115 ms | 115 ms | 4.89× |
 | maps | 3,000,000 | 2.00 s | 2.02 s | 1.65 s | 1.60 s | 1.60 s | 1.53 s | 1.28 s | 1.33 s | 1.21 s | 1.26 s | 966 ms | 833 ms | 852 ms | 605 ms | 607 ms | 3.30× |
 
-A rodada 1 foi copiada da saída impressa; da rodada 2 só os maiores tamanhos foram anotados (o
-código dela não foi salvo à parte).
+Round 1 was copied from the printed output; for round 2 only the largest sizes were recorded (its
+code was not saved separately).
 
-## Rodada 0: o ponto de partida
+## Round 0: the starting point
 
-O gerador produz código direto da árvore, como uma máquina de pilha: toda expressão deixa o
-resultado em RAX; uma operação `a op b` calcula `a`, empilha, calcula `b`, move para RCX,
-desempilha e opera. Uma condição `i <= n` virava:
+The generator produces code straight from the tree, like a stack machine: every expression leaves
+its result in RAX; an operation `a op b` computes `a`, pushes it, computes `b`, moves it to RCX,
+pops and operates. A condition `i <= n` became:
 
 ```
 mov rax,[rbp-0x18]   ; i
@@ -107,438 +107,442 @@ pop rax
 cmp rax,rcx
 setle al             ; 0/1
 movzx eax,al
-test rax,rax         ; converte para bool de novo
+test rax,rax         ; convert to bool again
 setne al
 movzx eax,al
 test rax,rax
-je fim
+je end
 ```
 
-Todas as variáveis vivem na pilha (`[rbp±x]`), com deslocamento sempre de 32 bits. Ver
-`rounds/round0-sieve.asm` (134 instruções na função).
+All variables live on the stack (`[rbp±x]`), always with a 32-bit displacement. See
+`rounds/round0-sieve.asm` (134 instructions in the function).
 
-## Rodada 1: codificação mais curta
+## Round 1: shorter encoding
 
-**Hipótese:** instruções menores (deslocamento de 8 bits em `[rbp-0x18]`, imediato de 8 bits em
-`add rsp, 24`) cabem melhor no cache de instruções.
-**Mudança:** `x64.rmx` e `alu_imm` escolhem a forma curta quando cabe; o `sub rsp` do prólogo
-continua com 32 bits porque é corrigido depois (`sub_imm32`).
-**Resultado:** código ~10% menor, tempo igual (dentro do ruído). O custo não está no tamanho das
-instruções, e sim na quantidade.
+**Hypothesis:** smaller instructions (8-bit displacement in `[rbp-0x18]`, 8-bit immediate in
+`add rsp, 24`) fit better in the instruction cache.
+**Change:** `x64.rmx` and `alu_imm` pick the short form when it fits; the prologue's `sub rsp`
+stays 32-bit because it is patched later (`sub_imm32`).
+**Result:** code ~10% smaller, same time (within noise). The cost is not in the size of the
+instructions but in their number.
 
-## Rodada 2: operandos simples e condições como desvios
+## Round 2: simple operands and conditions as branches
 
-**Hipótese:** a maioria dos operandos direitos é uma variável ou um número; e toda condição de
-`if`/`while`/`for` passa por dois "0/1" desnecessários.
-**Mudança:**
-- `simple_to(n, reg)`: carrega um número ou uma variável direto num registrador qualquer;
-  `operands(l, r)` usa isso e só empilha quando o lado direito é complexo.
-- `jump_if(cond, want, dest)`: comparação de inteiros vira `cmp` + `jcc` (a condição inversa é
-  `cc ^ 1`); `!x` troca o sentido; `a && b` e `a || b` viram desvios em curto-circuito.
+**Hypothesis:** most right operands are a variable or a number; and every `if`/`while`/`for`
+condition goes through two unnecessary "0/1" steps.
+**Change:**
+- `simple_to(n, reg)`: loads a number or a variable straight into any register;
+  `operands(l, r)` uses it and only pushes when the right side is complex.
+- `jump_if(cond, want, dest)`: integer comparison becomes `cmp` + `jcc` (the inverse condition is
+  `cc ^ 1`); `!x` flips the sense; `a && b` and `a || b` become short-circuit branches.
 
-`i <= n` agora é `mov rax,[rbp-0x18]; mov rcx,[rbp+0x10]; cmp rax,rcx; jg fim`.
-**Resultado:** fib −25%, sieve −13%, matmul −17%, sort −23%, maps −18%. Ponto flutuante não mudou
-(as operações com `num` continuam passando pela pilha).
+`i <= n` is now `mov rax,[rbp-0x18]; mov rcx,[rbp+0x10]; cmp rax,rcx; jg end`.
+**Result:** fib −25%, sieve −13%, matmul −17%, sort −23%, maps −18%. Floating point did not
+change (operations on `num` still go through the stack).
 
-## Rodada 3: índices, atribuições e constantes
+## Round 3: indexes, assignments and constants
 
-**Hipótese:** em `a[i]` a lista é empilhada para calcular o índice; `a[j] = true` guarda o
-endereço e o valor em duas variáveis escondidas antes de gravar; `count + 1` carrega o 1 num
-registrador; `if !a[i]` normaliza o valor para 0/1 antes de testar.
-**Mudança:**
-- `elem_check`: índice simples vai direto para RCX; a leitura é um só `mov rax,[rax+rcx*8]`.
-- `single_assign`: `x = v` e `a[i] = v` sem os temporários do caso geral (a ordem de avaliação
-  continua: índice antes do valor); valor simples vai direto para a memória.
-- `imm32`: `+ - & | ^` e comparações com constante de até 32 bits usam o imediato.
-- Em condições, inteiros e booleanos são testados com `test rax,rax` direto.
+**Hypothesis:** in `a[i]` the list is pushed while the index is computed; `a[j] = true` stores the
+address and the value in two hidden variables before writing; `count + 1` loads the 1 into a
+register; `if !a[i]` normalizes the value to 0/1 before testing.
+**Change:**
+- `elem_check`: a simple index goes straight into RCX; the load is a single `mov rax,[rax+rcx*8]`.
+- `single_assign`: `x = v` and `a[i] = v` without the temporaries of the general case (evaluation
+  order is kept: index before value); a simple value goes straight to memory.
+- `imm32`: `+ - & | ^` and comparisons with a constant of up to 32 bits use the immediate.
+- In conditions, integers and booleans are tested directly with `test rax,rax`.
 
-Ver `rounds/round3-sieve.asm` (84 instruções, eram 134).
-**Resultado:** sieve −14%, nbody −21%, sort −19%, matmul igual, maps −3%.
+See `rounds/round3-sieve.asm` (84 instructions, down from 134).
+**Result:** sieve −14%, nbody −21%, sort −19%, matmul unchanged, maps −3%.
 
-## Rodada 4: ponto flutuante em registradores XMM
+## Round 4: floating point in XMM registers
 
-**Hipótese:** toda operação com `num` fazia o caminho RAX → pilha → RAX → XMM e de volta
-(`push`, `pop`, dois `movq`); o mandelbrot e o nbody são só isso. E as comparações de `num`
-nas condições ainda montavam um 0/1.
-**Mudança:**
-- `fexpr(n, d)` avalia uma expressão `num` deixando o resultado em `xmm d`; o operando direito vai
-  para `xmm d+1` (`fpair`) e a operação é uma instrução (`addsd xmm d, xmm d+1`).
-- Uma chamada de função apaga todos os XMM, então só pode haver chamada numa subexpressão
-  avaliada quando nada está guardado em XMM (`d == 0`); as outras precisam ser `fpure` (sem
-  chamadas: números, variáveis, índices, campos). Se não forem, o valor da esquerda vai para a
-  pilha só nessa hora. Expressões mais fundas que 14 registradores também usam a pilha.
-- `float_jump`: `a < b` numa condição vira `ucomisd` + `jcc`, com NaN dando falso em todas as
-  comparações menos `!=`, como antes.
-- O `coerce` (int → num) e o arredondamento para `float32` passaram a usar o xmm15 como
-  rascunho: com o xmm0 eles apagavam o operando esquerdo guardado (o erro apareceu em 7 testes
-  na primeira tentativa: `n > 0` com `n` sem tipo nunca era verdadeiro).
-- Testes novos: `tests/lang/float_codegen_test.caju` (inteiros misturados, chamadas no lado
-  direito, expressões mais fundas que os registradores, divisão por zero aninhada, NaN).
+**Hypothesis:** every operation on `num` took the path RAX → stack → RAX → XMM and back
+(`push`, `pop`, two `movq`); mandelbrot and nbody are nothing but that. And `num` comparisons in
+conditions still built a 0/1.
+**Change:**
+- `fexpr(n, d)` evaluates a `num` expression leaving the result in `xmm d`; the right operand goes
+  to `xmm d+1` (`fpair`) and the operation is one instruction (`addsd xmm d, xmm d+1`).
+- A function call clobbers all XMM registers, so a call can only appear in a subexpression
+  evaluated when nothing is held in XMM (`d == 0`); the others must be `fpure` (no calls:
+  numbers, variables, indexes, fields). If they are not, the left value goes to the stack only at
+  that point. Expressions deeper than 14 registers also use the stack.
+- `float_jump`: `a < b` in a condition becomes `ucomisd` + `jcc`, with NaN giving false in every
+  comparison except `!=`, as before.
+- `coerce` (int → num) and rounding to `float32` now use xmm15 as scratch: with xmm0 they
+  clobbered the saved left operand (the bug showed up in 7 tests on the first attempt: `n > 0`
+  with an untyped `n` was never true).
+- New tests: `tests/lang/float_codegen_test.caju` (mixed integers, calls on the right side,
+  expressions deeper than the registers, nested division by zero, NaN).
 
-O núcleo do mandelbrot (`rounds/float_kernel.caju`) caiu de 110 para 69 instruções
+The mandelbrot kernel (`rounds/float_kernel.caju`) went from 110 to 69 instructions
 (`rounds/round3-float.asm` → `rounds/round4-float.asm`).
-**Resultado:** mandelbrot −46% (237 → 127 ms), nbody −8% (o resto é a chamada a `math.sqrt`
-a cada par de corpos, que ainda é uma chamada de função comum).
+**Result:** mandelbrot −46% (237 → 127 ms), nbody −8% (the rest is the call to `math.sqrt` for
+each pair of bodies, which is still an ordinary function call).
 
-## Rodada 5: profundidade de chamadas num registrador
+## Round 5: call depth in a register
 
-**Hipótese:** a linguagem limita a recursão a 10.000 chamadas aninhadas (a mensagem de erro cita
-o número, então o limite fica). Cada chamada fazia `mov rax,[rt_depth]; cmp rax,10000; jl;
-inc [rt_depth]; call; dec [rt_depth]`: duas leituras-e-escritas no mesmo endereço de memória
-por chamada, uma dependência em série de uma chamada para a outra.
-**Mudança:**
-- A profundidade vive no R15, que o gerador nunca usava e que as convenções do Linux e do
-  Windows preservam (código externo não o apaga): `cmp r15,10000; jl ok; ...; inc r15; call;
-  dec r15`. O programa zera o R15 na entrada.
-- O registro de `defer` guarda o R15, e a volta de um `recover` o restaura.
-- O runtime (`rt/panic.caju`) lê e muda a profundidade com duas funções internas novas,
-  `__depth()` e `__set_depth(x)`.
-- Como o compilador em JavaScript não conhece essas funções, ele passou a usar uma cópia
-  congelada do runtime (`bootstrap/rt/`); ele só compila o primeiro estágio.
+**Hypothesis:** the language limits recursion to 10,000 nested calls (the error message cites the
+number, so the limit stays). Each call did `mov rax,[rt_depth]; cmp rax,10000; jl;
+inc [rt_depth]; call; dec [rt_depth]`: two read-modify-writes to the same memory address per
+call, a serial dependency from one call to the next.
+**Change:**
+- The depth lives in R15, which the generator never used and which the Linux and Windows calling
+  conventions preserve (external code does not clobber it): `cmp r15,10000; jl ok; ...; inc r15;
+  call; dec r15`. The program zeroes R15 on entry.
+- The `defer` record saves R15, and returning from a `recover` restores it.
+- The runtime (`rt/panic.caju`) reads and changes the depth through two new intrinsic functions,
+  `__depth()` and `__set_depth(x)`.
+- Since the JavaScript compiler does not know these functions, it now uses a frozen copy of the
+  runtime (`bootstrap/rt/`); it only compiles the first stage.
 
 `rounds/round4-fib.asm` → `rounds/round5-fib.asm`.
-**Resultado:** fib −29% (91 → 65 ms); maps −4%, sieve −5% (todos chamam funções).
+**Result:** fib −29% (91 → 65 ms); maps −4%, sieve −5% (they all call functions).
 
-## Rodada 6: variáveis em registradores
+## Round 6: variables in registers
 
-**Hipótese:** depois das rodadas anteriores, o laço do crivo é quase só `mov rax,[rbp-x]` e
-`mov [rbp-x],rax`: as variáveis do laço (`i`, `j`, `n`) vão e voltam da memória a cada uso.
-**Mudança:** alocação de registradores simples, por função:
-- Conta os usos de cada variável local (peso 8 por nível de laço) e escolhe até 4 com pelo
-  menos 4 usos, que vão para RBX, R12, R13 e R14 (registradores preservados pelas funções
-  chamadas, inclusive as externas).
-- Só variáveis que nunca guardam ponteiro (inteiros, bool, num): o coletor de lixo procura
-  ponteiros só na pilha, e um ponteiro que vivesse só num registrador seria perdido.
-- Fora: variáveis em célula (endereço tomado com `&`), capturadas por funções anônimas, e todas
-  as de funções com `defer`.
-- O prólogo guarda os registradores usados no quadro e a saída os restaura; parâmetros escolhidos
-  são carregados no registrador na entrada.
-- Um `panic` recuperado pula os quadros que guardaram esses registradores; por isso uma função
-  com `defer` guarda os 4 na entrada e os restaura no ponto de recuperação.
+**Hypothesis:** after the previous rounds, the sieve loop is almost all `mov rax,[rbp-x]` and
+`mov [rbp-x],rax`: the loop variables (`i`, `j`, `n`) go to and from memory on every use.
+**Change:** simple per-function register allocation:
+- Counts the uses of each local variable (weight 8 per loop level) and picks up to 4 with at
+  least 4 uses, which go into RBX, R12, R13 and R14 (registers preserved by called functions,
+  including external ones).
+- Only variables that never hold a pointer (integers, bool, num): the garbage collector looks for
+  pointers only on the stack, and a pointer living only in a register would be lost.
+- Excluded: variables in cells (address taken with `&`), variables captured by anonymous
+  functions, and all variables of functions with `defer`.
+- The prologue saves the used registers in the frame and the exit restores them; chosen
+  parameters are loaded into their register on entry.
+- A recovered `panic` skips the frames that saved these registers; so a function with `defer`
+  saves all 4 on entry and restores them at the recovery point.
 
-`rounds/round4-sieve.asm` (84 instruções) → `rounds/round6-sieve.asm`.
-**Resultado:** sieve −28%, sort −27%, maps −16% (o runtime dos mapas também é compilado por este
-gerador), nbody −13%. O matmul e o mandelbrot não mudaram: os programas do benchmark fazem os
-laços no nível de cima do arquivo, onde as variáveis são globais (rodada 7).
+`rounds/round4-sieve.asm` (84 instructions) → `rounds/round6-sieve.asm`.
+**Result:** sieve −28%, sort −27%, maps −16% (the maps runtime is also compiled by this
+generator), nbody −13%. matmul and mandelbrot did not change: the benchmark programs run their
+loops at the top level of the file, where variables are globals (round 7).
 
-## Rodada 7: variáveis do nível de cima como locais
+## Round 7: top-level variables as locals
 
-**Hipótese:** em Caju é comum escrever o programa direto no nível de cima do arquivo (os
-programas do benchmark são assim). Ali toda variável era global: memória, e fora da alocação de
-registradores da rodada 6.
-**Mudança:** uma variável do nível de cima só precisa ser global se alguma função (com nome ou
-anônima) a usar, ou se o endereço dela for tomado (`&x`). As outras viram locais do código do nível
-de cima (`u.top`), que passa pela mesma alocação de registradores. O nível de cima de todos os
-arquivos do programa roda no mesmo `u.top`, então um módulo que usa variável de outro no nível de
-cima continua vendo a mesma.
-- A primeira versão esqueceu de olhar dentro dos literais de struct (`&Node{ik: NONE}`): uma
-  constante usada só ali virou local e a função não a achava. O compilador acusou o erro
-  (`variable "NONE" not found`) num teste; a varredura passou a visitar todas as listas de
-  filhos do nó.
-- Testes novos: `tests/lang/top_level_test.caju` (uso só em literal de struct, `&x`, função
-  anônima, função com nome que altera a variável, laço no nível de cima, coletor de lixo).
+**Hypothesis:** in Caju it is common to write the program directly at the top level of the file
+(the benchmark programs are like that). There every variable was a global: memory, and outside
+the register allocation of round 6.
+**Change:** a top-level variable only needs to be global if some function (named or anonymous)
+uses it, or if its address is taken (`&x`). The others become locals of the top-level code
+(`u.top`), which goes through the same register allocation. The top level of every file in the
+program runs in the same `u.top`, so a module that uses another module's variable at the top level
+still sees the same one.
+- The first version forgot to look inside struct literals (`&Node{ik: NONE}`): a constant used
+  only there became a local and the function could not find it. The compiler reported the error
+  (`variable "NONE" not found`) in a test; the scan now visits all of a node's child lists.
+- New tests: `tests/lang/top_level_test.caju` (use only in a struct literal, `&x`, anonymous
+  function, named function that changes the variable, loop at the top level, garbage collector).
 
-**Resultado:** mandelbrot −26% (125 → 92 ms), sieve −15%. O matmul quase não mudou: o laço
-quente dele é `c[i*n+j] += aik * b[k*n+j]`, e um `+=` com índice ainda passa pelo caminho geral
-(rodada 8).
+**Result:** mandelbrot −26% (125 → 92 ms), sieve −15%. matmul barely changed: its hot loop is
+`c[i*n+j] += aik * b[k*n+j]`, and an indexed `+=` still goes through the general path (round 8).
 
-## Rodada 8: `a[i] op= v` e operandos sem pilha
+## Round 8: `a[i] op= v` and operands without the stack
 
-**Hipótese:** o laço do matmul, `c[i*n+j] += aik * b[k*n+j]`, passava pelo caminho geral do
-`op=` com alvo composto (endereço e valor atual em variáveis escondidas, um nó `·tmp`).
-**Primeira mudança:** `index_op_assign`, um atalho para `a[i] op= v` (lista ou array de
-inteiros, ou de `num` quando `v` não chama funções): calcula o endereço uma vez, lê o valor atual
-antes de avaliar `v` (a mesma ordem do caminho geral), opera com a mesma `int_op` (com as
-verificações de divisão e deslocamento) e grava. Testes novos em
-`tests/lang/index_assign_test.caju`. **Resultado: nada** (matmul 202 ms).
+**Hypothesis:** the matmul loop, `c[i*n+j] += aik * b[k*n+j]`, went through the general path of
+`op=` with a compound target (address and current value in hidden variables, a `·tmp` node).
+**First change:** `index_op_assign`, a shortcut for `a[i] op= v` (list or array of integers, or
+of `num` when `v` does not call functions): computes the address once, reads the current value
+before evaluating `v` (the same order as the general path), operates with the same `int_op` (with
+the division and shift checks) and writes. New tests in `tests/lang/index_assign_test.caju`.
+**Result: nothing** (matmul 202 ms).
 
-**Segunda hipótese (lendo o código gerado):** o custo estava nos `push`/`pop`: em `b[k*n+j]` a
-lista era empilhada enquanto o índice composto era calculado, e em `aik * b[...]` o `aik` era
-empilhado enquanto o lado direito era calculado.
-**Segunda mudança:** quando um lado é simples (variável ou número) e o outro não chama funções,
-o lado composto é calculado primeiro e o simples é carregado depois direto no outro registrador.
-É seguro porque em Caju atribuição é comando, não expressão: uma expressão sem chamadas não muda
-nenhuma variável, então a ordem não altera o resultado.
-**Resultado:** matmul −34% (202 → 133 ms), maps −9%.
+**Second hypothesis (from reading the generated code):** the cost was in the `push`/`pop`: in
+`b[k*n+j]` the list was pushed while the compound index was computed, and in `aik * b[...]` `aik`
+was pushed while the right side was computed.
+**Second change:** when one side is simple (variable or number) and the other does not call
+functions, the compound side is computed first and the simple one is then loaded straight into
+the other register. This is safe because in Caju assignment is a statement, not an expression: a
+call-free expression changes no variable, so the order does not affect the result.
+**Result:** matmul −34% (202 → 133 ms), maps −9%.
 
-## Rodada 9: inline de funções pequenas
+## Round 9: inlining small functions
 
-**Hipótese:** no nbody, `math.sqrt(d2)` é uma chamada de função comum por par de corpos
-(`math.sqrt` é `return __sqrt(x)`), com o custo de chamada e com o valor saindo dos registradores
-XMM.
-**Mudança:** `try_inline` troca a chamada a uma função cujo corpo é só `return E` (sem chamar
-funções do programa, até 40 nós) por uma cópia de `E` com os parâmetros trocados pelos
-argumentos. Para não mudar o significado: os argumentos não podem chamar funções, o tipo de cada
-um tem que ser o do parâmetro, um parâmetro usado mais de uma vez (ou nenhuma) só aceita
-argumento simples, e o inline é recusado se uma variável local de quem chama tiver o nome de uma
-global usada no corpo. `fexpr` entende chamadas inline que devolvem `num`, e `__sqrt` vira
-`sqrtsd` direto no registrador.
-- A primeira versão fez inline de `fn helper() -> any { return recover() }`: o `recover` só vale
-  na própria função adiada, e o inline mudou isso (um teste de `panic` acusou). Funções internas
-  que dependem da chamada em que estão (`recover`, `__depth`, `__sp`...) ficaram fora.
-- Testes novos: `tests/lang/inline_test.caju`.
+**Hypothesis:** in nbody, `math.sqrt(d2)` is an ordinary function call per pair of bodies
+(`math.sqrt` is `return __sqrt(x)`), with the cost of a call and with the value leaving the XMM
+registers.
+**Change:** `try_inline` replaces a call to a function whose body is just `return E` (calling no
+program functions, up to 40 nodes) with a copy of `E` in which the parameters are replaced by the
+arguments. To keep the meaning: the arguments must not call functions, each argument's type must
+match the parameter's, a parameter used more than once (or not at all) only accepts a simple
+argument, and inlining is refused if a local variable of the caller has the name of a global used
+in the body. `fexpr` understands inlined calls that return `num`, and `__sqrt` becomes `sqrtsd`
+directly in the register.
+- The first version inlined `fn helper() -> any { return recover() }`: `recover` only works in
+  the deferred function itself, and inlining changed that (a `panic` test caught it). Intrinsic
+  functions that depend on the call they are in (`recover`, `__depth`, `__sp`...) are excluded.
+- New tests: `tests/lang/inline_test.caju`.
 
-**Resultado:** nbody −2%: o `sqrt` não era o custo principal. O que sobra no nbody: cada `x[i]`
-de uma lista global lê o ponteiro da memória e confere nil e limite; há 8 variáveis `num` para 4
-registradores; e ainda há 156 `push` na função `advance`.
+**Result:** nbody −2%: `sqrt` was not the main cost. What remains in nbody: each `x[i]` on a
+global list reads the pointer from memory and checks nil and bounds; there are 8 `num` variables
+for 4 registers; and there are still 156 `push` instructions in the `advance` function.
 
-## Rodada 10: mapas
+## Round 10: maps
 
-**Hipótese:** ler `m[k]` eram duas chamadas ao runtime (`rt_map_find` e `rt_map_val`), e cada
-tentativa da busca chamava `rt_hash` e `rt_keq`, mesmo com chave inteira.
-**Mudança:**
-- `rt_map_find` (runtime, `rt/values.caju`) tem um caminho para chaves inteiras com o hash e a
-  comparação escritos no próprio laço, sem chamadas; `rt_hash` testa a chave inteira primeiro.
-- `rt_map_get` devolve o valor (ou 0) e se a chave foi achada; o código gerado faz uma chamada só
-  e só chama `rt_zero` quando o valor zero do tipo não é 0 (textos, structs).
-- Testes novos: `tests/lang/map_values_test.caju` (valores zero de cada tipo, `v, ok`, chaves
-  negativas e grandes, `0.0` e `-0.0`, 50 mil chaves, structs como valores).
+**Hypothesis:** reading `m[k]` took two runtime calls (`rt_map_find` and `rt_map_val`), and each
+probe of the lookup called `rt_hash` and `rt_keq`, even with an integer key.
+**Change:**
+- `rt_map_find` (runtime, `rt/values.caju`) has a path for integer keys with the hash and the
+  comparison written in the loop itself, without calls; `rt_hash` tests for an integer key first.
+- `rt_map_get` returns the value (or 0) and whether the key was found; the generated code makes a
+  single call and only calls `rt_zero` when the type's zero value is not 0 (strings, structs).
+- New tests: `tests/lang/map_values_test.caju` (zero values of each type, `v, ok`, negative and
+  large keys, `0.0` and `-0.0`, 50 thousand keys, structs as values).
 
-**Resultado:** maps −23% (1,26 s → 966 ms).
+**Result:** maps −23% (1.26 s → 966 ms).
 
-## Rodada 11: listas dentro de laços
+## Round 11: lists inside loops
 
-**Hipótese:** em `for i := 0; i < len(a); i++ { ... a[i] ... }`, cada volta chamava `rt_slen`
-para o `len(a)`, e cada `a[i]` lia o cabeçalho da lista, conferia nil, lia o tamanho, comparava
-e lia o ponteiro dos dados. Mas o cabeçalho de uma lista nunca muda: `append` e `a[x:y]` criam
-um cabeçalho novo (`rt_hdr`). Se o laço não atribui a variável, o tamanho e os dados não mudam.
-**Mudança:**
-- `scan_loop` lista as variáveis que um laço (condição, passo e corpo) indexa e as que ele
-  atribui. Antes de um `while`, `for` ou `range`, `enter_scache` guarda o tamanho e o ponteiro
-  dos dados de cada lista local que o laço indexa e não atribui (fora: listas em célula,
-  capturadas, globais ou em registrador) em duas variáveis escondidas na pilha (o coletor vê o
-  ponteiro ali). Dentro do laço, `len(a)` lê a variável escondida e `a[i]` faz só
-  `cmp rcx,[tamanho]; jae lento; mov rax,[dados]`; o caminho lento é o de antes e dá o mesmo erro.
-- `counted_loop`: em `for i := K; i < len(a); i++` com `K >= 0` e nem `i` nem `a` atribuídos na
-  condição ou no corpo, `a[i]` está sempre dentro dos limites e não é conferido. `i` tem que ser
-  um `int` local fora de célula e não capturado (um `*p = 7` com `p := &i`, ou uma função anônima
-  que muda `i`, mudariam o índice sem que a varredura visse).
-- `len`/`cap` de uma lista viram duas instruções (sem chamar `rt_slen`), e o `range` lê os dados
-  uma vez.
-- O agente que escreveu a primeira versão mediu o ganho, mas o `counted_loop` nunca era ativado:
-  o `0` de `i := 0` e o `1` de `i++` vêm sem tipo anotado (`imm32` os tomava por `num`), e a
-  varredura incluía o próprio `i++`, então `i` sempre parecia atribuído. Corrigido com `int_lit`
-  e varrendo só a condição e o corpo; o código gerado (`tools/disasm.sh`) conferido.
-- Testes novos: `tests/lang/loop_lists_test.caju` (lista atribuída no laço, `append` sem
-  atribuir, lista nil, índice que não é a variável do laço, `&i`, função anônima que muda `i` ou
-  a lista). A suíte também passou com coleta a cada 64 KB.
+**Hypothesis:** in `for i := 0; i < len(a); i++ { ... a[i] ... }`, each iteration called
+`rt_slen` for `len(a)`, and each `a[i]` read the list header, checked nil, read the length,
+compared and read the data pointer. But a list header never changes: `append` and `a[x:y]` create
+a new header (`rt_hdr`). If the loop does not assign the variable, the length and data do not
+change.
+**Change:**
+- `scan_loop` lists the variables that a loop (condition, step and body) indexes and the ones it
+  assigns. Before a `while`, `for` or `range`, `enter_scache` stores the length and data pointer
+  of each local list that the loop indexes and does not assign (excluded: lists in cells,
+  captured, global or in a register) in two hidden variables on the stack (the collector sees the
+  pointer there). Inside the loop, `len(a)` reads the hidden variable and `a[i]` does only
+  `cmp rcx,[length]; jae slow; mov rax,[data]`; the slow path is the old one and gives the same
+  error.
+- `counted_loop`: in `for i := K; i < len(a); i++` with `K >= 0` and neither `i` nor `a` assigned
+  in the condition or the body, `a[i]` is always in bounds and is not checked. `i` must be a local
+  `int`, not in a cell and not captured (a `*p = 7` with `p := &i`, or an anonymous function that
+  changes `i`, would change the index without the scan seeing it).
+- `len`/`cap` of a list become two instructions (without calling `rt_slen`), and `range` reads the
+  data once.
+- The agent that wrote the first version measured the gain, but `counted_loop` was never
+  triggered: the `0` in `i := 0` and the `1` in `i++` come without a type annotation (`imm32`
+  took them for `num`), and the scan included the `i++` itself, so `i` always looked assigned.
+  Fixed with `int_lit` and by scanning only the condition and the body; the generated code
+  (`tools/disasm.sh`) was checked.
+- New tests: `tests/lang/loop_lists_test.caju` (list assigned in the loop, `append` without
+  assigning, nil list, index that is not the loop variable, `&i`, anonymous function that changes
+  `i` or the list). The suite also passed with a collection every 64 KB.
 
-O laço de soma de uma lista (`for i := 0; i < len(a); i++ { s += a[i] }`) passou de 26
-instruções mais uma chamada a `rt_slen` por volta para 17 instruções.
-**Resultado** (base remedida na mesma sessão, melhor de 3 passadas de 5 execuções): matmul −21%
-(136 → 108 ms), crivo −17% (173 → 144 ms), sort −13% (269 → 234 ms). O nbody ficou 7% mais lento,
-mas o código de `advance` é idêntico instrução por instrução: só o endereço da função mudou
-(o nbody usa listas globais, que a rodada não toca). É efeito de alinhamento do código.
+The loop that sums a list (`for i := 0; i < len(a); i++ { s += a[i] }`) went from 26 instructions
+plus one call to `rt_slen` per iteration to 17 instructions.
+**Result** (baseline remeasured in the same session, best of 3 passes of 5 runs): matmul −21%
+(136 → 108 ms), sieve −17% (173 → 144 ms), sort −13% (269 → 234 ms). nbody got 7% slower, but
+the code of `advance` is identical instruction for instruction: only the function's address
+changed (nbody uses global lists, which this round does not touch). It is a code alignment effect.
 
-## Rodada 12: listas de bool com 1 byte por elemento
+## Round 12: bool lists with 1 byte per element
 
-**Hipótese:** todo elemento de lista ocupava 8 bytes; o crivo de 10 milhões varria 80 MB (o Go,
-10 MB). O custo é de memória e de cache, não de instruções.
-**Mudança:** listas e arrays de `bool` guardam 1 byte por elemento.
-- Gerador: `byte_elems(t)` diz se a lista é de bool; ler é `movzx eax, byte [rax+rcx]`, o
-  endereço é `lea rax, [rax+rcx]`; literais e `append` gravam bytes; `a[x:y]` passa o tamanho do
-  elemento ao runtime (`rt_sub_slice`/`rt_sub_array` ganharam um argumento).
-- Um `*bool` pode apontar para dentro de uma lista de bool (1 byte) ou para uma variável ou campo
-  (8 bytes, cujos bytes de cima são sempre 0 num bool): por isso todo bool lido ou gravado por
-  endereço usa 1 byte (`load_at`/`store_at`).
-- Runtime (`rt/values.caju`): `rt_esize`, `rt_eload`, `rt_estore`, `rt_ecopy`, `rt_edata`; o
-  bloco de dados de uma lista de bool vem de `rt_alloc_ns` (sem ponteiros, já zerado: tudo
-  `false`). `make`, `append`, `copy`, comparação, cópia de arrays, valores zero e a impressão
-  conhecem o tamanho.
-- `[]uint8` continua com 8 bytes (fica para depois: aparece em mais lugares da biblioteca).
-- **Bootstrap:** como o formato dos dados mudou, o compilador anterior não pode compilar este
-  (ele gera leituras de 8 bytes, e o runtime novo aloca 1). A cadeia tem que começar no JS:
-  `node bootstrap/caju.js build -o build/s1 ...`, depois s1 → s2 → s3.
-- Testes novos: `tests/lang/bool_lists_test.caju` (make, literais, índices, ponteiros para
-  elementos, append, copy com sobreposição, fatias que compartilham memória, arrays em structs,
-  comparação, impressão). A suíte também passou com coleta a cada 64 KB.
+**Hypothesis:** every list element took 8 bytes; the 10-million sieve scanned 80 MB (Go, 10 MB).
+The cost is memory and cache, not instructions.
+**Change:** lists and arrays of `bool` store 1 byte per element.
+- Generator: `byte_elems(t)` says whether the list is of bool; a read is `movzx eax, byte [rax+rcx]`,
+  the address is `lea rax, [rax+rcx]`; literals and `append` write bytes; `a[x:y]` passes the
+  element size to the runtime (`rt_sub_slice`/`rt_sub_array` gained an argument).
+- A `*bool` can point into a bool list (1 byte) or to a variable or field (8 bytes, whose upper
+  bytes are always 0 in a bool): so every bool read or written through an address uses 1 byte
+  (`load_at`/`store_at`).
+- Runtime (`rt/values.caju`): `rt_esize`, `rt_eload`, `rt_estore`, `rt_ecopy`, `rt_edata`; the
+  data block of a bool list comes from `rt_alloc_ns` (no pointers, already zeroed: all `false`).
+  `make`, `append`, `copy`, comparison, array copies, zero values and printing know the size.
+- `[]uint8` stays at 8 bytes (left for later: it appears in more places in the library).
+- **Bootstrap:** since the data format changed, the previous compiler cannot compile this one (it
+  generates 8-byte reads, and the new runtime allocates 1). The chain has to start from JS:
+  `node bootstrap/caju.js build -o build/s1 ...`, then s1 → s2 → s3.
+- New tests: `tests/lang/bool_lists_test.caju` (make, literals, indexes, pointers to elements,
+  append, overlapping copy, slices that share memory, arrays in structs, comparison, printing).
+  The suite also passed with a collection every 64 KB.
 
-**Resultado:** crivo −52% (146 → 70 ms) e memória de 79 para 11 MB no tamanho maior; o resto não
-mudou (o nbody voltou aos 396 ms: confirma que os 7% da rodada 11 eram alinhamento).
+**Result:** sieve −52% (146 → 70 ms) and memory from 79 to 11 MB at the largest size; the rest
+did not change (nbody went back to 396 ms: confirming that round 11's 7% was alignment).
 
-## Rodadas 13 a 16: sete ângulos em paralelo
+## Rounds 13 to 16: seven angles in parallel
 
-Com `perf` e `valgrind` instalados (docs/tools.md), a contagem exata de instruções mostrou que a
-Caju executava 1,7 a 3,2 vezes mais instruções que o Go: o problema era o código gerado, não a
-memória (exceto nos mapas, com 0,77 instrução por ciclo). Sete agentes testaram uma hipótese
-cada, num worktree, com a suíte e a autocompilação como prova; cada um foi integrado e validado
-de novo (cadeia desde o JS, suíte normal e com coleta a cada 64 KB, saídas iguais às do Go).
+With `perf` and `valgrind` installed (docs/tools.md), exact instruction counts showed that Caju
+executed 1.7 to 3.2 times more instructions than Go: the problem was the generated code, not
+memory (except for maps, at 0.77 instructions per cycle). Seven agents tested one hypothesis
+each, in a worktree, with the suite and self-compilation as proof; each one was integrated and
+validated again (chain from JS, normal suite and with a collection every 64 KB, output identical
+to Go's).
 
-| mudança | commit | efeito principal (instruções) |
+| change | commit | main effect (instructions) |
 |---|---|---|
-| mapas: etiqueta do hash no índice, entradas de 16 bytes | 4c410db | maps −20% (ciclos −28%, falhas de cache −38%) |
-| 13: listas globais em laços sem chamadas; `movsd` direto; `jb` no caminho rápido | dc7734d | nbody −31%, matmul −14% |
-| 14: operações direto nas variáveis em registrador/slot (`inc rbx`, `cmp rbx,r12`, `add [rax+rbx*8],imm`) | 6cbb73d | sieve −42%, matmul −36%, mandelbrot −34% |
-| 15: variáveis `num` em xmm8–14 (salvas em volta das chamadas) | c91bf28 | mandelbrot −28%, nbody −6% |
-| 16: RSI, RDI, R8–R11 para variáveis; dados/tamanho das listas em registrador nos laços | 01668a2 | sieve −11%, matmul −8% (ciclos do matmul −60%) |
+| maps: hash tag in the index, 16-byte entries | 4c410db | maps −20% (cycles −28%, cache misses −38%) |
+| 13: global lists in call-free loops; direct `movsd`; `jb` on the fast path | dc7734d | nbody −31%, matmul −14% |
+| 14: operations directly on variables in registers/slots (`inc rbx`, `cmp rbx,r12`, `add [rax+rbx*8],imm`) | 6cbb73d | sieve −42%, matmul −36%, mandelbrot −34% |
+| 15: `num` variables in xmm8–14 (saved around calls) | c91bf28 | mandelbrot −28%, nbody −6% |
+| 16: RSI, RDI, R8–R11 for variables; list data/length in registers in loops | 01668a2 | sieve −11%, matmul −8% (matmul cycles −60%) |
 
-**Tempo** (rodada 12 × rodada 16, mesma sessão, intercaladas, melhor de 3 passadas de 5
-execuções, maior tamanho): sieve 67 → 29 ms (−57%), nbody 390 → 175 ms (−55%), mandelbrot 89 →
-37 ms (−58%), matmul 106 → 35 ms (−67%), sort 225 → 184 ms (−18%), maps 809 → 605 ms (−25%),
+**Time** (round 12 vs. round 16, same session, interleaved, best of 3 passes of 5 runs, largest
+size): sieve 67 → 29 ms (−57%), nbody 390 → 175 ms (−55%), mandelbrot 89 → 37 ms (−58%),
+matmul 106 → 35 ms (−67%), sort 225 → 184 ms (−18%), maps 809 → 605 ms (−25%),
 fib 63 → 62 ms.
 
-## Rodadas 17 e 18: fluxo de controle e divisão por constante
+## Rounds 17 and 18: control flow and division by a constant
 
-- **17 (ângulo 7, cfad91b):** laços `while`/`for`/`range` com a condição depois do corpo (um
-  desvio por volta); caminhos de erro (limites, nil, divisão, deslocamento, profundidade) no
-  código frio, depois do `ret`; `x64.finish` encurta desvios para rel8 e tira desvios para a
-  instrução seguinte; `return` no meio da função faz o epílogo ali. Testes:
+- **17 (angle 7, cfad91b):** `while`/`for`/`range` loops with the condition after the body (one
+  branch per iteration); error paths (bounds, nil, division, shift, depth) in cold code, after the
+  `ret`; `x64.finish` shortens branches to rel8 and removes branches to the next instruction;
+  `return` in the middle of a function emits the epilogue there. Tests:
   `tests/lang/loop_layout_test.caju`.
-- **18 (ângulo 1, 9c18cb7):** `x / d` e `x % d` com `d` constante sem `idiv` nem verificações
-  (deslocamentos para potências de 2, multiplicação pelo número mágico para os outros). Testes:
-  `tests/lang/const_div_test.caju` (10 tipos inteiros, conferidos contra o caminho geral).
+- **18 (angle 1, 9c18cb7):** `x / d` and `x % d` with a constant `d` without `idiv` or checks
+  (shifts for powers of 2, multiplication by the magic number for the others). Tests:
+  `tests/lang/const_div_test.caju` (10 integer types, checked against the general path).
 
-Medidas separadas sobre a rodada 16 (tempo, 3 passadas intercaladas): a 17 deu sieve −31%,
-sort −11%, fib −7%; a 18 deu sort −5% e matmul −15% sozinha, mas na combinação o matmul fica em
-−4% (a inicialização do matmul faz só 90 mil divisões, ~1 ms: o −15% era efeito de alinhamento).
-Juntas, sobre a rodada 16: sieve 29 → 21 ms (−28%), sort 184 → 164 ms (−11%), fib 62 → 57 ms
-(−8%); o resto igual. A 18 vale mais fora destes desafios: −21% de ciclos num laço com `%`
-constante.
+Measured separately on top of round 16 (time, 3 interleaved passes): 17 gave sieve −31%,
+sort −11%, fib −7%; 18 gave sort −5% and matmul −15% on its own, but combined matmul ends up at
+−4% (matmul's initialization does only 90 thousand divisions, ~1 ms: the −15% was an alignment
+effect). Together, on top of round 16: sieve 29 → 21 ms (−28%), sort 184 → 164 ms (−11%), fib
+62 → 57 ms (−8%); the rest unchanged. Round 18 is worth more outside these challenges: −21% cycles
+in a loop with a constant `%`.
 
-## Rodada 19: o custo das chamadas (fib)
+## Round 19: the cost of calls (fib)
 
-**Hipótese:** depois das rodadas anteriores o fib era o único desafio ainda a 1,6× do Go. Pelo
-código de máquina (`tools/disasm.sh`), a Caju executava 12 instruções numa chamada-folha
-(`n < 2`) e 29 nas outras; o Go, 10 e 20 (`go tool objdump`). Três sobras:
-1. A folha montava o quadro inteiro (push rbp, sub rsp, guardar e carregar rbx) só para
-   comparar `n` e voltar.
-2. `mov rsp, rbp; pop rbp` em todo retorno.
-3. A profundidade de chamadas custava `cmp r15,10000; jge; inc r15` antes de cada chamada.
+**Hypothesis:** after the previous rounds fib was the only challenge still 1.6× behind Go. From
+the machine code (`tools/disasm.sh`), Caju executed 12 instructions in a leaf call (`n < 2`) and
+29 in the others; Go, 10 and 20 (`go tool objdump`). Three leftovers:
+1. The leaf built the whole frame (push rbp, sub rsp, save and load rbx) just to compare `n` and
+   return.
+2. `mov rsp, rbp; pop rbp` on every return.
+3. The call depth cost `cmp r15,10000; jge; inc r15` before each call.
 
-**Mudança:**
-- `early_guard`: uma função cujo primeiro comando é `if p < K { return q }` (p parâmetro `int`;
-  K constante ou outro parâmetro; q parâmetro ou constante; qualquer comparação) faz o teste
-  antes do prólogo, lendo os argumentos acima do endereço de retorno (`[rsp+8+...]`), e volta
-  sem montar o quadro. Nada roda antes desse comando na função, então pular o prólogo não muda
-  nada; ficam fora funções com `defer`, funções anônimas, parâmetros em célula e resultados
-  com nome. A folha do fib: `mov rax,[rsp+8]; cmp rax,2; jge corpo; ret` (4 instruções).
-- `leave` no lugar de `mov rsp, rbp; pop rbp`.
-- R15 conta as chamadas que ainda cabem: começa em 10.000 e cada chamada faz
-  `dec r15; js erro` (e `inc r15` na volta). A 10.001ª chamada aninhada falha, como antes; o
-  runtime só guarda, restaura e compara o valor (`__depth`/`__set_depth`), então nada mais muda.
-- Testes novos: `tests/lang/calls_test.caju` (variações da guarda, métodos, exatamente 10.000
-  chamadas passam e 10.001 falham, a profundidade inteira de volta depois de um panic
-  recuperado); passam também no compilador anterior.
+**Change:**
+- `early_guard`: a function whose first statement is `if p < K { return q }` (p an `int`
+  parameter; K a constant or another parameter; q a parameter or constant; any comparison) runs
+  the test before the prologue, reading the arguments above the return address (`[rsp+8+...]`),
+  and returns without building the frame. Nothing runs before this statement in the function, so
+  skipping the prologue changes nothing; excluded are functions with `defer`, anonymous functions,
+  parameters in cells and named results. The fib leaf: `mov rax,[rsp+8]; cmp rax,2; jge body;
+  ret` (4 instructions).
+- `leave` instead of `mov rsp, rbp; pop rbp`.
+- R15 counts the calls that still fit: it starts at 10,000 and each call does
+  `dec r15; js fail` (and `inc r15` on return). The 10,001st nested call fails, as before; the
+  runtime only saves, restores and compares the value (`__depth`/`__set_depth`), so nothing else
+  changes.
+- New tests: `tests/lang/calls_test.caju` (guard variations, methods, exactly 10,000 calls pass
+  and 10,001 fail, the full depth back after a recovered panic); they also pass on the previous
+  compiler.
 
-**Resultado:** instruções do fib 32 de 144,7 M para 109,5 M (−24%; o Go faz 103 M); os outros
-desafios caíram de 0 a 1%. Tempo (5 passadas intercaladas): fib 35 de 58 para 41 ms (−30%);
-o Go faz 36,7 ms. O que sobra é a passagem de argumentos pela pilha (o Go usa registradores) e
-guardar/restaurar o RBX nas chamadas que não são folha.
+**Result:** fib 32 instructions from 144.7 M to 109.5 M (−24%; Go does 103 M); the other
+challenges dropped 0 to 1%. Time (5 interleaved passes): fib 35 from 58 to 41 ms (−30%); Go does
+36.7 ms. What remains is passing arguments on the stack (Go uses registers) and saving/restoring
+RBX in non-leaf calls.
 
-## Rodada 20 (ângulo C): recursão como laço com acumulador
+## Round 20 (angle C): recursion as a loop with an accumulator
 
-**Hipótese:** o Rust transforma `fib(n - 1) + fib(n - 2)` num laço (`acc += fib(n - 1); n -= 2`):
-metade das chamadas. Com inteiros de 64 bits que dão a volta, + * & | ^ são exatamente
-associativas e comutativas, então vale para qualquer função assim.
+**Hypothesis:** Rust turns `fib(n - 1) + fib(n - 2)` into a loop (`acc += fib(n - 1); n -= 2`):
+half the calls. With 64-bit wrapping integers, + * & | ^ are exactly associative and commutative,
+so this works for any function of that shape.
 
-**Mudança (`acc_plan`, `acc_loop`, `acc_return` em native.caju):** numa função (não método, sem
-`defer`, sem resultados com nome, sem variáveis em célula, resultado `int`) cujos `return` diretos
-no corpo ou em blocos if/else são `L op f(args)`, `f(args) op L` (L literal ou variável local) ou
-`f(args)`, esses `return` fazem `acc = acc op L`, passam os argumentos aos parâmetros e voltam ao
-começo; os outros `return q` dão `acc op q`. A ordem de avaliação fica (L, os argumentos, depois a
-"chamada"). Cada volta faz o `dec r15; js` da chamada que substitui (no mesmo nó, mesma
-mensagem); quando L é ela mesma uma chamada e os argumentos não chamam nada, a unidade da chamada
-de L fica (sem `inc r15`/`dec r15`), porque a chamada substituída é da mesma profundidade. Na saída
-o R15 volta ao valor da entrada (guardado no quadro). Com `early_guard`, a guarda é testada de
-novo no fim de cada volta (o laço vai direto para o segundo comando). O laço do fib:
+**Change (`acc_plan`, `acc_loop`, `acc_return` in native.caju):** in a function (not a method, no
+`defer`, no named results, no variables in cells, `int` result) whose direct `return`s in the body
+or in if/else blocks are `L op f(args)`, `f(args) op L` (L a literal or local variable) or
+`f(args)`, those `return`s do `acc = acc op L`, pass the arguments to the parameters and jump back
+to the start; the other `return q`s give `acc op q`. Evaluation order is kept (L, the arguments,
+then the "call"). Each iteration does the `dec r15; js` of the call it replaces (on the same node,
+same message); when L is itself a call and the arguments call nothing, L's call unit is kept
+(without `inc r15`/`dec r15`), because the replaced call is at the same depth. On exit R15 goes
+back to its value on entry (saved in the frame). With `early_guard`, the guard is tested again at
+the end of each iteration (the loop jumps straight to the second statement). The fib loop:
 `lea rax,[rbx-1]; push rax; dec r15; js; call fib; add rsp,8; add [acc],rax; sub rbx,2; cmp rbx,2; jge`.
 
-**Resultado:** fib 32 de 109,5 M para 75,7 M instruções (−31%; Go 102,8 M, Rust 69,4 M); ciclos
-42 M → 33 M (ruidoso). Os outros desafios não mudam. Testes: `tests/lang/self_calls_test.caju`
-(resultados, volta dos 64 bits, ordem dos efeitos, structs por valor, exatamente 10.000 chamadas
-em seis formas, profundidade das chamadas nos argumentos, recursão infinita, divisão por zero na
-mesma linha, panic recuperado); passam também no compilador anterior.
+**Result:** fib 32 from 109.5 M to 75.7 M instructions (−31%; Go 102.8 M, Rust 69.4 M); cycles
+42 M → 33 M (noisy). The other challenges do not change. Tests: `tests/lang/self_calls_test.caju`
+(results, 64-bit wraparound, order of effects, structs by value, exactly 10,000 calls in six
+forms, depth of calls in the arguments, infinite recursion, division by zero on the same line,
+recovered panic); they also pass on the previous compiler.
 
-## Rodadas 20 a 25: atrás do Rust
+## Rounds 20 to 25: chasing Rust
 
-Com o Go alcançado, o alvo passou a ser o Rust, que executava 1,5× a 3× menos instruções em
-fib, nbody, matmul, sort e maps (`perf stat` nos três binários; `objdump` do Rust e `go tool
-objdump` mostraram o porquê). Seis agentes, um por hipótese, cada um num worktree; integrados um
-por um (cadeia desde o JS, suíte normal e com coleta a cada 64 KB, saídas iguais às do Go).
-Nenhum programa do benchmark foi alterado.
+With Go caught up, the target became Rust, which executed 1.5× to 3× fewer instructions on fib,
+nbody, matmul, sort and maps (`perf stat` on the three binaries; Rust's `objdump` and `go tool
+objdump` showed why). Six agents, one per hypothesis, each in a worktree; integrated one by one
+(chain from JS, normal suite and with a collection every 64 KB, output identical to Go's). No
+benchmark program was changed.
 
-| rodada | mudança | commit | efeito (instruções) |
+| round | change | commit | effect (instructions) |
 |---|---|---|---|
-| 20 | recursão como laço com acumulador: `return f(a) + f(b)` vira laço numa das chamadas (como o LLVM), com a profundidade contada por volta e devolvida no retorno | 3db2a83 | fib −31% |
-| 21 | laços `for v := E; v < C` com C constante: listas conferidas uma vez antes do laço; cópia sem verificações e o laço original quando falha; operandos `num` direto da memória | 719f14e | nbody −56% |
-| 22 | argumentos não-ponteiro em registradores (RSI, RDI, R8–R11) nas chamadas diretas; duas entradas por função (`u.r.` e `u.f.`); `early_guard` nos registradores | 3fcce14 | fib −12% |
-| 23 | laços contados versionados (limites conferidos antes, cópia sem verificações desenrolada ×4) e vetorizados com SSE2 quando o resultado é idêntico (aliasing conferido) | ca7cec0 | matmul −80% |
-| 24 | fatos de índice (`a[i]` já conferido não é conferido de novo até `a` ou `i` mudarem); `make` sem zerar de novo; páginas novas sem zerar (`rt_fresh`); condição repetida antes do corpo | 6529562 | sort −29%, sieve −5% |
-| 25 | mapas: `m[k] op= v` numa sondagem só (`rt_map_slot`); índice de 32 bits; vetores velhos liberados na hora e memória livre devolvida ao sistema | b2f68a7 | maps −36%; memória do maps 3M 132 → 50 MB |
+| 20 | recursion as a loop with an accumulator: `return f(a) + f(b)` becomes a loop on one of the calls (like LLVM), with the depth counted per iteration and given back on return | 3db2a83 | fib −31% |
+| 21 | `for v := E; v < C` loops with a constant C: lists checked once before the loop; an unchecked copy, with the original loop when the check fails; `num` operands straight from memory | 719f14e | nbody −56% |
+| 22 | non-pointer arguments in registers (RSI, RDI, R8–R11) in direct calls; two entry points per function (`u.r.` and `u.f.`); `early_guard` on the registers | 3fcce14 | fib −12% |
+| 23 | versioned counted loops (bounds checked beforehand, unchecked copy unrolled ×4) and vectorized with SSE2 when the result is identical (aliasing checked) | ca7cec0 | matmul −80% |
+| 24 | index facts (an already-checked `a[i]` is not checked again until `a` or `i` changes); `make` without zeroing twice; fresh pages without zeroing (`rt_fresh`); condition repeated before the body | 6529562 | sort −29%, sieve −5% |
+| 25 | maps: `m[k] op= v` in a single probe (`rt_map_slot`); 32-bit index; old vectors freed right away and free memory returned to the system | b2f68a7 | maps −36%; maps 3M memory 132 → 50 MB |
 
-Resultados negativos registrados pelos agentes: sondagem em grupos estilo SwissTable com SSE2
-(menos desvios errados, mas mais instruções e mais ciclos); multiplicação vetorial de inteiros
-de 64 bits com `pmuludq` (o próprio Rust gasta mais instruções por elemento do que o escalar
-desenrolado).
+Negative results recorded by the agents: SwissTable-style group probing with SSE2 (fewer
+mispredicted branches, but more instructions and more cycles); vector multiplication of 64-bit
+integers with `pmuludq` (Rust itself spends more instructions per element than the unrolled
+scalar code).
 
-**Onde o Rust ainda ganha:** fib (1,3×: o laço do acumulador tem 10 instruções contra 7, pelo
-limite de profundidade e o `push` de volta), matmul (1,2×), mandelbrot (1,1×) e o maps grande
-(1,9×: a tabela do Rust é mais compacta e o hash mais barato).
+**Where Rust still wins:** fib (1.3×: the accumulator loop has 10 instructions vs. 7, because of
+the depth limit and the `push` on return), matmul (1.2×), mandelbrot (1.1×) and large maps
+(1.9×: Rust's table is more compact and its hash cheaper).
 
-## Rodada 26: alocação e coleta (servidor HTTP)
+## Round 26: allocation and collection (HTTP server)
 
-Perfil do servidor HTTP (`bench/http`, `GET /users/:id`, um núcleo): ~55% do tempo de usuário
-em alocação e coleta, 33% só dentro de `rt_alloc_x`, quase tudo numa instrução: a leitura do
-próximo nó da lista livre (`__load64(p)`), que era uma falha de cache (objetos livres frios).
-Medido com instruções exatas por requisição (callgrind) e CPU de usuário por requisição.
+Profile of the HTTP server (`bench/http`, `GET /users/:id`, one core): ~55% of user time in
+allocation and collection, 33% inside `rt_alloc_x` alone, almost all of it on one instruction:
+the load of the next node of the free list (`__load64(p)`), which was a cache miss (cold free
+objects). Measured with exact instructions per request (callgrind) and user CPU per request.
 
-| hipótese | resultado |
+| hypothesis | result |
 |---|---|
-| H2a alocar pela varredura do bitmap "em uso" em vez de lista livre (sem divisão, sem `rt_bit_set`/`rt_bit_clr`, bit "sem ponteiros" por página: chave = classe×2 + sem ponteiros) | aceita: 33,3 → 29,5 mil instr./req. |
-| H2b faixas: reserva uma sequência de posições livres de uma vez (bits e zeragem juntos); cada alocação só avança um ponteiro; a coleta devolve o resto das faixas antes de marcar; varredura = `em uso &= marcado` | aceita: → 24,6 mil |
-| H2c caminho rápido completo em `rt_alloc`/`rt_alloc_ns` ([próximo, fim, tamanho] por chave), o resto em `rt_alloc_slow` | aceita: → 22,5 mil |
-| H2d limite de coleta menor (2 MB, 1 MB) para caber no cache | inconclusiva (ruído de outro processo); não mudou |
-| H2e alocação expandida no lugar pelo gerador para tamanhos constantes | não feita: ~35 instr. por struct, ~1% por requisição |
-| H1a mapa num bloco só (72 + 128 + 64 bytes) | rejeitada: menos alocações, mesmas instruções e mais bytes (classe de 320) |
-| H1a′ mapa num bloco de 168 bytes (cabeçalho + 4 entradas + índice de 8) | aceita: 17,8 → 17,2 mil; 272 → 176 bytes por mapa vazio |
-| H1b literais de struct: campo omitido cujo zero é 0 não chama `rt_zero` (texto: o literal `""`) | aceita: 18,3 → 17,8 mil |
-| H1c `std/http`: linha de status e Content-Length sem concatenar (`put_int`), método/versão/nomes de cabeçalho comuns sem alocar (`mem_known`), `has_token` sem `split` | aceita: 18,9 → 18,3 mil |
-| H1d framework web: roteador sem `split` (compara os bytes do caminho com os filhos fixos), `params`/`keys` criados só quando usados, cadeia de handlers guardada por rota | aceita: 22,5 → 18,9 mil |
+| H2a allocate by scanning the "in use" bitmap instead of a free list (no division, no `rt_bit_set`/`rt_bit_clr`, a per-page "no pointers" bit: key = class×2 + no pointers) | accepted: 33.3k → 29.5k instr./req. |
+| H2b runs: reserves a sequence of free slots at once (bits and zeroing together); each allocation just bumps a pointer; collection gives back the rest of the runs before marking; sweep = `in use &= marked` | accepted: → 24.6k |
+| H2c full fast path in `rt_alloc`/`rt_alloc_ns` ([next, end, size] per key), the rest in `rt_alloc_slow` | accepted: → 22.5k |
+| H2d smaller collection threshold (2 MB, 1 MB) to fit in the cache | inconclusive (noise from another process); not changed |
+| H2e allocation expanded inline by the generator for constant sizes | not done: ~35 instr. per struct, ~1% per request |
+| H1a map in a single block (72 + 128 + 64 bytes) | rejected: fewer allocations, same instructions and more bytes (320 class) |
+| H1a′ map in a 168-byte block (header + 4 entries + 8-slot index) | accepted: 17.8k → 17.2k; 272 → 176 bytes per empty map |
+| H1b struct literals: an omitted field whose zero is 0 does not call `rt_zero` (strings: the literal `""`) | accepted: 18.3k → 17.8k |
+| H1c `std/http`: status line and Content-Length without concatenation (`put_int`), common method/version/header names without allocating (`mem_known`), `has_token` without `split` | accepted: 18.9k → 18.3k |
+| H1d web framework: router without `split` (compares the path bytes with the fixed children), `params`/`keys` created only when used, handler chain stored per route | accepted: 22.5k → 18.9k |
 
-Total no servidor, num núcleo (req/s, CPU de usuário por requisição):
+Server totals, on one core (req/s, user CPU per request):
 
-| rota | antes | depois |
+| route | before | after |
 |---|---|---|
-| GET /users/:id | 56,9 mil, 8,0 µs | 67,5 mil (+19%), 4,4 µs |
-| GET /users (50) | 30,3 mil, 21,3 µs | 32,7 mil (+8%), 19,1 µs |
-| POST /users | 50,4 mil, 10,7 µs | 64,2 mil (+27%), 6,1 µs |
+| GET /users/:id | 56.9k, 8.0 µs | 67.5k (+19%), 4.4 µs |
+| GET /users (50) | 30.3k, 21.3 µs | 32.7k (+8%), 19.1 µs |
+| POST /users | 50.4k, 10.7 µs | 64.2k (+27%), 6.1 µs |
 
-O compilador compilando a si mesmo: 12,17 → 9,85 bilhões de instruções (−19%), 7,1 → 5,1
-bilhões de ciclos (−28%). Benchmarks de CPU (fib...maps): ±0,1% de instruções. Memória: maps 3M
-igual; sort 2M 16,9 → 19,9 MB (páginas separadas por "sem ponteiros").
+The compiler compiling itself: 12.17 → 9.85 billion instructions (−19%), 7.1 → 5.1 billion
+cycles (−28%). CPU benchmarks (fib...maps): ±0.1% instructions. Memory: maps 3M unchanged;
+sort 2M 16.9 → 19.9 MB (pages separated by "no pointers").
 
-## Rodada 27: mapas (índice menor, chaves de texto) e rotas do std/http
+## Round 27: maps (smaller index, string keys) and std/http routes
 
-Ponto de partida, maps 3M (`perf stat`): a Caju e o Rust executavam as **mesmas** ~1,0 bilhão de
-instruções, com falhas de cache parecidas (13,7 M × 12,1 M) e as mesmas páginas de 2 MB (as duas
-usam THP: ~230 MB em AnonHugePages), mas a Caju gastava 1,9× os ciclos e tinha 4× os desvios
-errados. O tempo de `rt_map_slot`/`rt_map_get` estava quase todo na instrução depois de ler o índice.
+Starting point, maps 3M (`perf stat`): Caju and Rust executed the **same** ~1.0 billion
+instructions, with similar cache misses (13.7 M vs. 12.1 M) and the same 2 MB pages (both use
+THP: ~230 MB in AnonHugePages), but Caju spent 1.9× the cycles and had 4× the mispredicted
+branches. The time in `rt_map_slot`/`rt_map_get` was almost all on the instruction after the
+index load.
 
-| hipótese | resultado |
+| hypothesis | result |
 |---|---|
-| desvios errados dependentes da falha de cache (sondagem linear: o laço termina num ponto imprevisível) | parcialmente refutada: índice 1/4 cheio corta os desvios de 3,3 M para 1,25 M, mas os ciclos **sobem** 10% (índice de 32 MB) |
-| páginas de 2 MB (`madvise(MADV_HUGEPAGE)` na arena) | rejeitada: o kernel (THP `always`) já usava páginas grandes nas duas linguagens |
-| **M3a índice até 3/4 cheio** (era 1/2): 8 MB em vez de 16 MB no maps 3M | **aceita**: ciclos −19%, maps 3M 568 → 482 ms intercalado (−15%; Go 558, Rust 320); memória 53,9 → 44,0 MB; 1M não muda (o índice tem o mesmo tamanho) |
-| M3b controle de 1 byte por slot em grupos de 8 com SWAR (como o hashbrown) + posições de 32 bits à parte | rejeitada: desvios 5,76 M → 1,70 M, mas ciclos +30% e instruções +22%: a chave presente passa a ter 3 acessos dependentes (controle → posição → entrada) em vez de 2. Mesmo resultado da tentativa com SSE2 das rodadas 20–25, agora com a causa medida |
-| M4a caminho de inteiros de `rt_map_get`/`rt_map_slot` em funções sem chamadas (variáveis em registradores) | rejeitada: +9,5% instruções, ciclos iguais (a latência da memória domina) |
-| **M1 hash de texto de 8 em 8 bytes** (`rt_str_hash`: o último passo lê os 8 bytes que terminam no último byte, sem passar do fim) e a mistura final no lugar | **aceita** |
-| **M2 `rt_streq` de 8 em 8 bytes** (mesmo endereço → igual; comprimentos; a última palavra sobrepõe o já comparado ou os comprimentos iguais) e `rt_strcmp` pulando palavras iguais; `==`/`!=` de textos chamam `rt_streq` (gerador: `cmp_expr`) | **aceita**: programa com mapa de texto e `==` de textos −45% de instruções (1,15 bi → 639 mi) |
-| **M1′ `rt_map_fs`**: sondagem própria para chaves de texto, sem chamadas a `rt_hash`/`rt_map_tag`/`rt_keq`; mesmo endereço é igual sem ler bytes | **aceita** (junto com M5 abaixo) |
-| **M5 `std/http`**: `find_route` só procura no mapa se há rotas exatas; prefixos numa lista do mais longo ao mais curto; `Request.header` só converte para minúsculas se o nome tem maiúsculas | **aceita**: servidor (web, 1 CPU) GET /users/:id 17,5 → 15,9 mil instruções por requisição (−9%), ciclos −5%; POST /users 27,3 → 25,5 mil (−7%), ciclos −3%; req/s dentro do ruído (metade do custo é o kernel) |
+| mispredicted branches depending on the cache miss (linear probing: the loop ends at an unpredictable point) | partly refuted: a 1/4-full index cuts mispredictions from 3.3 M to 1.25 M, but cycles **rise** 10% (32 MB index) |
+| 2 MB pages (`madvise(MADV_HUGEPAGE)` on the arena) | rejected: the kernel (THP `always`) already used huge pages in both languages |
+| **M3a index up to 3/4 full** (was 1/2): 8 MB instead of 16 MB for maps 3M | **accepted**: cycles −19%, maps 3M 568 → 482 ms interleaved (−15%; Go 558, Rust 320); memory 53.9 → 44.0 MB; 1M does not change (the index has the same size) |
+| M3b 1-byte control per slot in groups of 8 with SWAR (like hashbrown) + separate 32-bit positions | rejected: mispredictions 5.76 M → 1.70 M, but cycles +30% and instructions +22%: a present key now takes 3 dependent accesses (control → position → entry) instead of 2. Same result as the SSE2 attempt in rounds 20–25, now with the cause measured |
+| M4a integer path of `rt_map_get`/`rt_map_slot` in call-free functions (variables in registers) | rejected: +9.5% instructions, same cycles (memory latency dominates) |
+| **M1 string hash 8 bytes at a time** (`rt_str_hash`: the last step reads the 8 bytes ending at the last byte, without going past the end) and the final mix inlined | **accepted** |
+| **M2 `rt_streq` 8 bytes at a time** (same address → equal; lengths; the last word overlaps what was already compared or the equal lengths) and `rt_strcmp` skipping equal words; string `==`/`!=` call `rt_streq` (generator: `cmp_expr`) | **accepted**: a program with a string map and string `==` −45% instructions (1.15 B → 639 M) |
+| **M1′ `rt_map_fs`**: dedicated probing for string keys, without calls to `rt_hash`/`rt_map_tag`/`rt_keq`; the same address is equal without reading bytes | **accepted** (together with M5 below) |
+| **M5 `std/http`**: `find_route` only looks in the map if there are exact routes; prefixes in a list from longest to shortest; `Request.header` only lowercases if the name has uppercase letters | **accepted**: server (web, 1 CPU) GET /users/:id 17.5k → 15.9k instructions per request (−9%), cycles −5%; POST /users 27.3k → 25.5k (−7%), cycles −3%; req/s within noise (half the cost is the kernel) |
 
-Onde o Rust ainda ganha no maps 3M (1,5×): o controle de 1 byte por slot do hashbrown fica no cache
-(2 MB) e resolve a chave ausente sem ir à RAM, com 2 acessos dependentes na chave presente; a
-Caju precisa da posição da entrada no índice (a ordem de inserção do `range` é da linguagem), e
-um terceiro acesso custa mais que os desvios que economiza.
+Where Rust still wins on maps 3M (1.5×): hashbrown's 1-byte control per slot stays in the cache
+(2 MB) and resolves a missing key without going to RAM, with 2 dependent accesses for a present
+key; Caju needs the entry's position in the index (`range`'s insertion order is part of the
+language), and a third access costs more than the mispredictions it saves.
 
-## O que ficou para depois
+## What is left for later
 
-Em ordem de ganho esperado:
-1. ~~`[]bool` com 1 byte por elemento~~ (rodada 12). Falta `[]uint8`.
-2. **Mais registradores para `num`** (XMM preservados não existem no Linux: precisaria guardar em
-   volta das chamadas) e carregar `num` da memória direto para XMM (`movsd xmm, [rbp-x]`).
-3. ~~Tirar verificações repetidas de laço~~ (rodada 11, para listas locais). Falta: listas
-   globais (o nbody), e manter o ponteiro de dados num registrador.
-4. **Desvios curtos** (`jcc rel8`) e código frio (chamadas de erro) fora do caminho quente.
-5. **Uma representação intermediária** com alocação de registradores de verdade: o salto maior,
-   mas é reescrever o gerador.
+In order of expected gain:
+1. ~~`[]bool` with 1 byte per element~~ (round 12). `[]uint8` is still pending.
+2. **More registers for `num`** (there are no callee-saved XMM registers on Linux: they would need
+   to be saved around calls) and loading `num` from memory straight into XMM (`movsd xmm, [rbp-x]`).
+3. ~~Remove repeated loop checks~~ (round 11, for local lists). Still pending: global lists
+   (nbody), and keeping the data pointer in a register.
+4. **Short branches** (`jcc rel8`) and cold code (error calls) off the hot path.
+5. **An intermediate representation** with real register allocation: the biggest leap, but it
+   means rewriting the generator.

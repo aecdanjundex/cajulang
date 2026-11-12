@@ -1,80 +1,81 @@
-# Pacotes (`caju pkg`)
+# Packages (`caju pkg`)
 
-Um pacote Caju é um repositório do GitHub com um `caju.toml` na raiz. O nome do pacote é o
-caminho do repositório, e é também o que os programas importam:
+A Caju package is a GitHub repository with a `caju.toml` at its root. The package name is the
+repository path, which is also what programs import:
 
 ```caju
-import "github.com/acme/strutil"            # o arquivo principal do pacote
-import "github.com/acme/strutil/extra"      # outro arquivo do pacote (extra.caju)
+import "github.com/acme/strutil"            # the package's main file
+import "github.com/acme/strutil/extra"      # another file in the package (extra.caju)
 
 print(strutil.shout("oi"))
 ```
 
-## `caju.toml`: o manifesto
+## `caju.toml`: the manifest
 
-Todo pacote, e todo projeto que usa pacotes, tem um `caju.toml` ([TOML](https://toml.io)):
+Every package, and every project that uses packages, has a `caju.toml` ([TOML](https://toml.io)):
 
 ```toml
 [package]
-name = "github.com/acme/greet"     # obrigatório: github.com/dono/repositório
-version = "0.3.0"                  # versão semântica MAJOR.MINOR.PATCH
+name = "github.com/acme/greet"     # required: github.com/owner/repository
+version = "0.3.0"                  # semantic version MAJOR.MINOR.PATCH
 description = "Saudações"
 license = "MIT"
 authors = ["Acme"]
-entry = "greet.caju"               # opcional; padrão: <nome do repositório>.caju
-caju = "0.1.0"                     # opcional; versão mínima do compilador
+entry = "greet.caju"               # optional; default: <repository name>.caju
+caju = "0.1.0"                     # optional; minimum compiler version
 
 [dependencies]
-"github.com/acme/strutil" = "1.1.0"   # a versão MÍNIMA de que este pacote precisa
+"github.com/acme/strutil" = "1.1.0"   # the MINIMUM version this package needs
 ```
 
-## Publicar uma versão
+## Publishing a version
 
-1. Ajuste `version` no `caju.toml` (ex.: `1.2.0`).
-2. Faça commit e crie a tag com o mesmo número e um `v` na frente: `git tag v1.2.0 && git push --tags`.
+1. Set `version` in `caju.toml` (e.g. `1.2.0`).
+2. Commit, and create a tag with the same number prefixed by `v`: `git tag v1.2.0 && git push --tags`.
 
-O gerenciador confere que a tag `vX.Y.Z` tem `version = "X.Y.Z"` no `caju.toml`; se não tiver,
-recusa o pacote. Uma versão publicada não deve mudar: se a tag for movida para outro commit, quem
-já tem o `caju.lock` recebe um erro.
+The manager checks that tag `vX.Y.Z` has `version = "X.Y.Z"` in its `caju.toml`; if it doesn't, the
+package is rejected. A published version must not change: if the tag is moved to another commit,
+anyone who already has a `caju.lock` gets an error.
 
-## Comandos
+## Commands
 
 ```sh
-caju pkg init [github.com/dono/repo]   # cria caju.toml (sem nome: usa o remote origin do git)
-caju pkg add github.com/acme/greet     # última versão publicada; ou ...@0.2.0
+caju pkg init [github.com/dono/repo]   # creates caju.toml (with no name: uses the git origin remote)
+caju pkg add github.com/acme/greet     # latest published version; or ...@0.2.0
 caju pkg remove github.com/acme/greet
-caju pkg update [nome]                 # leva as dependências à última versão publicada
-caju pkg install                       # baixa o que falta e confere tudo pelo caju.lock
-caju pkg verify                        # confere os pacotes do cache contra os hashes do lock
-caju pkg tree                          # árvore de dependências
-caju pkg hash [dir]                    # o hash de um diretório de pacote
+caju pkg update [nome]                 # moves dependencies to their latest published version
+caju pkg install                       # downloads what is missing and checks everything against caju.lock
+caju pkg verify                        # checks the cached packages against the hashes in the lock
+caju pkg tree                          # dependency tree
+caju pkg hash [dir]                    # the hash of a package directory
 ```
 
-`add`, `remove` e `update` editam só a seção `[dependencies]` do `caju.toml` (comentários e o
-resto do arquivo ficam como estão) e, se a instalação falhar, deixam o arquivo como era.
+`add`, `remove` and `update` edit only the `[dependencies]` section of `caju.toml` (comments and the
+rest of the file are left as they are) and, if the installation fails, restore the file to what it was.
 
-## Dependências recursivas e escolha de versões
+## Recursive dependencies and version selection
 
-`install` lê as dependências do projeto, baixa cada uma, lê o `caju.toml` dela e segue as
-dependências dela, e assim por diante. Quando dois pacotes pedem versões diferentes do mesmo
-pacote, vale a **maior das versões mínimas** pedidas (*minimal version selection*, como no Go):
+`install` reads the project's dependencies, downloads each one, reads its `caju.toml` and follows
+its dependencies, and so on. When two packages ask for different versions of the same package, the
+**highest of the requested minimum versions** wins (*minimal version selection*, as in Go):
 
 ```
-app      precisa de greet ≥ 0.3.0 e strutil ≥ 1.0.0
-greet    precisa de strutil ≥ 1.1.0
+app      needs greet ≥ 0.3.0 and strutil ≥ 1.0.0
+greet    needs strutil ≥ 1.1.0
 → greet 0.3.0, strutil 1.1.0
 ```
 
-O resultado não muda quando alguém publica uma versão nova: só muda quando um `caju.toml` pede uma
-versão maior. Versões de MAJOR diferente (1.x e 2.x) não são compatíveis: pedir as duas é erro.
+The result does not change when someone publishes a new version: it only changes when a `caju.toml`
+asks for a higher version. Versions with different MAJOR numbers (1.x and 2.x) are not compatible:
+asking for both is an error.
 
-## `caju.lock`: versões e hashes
+## `caju.lock`: versions and hashes
 
-`install` grava `caju.lock`, que fixa cada pacote usado (direto ou indireto):
+`install` writes `caju.lock`, which pins every package used (direct or indirect):
 
 ```toml
 version = 1
-requires = ["github.com/acme/greet@0.3.0"]   # as dependências do caju.toml quando o lock foi feito
+requires = ["github.com/acme/greet@0.3.0"]   # the caju.toml dependencies when the lock was made
 
 [[package]]
 name = "github.com/acme/strutil"
@@ -85,36 +86,36 @@ hash = "sha256:fe890cc2d93fc5890a50a22d1d8638543b47e2e3e7953481fa272bb6120c1531"
 dependencies = []
 ```
 
-Faça commit do `caju.lock`. Com ele, todo mundo compila exatamente os mesmos arquivos.
+Commit `caju.lock`. With it, everyone compiles exactly the same files.
 
-**O hash** é calculado sobre os arquivos, não sobre o git: para cada arquivo do pacote (em ordem
-de caminho, sem `.git`), a linha `<sha256 do conteúdo>  <caminho>`; o hash do pacote é o SHA-256
-dessa lista. Um link simbólico conta como o texto `symlink <destino>`. O mesmo conteúdo dá sempre o
-mesmo hash, em qualquer máquina.
+**The hash** is computed over the files, not over git: for each file in the package (in path order,
+excluding `.git`), the line `<sha256 of the contents>  <path>`; the package hash is the SHA-256 of
+that list. A symbolic link counts as the text `symlink <target>`. The same contents always give the
+same hash, on any machine.
 
-**As verificações:**
+**The checks:**
 
-| quando | o que é conferido |
+| when | what is checked |
 |---|---|
-| `install` / `add` baixando um pacote | o commit da tag e o hash dos arquivos batem com o `caju.lock` (se o pacote já está nele) |
-| `install` com o pacote já no cache | o hash dos arquivos do cache bate com o `caju.lock` |
-| `caju build` / `caju run` | o `caju.lock` está em dia com o `caju.toml`, e o hash de cada pacote no cache bate com o lock |
-| `caju pkg verify` | o hash de cada pacote no cache, com relatório |
+| `install` / `add` downloading a package | the tag's commit and the file hash match `caju.lock` (if the package is already in it) |
+| `install` with the package already cached | the hash of the cached files matches `caju.lock` |
+| `caju build` / `caju run` | `caju.lock` is up to date with `caju.toml`, and the hash of each cached package matches the lock |
+| `caju pkg verify` | the hash of each cached package, with a report |
 
-Qualquer diferença é erro, com os dois hashes (ou commits) na mensagem.
+Any mismatch is an error, with both hashes (or commits) in the message.
 
-## Onde ficam os arquivos
+## Where the files live
 
-- Cache: `$CAJU_HOME/pkg/<nome>@<versão>/` (padrão `~/.caju/pkg`), com `<nome>@<versão>.info`
-  guardando o commit.
-- Download: `git clone --depth 1 --branch vX.Y.Z https://github.com/dono/repo`. O `git` precisa
-  estar instalado. `CAJU_PKG_SOURCE=/caminho` troca `https://` por um diretório local ou espelho
-  (`/caminho/github.com/dono/repo`); os testes usam isso.
+- Cache: `$CAJU_HOME/pkg/<name>@<version>/` (default `~/.caju/pkg`), with `<name>@<version>.info`
+  holding the commit.
+- Download: `git clone --depth 1 --branch vX.Y.Z https://github.com/dono/repo`. `git` must be
+  installed. `CAJU_PKG_SOURCE=/caminho` replaces `https://` with a local directory or mirror
+  (`/caminho/github.com/dono/repo`); the tests use this.
 
-## Regras para o código de um pacote
+## Rules for package code
 
-- Dentro de um pacote, os arquivos se importam pelo caminho completo:
-  `import "github.com/acme/strutil/extra"`, não `import "extra"`. O compilador dá um erro claro
-  se um arquivo de pacote usar um caminho relativo.
-- A biblioteca padrão se importa normalmente (`import "std/strings"`).
-- Um pacote só deve importar os pacotes que estão no `[dependencies]` dele.
+- Inside a package, files import each other by their full path:
+  `import "github.com/acme/strutil/extra"`, not `import "extra"`. The compiler gives a clear error
+  if a package file uses a relative path.
+- The standard library is imported as usual (`import "std/strings"`).
+- A package should only import the packages listed in its `[dependencies]`.

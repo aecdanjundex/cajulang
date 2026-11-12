@@ -211,7 +211,7 @@ fn (g: *Gen) str_lit(s: str) -> str {
   return sym
 }
 
-# type descriptor (layout in docs/arquitetura-nativo.md and rt/values.caju)
+# type descriptor (layout in docs/native-architecture.md and rt/values.caju)
 fn (g: *Gen) desc(t0: str, n: *ast.Node) -> str {
   t := types.dflt(t0)
   have, ok := g.descs[t]

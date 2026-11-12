@@ -1,79 +1,81 @@
-# Histórico do projeto (o que foi feito e por quê)
+# Project history (what was done and why)
 
-Resumo das conversas que construíram a Caju, para dar contexto a quem continua.
+A summary of the conversations that built Caju, to give context to whoever continues the work.
 
-## A linguagem e a página
+## The language and the page
 
-- A Caju nasceu como uma linguagem de brinquedo em português, numa página HTML só
-  (`web/caju.html`): editor, árvore sintática, interpretador da árvore, compilador de bytecode,
-  otimizador, VM de pilha, aba de tipos, desmontador, referência e dezenas de exemplos.
-- Ganhou recursos do Go: tipos com verificação (tipagem gradual: o que não tem tipo é `any`),
-  structs, métodos, interfaces, slices, maps, ponteiros, closures, vários resultados, `defer`,
-  `panic`/`recover`, goroutines, canais, `select`, inteiros de tamanho fixo (int8...uint64), vários
-  arquivos com `import`/`export`, `extern` para chamar DLLs do Windows e `dllexport`.
-- "Gerar .exe / .dll": a página junta o bytecode do programa (formato v6, ver `serializeProgram`)
-  a um runtime nativo já compilado e embutido em base64 (x64, x86 e DLL x64), escreve as
-  informações de versão no recurso VERSIONINFO e pode assinar o .exe (Authenticode, com um
-  certificado gerado na hora ou um do usuário).
-- O antigo sistema de "gas" (limite de custo por instrução) foi **removido** a pedido do dono;
-  o bytecode passou para a versão 6.
+- Caju started as a toy language in Portuguese, in a single HTML page
+  (`web/caju.html`): editor, syntax tree, tree interpreter, bytecode compiler, optimizer, stack
+  VM, types tab, disassembler, reference and dozens of examples.
+- It gained Go features: checked types (gradual typing: anything untyped is `any`), structs,
+  methods, interfaces, slices, maps, pointers, closures, multiple results, `defer`,
+  `panic`/`recover`, goroutines, channels, `select`, fixed-size integers (int8...uint64), multiple
+  files with `import`/`export`, `extern` for calling Windows DLLs, and `dllexport`.
+- "Gerar .exe / .dll": the page combines the program's bytecode (format v6, see `serializeProgram`)
+  with a prebuilt native runtime embedded in base64 (x64, x86 and x64 DLL), writes the version
+  information into the VERSIONINFO resource and can sign the .exe (Authenticode, with a
+  certificate generated on the spot or one supplied by the user).
+- The old "gas" system (a cost limit per instruction) was **removed** at the owner's request;
+  the bytecode moved to version 6.
 
-## Runtime em Rust
+## Rust runtime
 
-- O runtime nativo era em C; foi **reescrito em Rust** (`runtime/rs/`) e passou em todos os testes
-  de paridade (Linux, Wine x64 e x86, DLL e FFI).
-- Detalhes do build: o Rust compila uma biblioteca estática; o zig faz o link para Windows (com
-  `-fno-compiler-rt` para não duplicar `___chkstk_ms` e `-lunwind`); `-Z build-std` com o código da
-  biblioteca padrão (clonado do repositório do Rust, porque o rustup não conseguia baixar o
-  rust-std do Windows); um embrulho de `dlltool` do zig em `rs/tools`; DLL com tabela de
-  exportação em assembly (`.cajuexp` em `caju-asm-x64.S`).
+- The native runtime was written in C; it was **rewritten in Rust** (`runtime/rs/`) and passed all
+  the parity tests (Linux, Wine x64 and x86, DLL and FFI).
+- Build details: Rust compiles a static library; zig does the linking for Windows (with
+  `-fno-compiler-rt` to avoid duplicating `___chkstk_ms`, and `-lunwind`); `-Z build-std` with the
+  standard library source (cloned from the Rust repository, because rustup could not download the
+  Windows rust-std); a wrapper around zig's `dlltool` in `rs/tools`; DLL with an export table
+  in assembly (`.cajuexp` in `caju-asm-x64.S`).
 
-## Compilador nativo
+## Native compiler
 
-- Pergunta do dono: "é possível criar o próprio runtime na linguagem Caju?". Resposta: sim, com um
-  compilador nativo; ele escolheu esse caminho. O plano em 9 fases está em
-  `docs/plano-compilador-nativo.md`, com as decisões recomendadas aceitas.
-- Fase 1: montador x86-64, ELF/PE, números (impressão com 12 algarismos idêntica ao JS),
-  textos, funções, controle de fluxo, extern por thunks Win64. Benchmark 17x mais rápido.
-- Fase 2: valores compostos com descritores de tipo nos dados; erros ao rodar com a mesma
-  mensagem e linha da VM.
-- Fase 3: any/interfaces (caixas), switch de tipos, closures (`[código, células]`), métodos por
-  nome, vários resultados, `errors.New`, parâmetros sem tipo. As regras numéricas da VM para `any`
-  foram copiadas (inclusive a "caixa conta como verdadeiro").
-- Fase 4: coletor de lixo conservador com classes de tamanho; 3 milhões de objetos em 18 MB.
-  Um erro na tabela de classes de tamanho (classes não chegavam a 16384) foi achado com gdb +
+- The owner asked: "é possível criar o próprio runtime na linguagem Caju?" ("is it possible to
+  write the runtime itself in Caju?"). Answer: yes, with a native compiler; the owner chose that path. The
+  9-phase plan is in `docs/native-compiler-plan.md`, with the recommended decisions accepted.
+- Phase 1: x86-64 assembler, ELF/PE, numbers (12-digit printing identical to JS), strings,
+  functions, control flow, extern through Win64 thunks. Benchmark 17x faster.
+- Phase 2: composite values with type descriptors in data; runtime errors with the same message
+  and line as the VM.
+- Phase 3: any/interfaces (boxes), type switches, closures (`[code, cells]`), methods by name,
+  multiple results, `errors.New`, untyped parameters. The VM's numeric rules for `any` were copied
+  (including "a box counts as true").
+- Phase 4: conservative garbage collector with size classes; 3 million objects in 18 MB.
+  A bug in the size-class table (classes did not reach 16384) was found with gdb +
   `native/sym.js`.
-- Fase 5: defer/panic/recover com registro no quadro e salto para o "recuperado".
-- Ao empacotar o projeto para o Claude Code, descobriu-se que os testes passavam os exemplos de
-  vários arquivos de um jeito errado (VM e nativo falhavam iguais); corrigido (`filesOf` em
-  `native/run.js`), e o nativo passou a aceitar módulos (`Módulo` na árvore ligada).
+- Phase 5: defer/panic/recover with a record in the frame and a jump to the "recovered" code.
+- While packaging the project for Claude Code, it turned out that the tests were passing the
+  multi-file examples the wrong way (VM and native failed the same way); this was fixed (`filesOf`
+  in `native/run.js`), and the native compiler started accepting modules (`Módulo` in the linked
+  tree).
 
-## Diferenças aceitas entre a VM e o nativo
+## Accepted differences between the VM and native
 
-- Inteiros acima de 2^53 (a VM usa números do JS).
-- `5e-324`: o JS imprime o subnormal mais curto; o nativo imprime 12 algarismos.
-- `any` com tipo errado indo para um tipo concreto: a VM segue sem conferir; o nativo dá erro.
-- (Fase 6) a ordem de preempção entre goroutines não será a mesma.
+- Integers above 2^53 (the VM uses JS numbers).
+- `5e-324`: JS prints the shortest subnormal; native prints 12 digits.
+- `any` with the wrong type flowing into a concrete type: the VM carries on without checking;
+  native raises an error.
+- (Phase 6) the preemption order between goroutines will not be the same.
 
-## Reorganização e compilador em Caju (fase 9)
+## Reorganization and compiler in Caju (phase 9)
 
-- O repositório foi reorganizado: a página HTML e o runtime em Rust saíram; o compilador em
-  JavaScript foi dividido em `bootstrap/*.js`; o runtime foi para `rt/`, a biblioteca padrão para
-  `lib/` e os testes para `tests/` (com a saída esperada ao lado de cada programa). Código,
-  comentários e mensagens passaram para o inglês.
-- O compilador foi portado para Caju (`compiler/*.caju`) como tradução fiel do JS
-  (`docs/compiler-port.md`). Resultado: para todos os programas de `tests/` ele gera binários
-  idênticos byte a byte aos do bootstrap (Linux e Windows), e a autocompilação fecha: os
-  estágios 1, 2 e 3 são iguais (cerca de 2 s por estágio, binário de 1,2 MB).
+- The repository was reorganized: the HTML page and the Rust runtime were removed; the JavaScript
+  compiler was split into `bootstrap/*.js`; the runtime moved to `rt/`, the standard library to
+  `lib/` and the tests to `tests/` (with the expected output next to each program). Code,
+  comments and messages were switched to English.
+- The compiler was ported to Caju (`compiler/*.caju`) as a faithful translation of the JS
+  (`docs/compiler-port.md`). Result: for every program in `tests/` it produces binaries
+  byte-for-byte identical to the bootstrap's (Linux and Windows), and self-compilation closes:
+  stages 1, 2 and 3 are identical (about 2 s per stage, 1.2 MB binary).
 
-## Gerenciador de pacotes, std ampliada e testes BDD
+## Package manager, expanded std and BDD tests
 
-- `caju pkg` (docs/packages.md): pacotes são repositórios do GitHub com `caju.toml` (TOML);
-  versões por tags `vX.Y.Z`; dependências recursivas com *minimal version selection*; `caju.lock`
-  fixa versão, commit e um hash SHA-256 dos arquivos de cada pacote, conferido ao baixar, ao
-  compilar e em `caju pkg verify`. Download pelo `git` (a linguagem não tem TLS).
-- std nova: `fs` e `path` (arquivos e diretórios), `toml`, `crypto` (SHA-256/512, SHA-1, MD5,
-  HMAC, PBKDF2, bytes aleatórios), `hash` (CRC-32, FNV), `hex`, `base64`, `testing`.
-- Testes: os ~140 programas com `.out` viraram arquivos `_test.caju` em estilo BDD
-  (`describe`/`it` com títulos em texto, `expect`), ao lado do código (docs/testing.md). O `caju
-  test` acha e roda os testes; o `tests/run.js` saiu.
+- `caju pkg` (docs/packages.md): packages are GitHub repositories with a `caju.toml` (TOML);
+  versions come from `vX.Y.Z` tags; recursive dependencies with *minimal version selection*;
+  `caju.lock` pins the version, commit and a SHA-256 hash of each package's files, checked on
+  download, on build and by `caju pkg verify`. Downloads go through `git` (the language has no TLS).
+- New std: `fs` and `path` (files and directories), `toml`, `crypto` (SHA-256/512, SHA-1, MD5,
+  HMAC, PBKDF2, random bytes), `hash` (CRC-32, FNV), `hex`, `base64`, `testing`.
+- Tests: the ~140 programs with `.out` files became BDD-style `_test.caju` files
+  (`describe`/`it` with string titles, `expect`), next to the code (docs/testing.md). `caju
+  test` finds and runs the tests; `tests/run.js` was removed.

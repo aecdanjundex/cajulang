@@ -1,12 +1,12 @@
-# Testes (`caju test` e `std/testing`)
+# Tests (`caju test` and `std/testing`)
 
-Os testes seguem o estilo do Go na organização e o estilo BDD na escrita:
+Tests follow Go's style in how they are organized and BDD style in how they are written:
 
-- um arquivo de teste termina em `_test.caju` e fica **ao lado** do código que testa
+- a test file ends in `_test.caju` and sits **next to** the code it tests
   (`lib/strings.caju` → `lib/strings_test.caju`);
-- programas auxiliares de teste ficam em `testdata/` (o `caju test` não procura testes lá);
-- cada teste tem um **título em texto** que diz o comportamento esperado, e os valores são
-  verificados com `expect`. Não há arquivos `.out`.
+- helper programs for tests go in `testdata/` (`caju test` does not look for tests there);
+- each test has a **text title** that states the expected behavior, and values are checked with
+  `expect`. There are no `.out` files.
 
 ```caju
 import "std/strings"
@@ -23,16 +23,16 @@ describe("strings.split", fn() {
 })
 ```
 
-## Rodar
+## Running
 
 ```sh
-caju test                   # todos os *_test.caju sob o diretório atual
-caju test lib compiler      # sob estes diretórios (ou arquivos)
-caju test -v lib            # mostra cada teste, não só os arquivos
-caju test --run "split"     # só os testes cujo título completo contém "split"
+caju test                   # all *_test.caju files under the current directory
+caju test lib compiler      # under these directories (or files)
+caju test -v lib            # shows each test, not just the files
+caju test --run "split"     # only the tests whose full title contains "split"
 ```
 
-Saída de um arquivo com falha:
+Output for a failing file:
 
 ```
 FAIL lib/strings_test.caju
@@ -46,56 +46,56 @@ FAIL: strings.split › keeps empty parts between two separators
 # 1 passed, 1 failed, 0 skipped
 ```
 
-Cada arquivo de teste é compilado como um programa e roda no próprio diretório (caminhos como
-`testdata/x.caju` são relativos ao arquivo de teste). O `caju test` termina com código 1 se algum
-teste falhar.
+Each test file is compiled as a program and runs in its own directory (paths such as
+`testdata/x.caju` are relative to the test file). `caju test` exits with code 1 if any test fails.
 
-## Estrutura
+## Structure
 
-| função | para quê |
+| function | purpose |
 |---|---|
-| `describe(título, fn() {...})` | agrupa testes de um assunto; pode ter `describe` dentro |
-| `it(título, fn() {...})` | um teste; para no primeiro `expect` que falha, ou num `panic`/erro de execução |
-| `skip(título, fn() {...})` | um teste escrito mas não executado (aparece como *skipped*) |
-| `before_each(fn() {...})` | roda antes de cada teste do bloco (e dos blocos de dentro) |
-| `after_each(fn() {...})` | roda depois de cada teste do bloco, mesmo se ele falhar |
-| `fail(mensagem)` | faz o teste atual falhar |
+| `describe(title, fn() {...})` | groups the tests for one subject; can contain nested `describe` blocks |
+| `it(title, fn() {...})` | a test; stops at the first failing `expect`, or at a `panic`/runtime error |
+| `skip(title, fn() {...})` | a test that is written but not run (shown as *skipped*) |
+| `before_each(fn() {...})` | runs before each test in the block (and in nested blocks) |
+| `after_each(fn() {...})` | runs after each test in the block, even if it fails |
+| `fail(message)` | makes the current test fail |
 
-## Verificações (`expect(valor)....`)
+## Assertions (`expect(value)....`)
 
-| método | passa quando |
+| method | passes when |
 |---|---|
-| `to_equal(x)` | os valores são iguais; listas, mapas e structs pelo conteúdo. Texto e número são diferentes (`"1"` ≠ `1`) |
-| `to_be_true()`, `to_be_false()`, `to_be_nil()` | o valor é `true`, `false`, `nil` |
-| `to_contain(x)` | texto contém o trecho; lista contém o elemento; mapa (chave texto) contém a chave |
-| `to_have_length(n)` | texto (em bytes), lista ou mapa tem tamanho `n` |
-| `to_start_with(s)`, `to_end_with(s)` | texto começa / termina com `s` |
-| `to_be_greater_than(n)`, `to_be_less_than(n)`, `to_be_at_least(n)`, `to_be_at_most(n)` | comparação de números (int ou float) |
-| `to_be_close_to(n, eps)` | número a no máximo `eps` de `n` |
-| `to_be_error(msg)` | é um `error` (não nil) com essa mensagem |
-| `to_panic()`, `to_panic_with(msg)` | `expect(fn() {...})`: a função entra em pânico (ou para num erro de execução), com essa mensagem |
+| `to_equal(x)` | the values are equal; lists, maps and structs by content. Text and numbers differ (`"1"` ≠ `1`) |
+| `to_be_true()`, `to_be_false()`, `to_be_nil()` | the value is `true`, `false`, `nil` |
+| `to_contain(x)` | text contains the substring; list contains the element; map (text keys) contains the key |
+| `to_have_length(n)` | text (in bytes), list or map has length `n` |
+| `to_start_with(s)`, `to_end_with(s)` | text starts / ends with `s` |
+| `to_be_greater_than(n)`, `to_be_less_than(n)`, `to_be_at_least(n)`, `to_be_at_most(n)` | number comparison (int or float) |
+| `to_be_close_to(n, eps)` | number is at most `eps` away from `n` |
+| `to_be_error(msg)` | is an `error` (not nil) with this message |
+| `to_panic()`, `to_panic_with(msg)` | `expect(fn() {...})`: the function panics (or stops with a runtime error), with this message |
 
-`expect(x).not_()` inverte a verificação: `expect(lista).not_().to_contain("a")`.
-(`not` é palavra reservada; o `_` segue a mesma convenção de `fn_`, `from_`.)
+`expect(x).not_()` negates the assertion: `expect(lista).not_().to_contain("a")`.
+(`not` is a reserved word; the `_` follows the same convention as `fn_`, `from_`.)
 
-## Programas inteiros
+## Whole programs
 
-Para testar o que só aparece na saída de um programa (erros de compilação, erros de execução com
-arquivo e linha, `os.exit`):
+To test what only shows up in a program's output (compile errors, runtime errors with file and
+line, `os.exit`):
 
 ```caju
 import { describe, it, expect, run_file, run_source } from "std/testing"
 
 it("reports a division by zero with the line", fn() {
-  r := run_file("testdata/div0.caju")         # compila e roda com `caju run`
+  r := run_file("testdata/div0.caju")         # compiles and runs with `caju run`
   expect(r.output).to_equal("Runtime error in div0.caju, line 2: Integer division by zero.")
   expect(r.code).to_equal(1)
 })
 
 it("rejects a name that was never declared", fn() {
-  r := run_source("print(nome)\n")             # um programa dado como texto
+  r := run_source("print(nome)\n")             # a program given as text
   expect(r.output).to_start_with("Compile error in main.caju, line 1:")
 })
 ```
 
-`r.output` junta saída padrão e de erro, sem a última quebra de linha; `r.code` é o código de saída.
+`r.output` combines standard output and standard error, without the final newline; `r.code` is the
+exit code.

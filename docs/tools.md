@@ -1,7 +1,7 @@
-# Ferramentas de medição
+# Measurement tools
 
-Sem `sudo`, instaladas a partir dos pacotes do Ubuntu extraídos em `~/.local/tools` (com atalhos
-em `~/.local/bin`):
+Installed without `sudo`, from Ubuntu packages extracted into `~/.local/tools` (with shortcuts in
+`~/.local/bin`):
 
 ```sh
 cd ~/.local/tools/debs
@@ -12,16 +12,16 @@ dpkg-deb -x linux-tools-6.8.0-71_*.deb ../perf && dpkg-deb -x libtraceevent1_*.d
 # ~/.local/bin/perf:     LD_LIBRARY_PATH=<dir of libtraceevent.so.1> exec .../perf "$@"
 ```
 
-O perf do kernel 6.8 funciona no WSL2 (5.15), inclusive com contadores de hardware.
+The perf from kernel 6.8 works on WSL2 (5.15), including hardware counters.
 
-- `tools/profile.sh prog.caju args` — onde o tempo vai, por função (perf record + `CAJU_SYMS`,
-  porque os binários não têm tabela de símbolos). `HOT=fn` mostra os endereços mais quentes
-  dentro de `fn`; veja-os com `tools/disasm.sh`.
-- `tools/icount.sh prog.caju args` — instruções executadas (callgrind; exatas) e ciclos,
-  instruções, falhas de cache e de desvio (perf stat, 5 execuções).
-- Para comparar duas versões do compilador sem ruído: `perf stat -e instructions:u` dá o mesmo
-  número em toda execução (o tempo varia 5 a 10% nesta máquina). Ciclos medem o que importa,
-  mas com ruído; use os dois.
+- `tools/profile.sh prog.caju args` — where the time goes, per function (perf record + `CAJU_SYMS`,
+  because the binaries have no symbol table). `HOT=fn` shows the hottest addresses inside `fn`;
+  view them with `tools/disasm.sh`.
+- `tools/icount.sh prog.caju args` — instructions executed (callgrind; exact) and cycles,
+  instructions, cache misses and branch misses (perf stat, 5 runs).
+- To compare two compiler versions without noise: `perf stat -e instructions:u` gives the same
+  number on every run (time varies by 5 to 10% on this machine). Cycles measure what matters, but
+  are noisy; use both.
 
-Linha de base (master d6f9781), instruções Caju ÷ Go: fib 1,7×, sieve 2,4×, nbody 2,3×,
-mandelbrot 2,6×, matmul 3,2×, sort 2,5×, maps 1,6×. Nos mapas, o IPC é 0,77 (falhas de cache).
+Baseline (master d6f9781), Caju ÷ Go instructions: fib 1.7×, sieve 2.4×, nbody 2.3×,
+mandelbrot 2.6×, matmul 3.2×, sort 2.5×, maps 1.6×. In maps, the IPC is 0.77 (cache misses).
