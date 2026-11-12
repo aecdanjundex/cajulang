@@ -5,6 +5,9 @@
 results, instead of running `caju` in a shell and reading its output. It comes with the `caju`
 command: nothing else to install. It is written in Caju (`compiler/mcp.caju`).
 
+More, with a measured comparison of an assistant using the CLI and the server:
+https://cajulang.vercel.app/en/mcp (and `bench/mcp/RESULTS.md`).
+
 ## Set it up
 
 Claude Code:
