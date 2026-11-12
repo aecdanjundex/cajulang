@@ -1,0 +1,750 @@
+# std/cli: command line programs: commands and subcommands, flags, arguments, generated help and
+# clear errors.
+#
+#   import "std/cli"
+#   import "std/os"
+#
+#   app := cli.app("greet", "Greets people").version("1.0.0")
+#   loud := app.flag_bool("loud", "l", "shout the greeting")
+#   app.flag_str("greeting", "g", "text", "Hello", "the word to greet with")
+#   app.args("names", "who to greet").min(1)
+#   app.action(fn(m: *cli.Match) {
+#     for _, n := range m.args("names") { print(m.str("greeting") + ", " + n) }
+#   })
+#   app.run(os.args()[1:])
+#
+# Flags: `--name value`, `--name=value`, `-n value`, `-nvalue`, several bool flags together
+# (`-abc`), `--` ends the flags. A flag declared on a command also works on its subcommands.
+# `-h`/`--help` (and `help <command>` when there are subcommands) print the generated help;
+# `--version` prints the version. A mistake prints the error, a suggestion for misspelled names,
+# and how to get help, and exits with code 2.
+#
+# run() exits on errors; execute() returns the exit code instead; parse() only parses, for tests
+# and for programs that dispatch on their own.
+
+import "std/os"
+import "std/strings"
+import "std/strconv"
+
+# ---------------------------------------------------------------- declarations
+
+# a flag: kind is "bool", "str", "int" or "list" (a str flag that can be given many times)
+export struct Flag {
+  name: str
+  short: str               # one letter, or ""
+  kind: str
+  value_name: str          # shown in the help: --output <file>
+  def: str                 # the default value, as text ("" = none)
+  def_text: str            # how the help shows the default, when it is not the value itself
+  help_text: str
+  choice_list: []str       # the accepted values ([] = any)
+  is_required: bool
+  env_var: str             # read when the flag is not given
+  is_hidden: bool          # not in the help
+}
+
+# a positional argument: required, optional (one) or variadic (the rest)
+export struct Arg {
+  name: str
+  help_text: str
+  is_optional: bool
+  is_variadic: bool
+  min_count: int           # for a variadic argument
+  is_raw: bool             # variadic: everything after it, flags too, is kept as it is
+}
+
+struct Example {
+  cmdline: str
+  what: str
+}
+
+export struct Command {
+  name: str
+  summary: str
+  long: str
+  aliases: []str
+  parent: *Command
+  subs: []*Command
+  flags: []*Flag
+  pos: []*Arg
+  examples: []*Example
+  ver: str
+  has_action: bool
+  act: fn(*Match)
+  is_hidden: bool
+}
+
+# a program (the root command): name is how it is called, summary one line about it
+export fn app(name: str, summary: str) -> *Command {
+  return &Command{name: name, summary: summary, aliases: []str{}, subs: []*Command{}, flags: []*Flag{}, pos: []*Arg{}, examples: []*Example{}}
+}
+
+# a subcommand of c
+export fn (c: *Command) sub(name: str, summary: str) -> *Command {
+  s := app(name, summary)
+  s.parent = c
+  c.subs = append(c.subs, s)
+  return s
+}
+
+# more text for the help, after the summary
+export fn (c: *Command) describe(text: str) -> *Command {
+  c.long = text
+  return c
+}
+
+# another name for this command
+export fn (c: *Command) alias(name: str) -> *Command {
+  c.aliases = append(c.aliases, name)
+  return c
+}
+
+# a command line shown in the help, with what it does
+export fn (c: *Command) example(cmdline: str, what: str) -> *Command {
+  c.examples = append(c.examples, &Example{cmdline: cmdline, what: what})
+  return c
+}
+
+# the version printed by --version (on the root command)
+export fn (c: *Command) version(v: str) -> *Command {
+  c.ver = v
+  return c
+}
+
+# what runs when this command is chosen
+export fn (c: *Command) action(f: fn(*Match)) -> *Command {
+  c.act = f
+  c.has_action = true
+  return c
+}
+
+# leaves the command out of the help (it still works)
+export fn (c: *Command) hidden() -> *Command {
+  c.is_hidden = true
+  return c
+}
+
+fn (c: *Command) add_flag(f: *Flag) -> *Flag {
+  if f.name == "help" || f.short == "h" { panic("cli: --help/-h is reserved (" + c.path() + ")") }
+  for _, g := range c.flags {
+    if g.name == f.name || (f.short != "" && g.short == f.short) { panic("cli: flag declared twice in " + c.path() + ": --" + f.name) }
+  }
+  c.flags = append(c.flags, f)
+  return f
+}
+
+# a flag without a value: true when given (--name, or --name=false to turn it off)
+export fn (c: *Command) flag_bool(name: str, short: str, help: str) -> *Flag {
+  return c.add_flag(&Flag{name: name, short: short, kind: "bool", help_text: help, choice_list: []str{}})
+}
+
+# a flag with a text value; def is the value when it is not given ("" = none)
+export fn (c: *Command) flag_str(name: str, short: str, value_name: str, def: str, help: str) -> *Flag {
+  return c.add_flag(&Flag{name: name, short: short, kind: "str", value_name: value_name, def: def, help_text: help, choice_list: []str{}})
+}
+
+# a flag with an integer value
+export fn (c: *Command) flag_int(name: str, short: str, value_name: str, def: int, help: str) -> *Flag {
+  return c.add_flag(&Flag{name: name, short: short, kind: "int", value_name: value_name, def: str(def), help_text: help, choice_list: []str{}})
+}
+
+# a flag that can be given many times; m.list(name) has every value, in order
+export fn (c: *Command) flag_list(name: str, short: str, value_name: str, help: str) -> *Flag {
+  return c.add_flag(&Flag{name: name, short: short, kind: "list", value_name: value_name, help_text: help, choice_list: []str{}})
+}
+
+# only these values are accepted
+export fn (f: *Flag) choices(values: []str) -> *Flag {
+  f.choice_list = values
+  return f
+}
+
+# the flag must be given (or come from its environment variable)
+export fn (f: *Flag) required() -> *Flag {
+  f.is_required = true
+  return f
+}
+
+# when the flag is not given, the value of this environment variable (if set) is used
+export fn (f: *Flag) env(var: str) -> *Flag {
+  f.env_var = var
+  return f
+}
+
+# how the help describes the default, e.g. "the file's name"
+export fn (f: *Flag) default_text(text: str) -> *Flag {
+  f.def_text = text
+  return f
+}
+
+# leaves the flag out of the help (it still works)
+export fn (f: *Flag) hidden() -> *Flag {
+  f.is_hidden = true
+  return f
+}
+
+fn (c: *Command) add_arg(a: *Arg) -> *Arg {
+  if len(c.pos) > 0 {
+    last := c.pos[len(c.pos) - 1]
+    if last.is_variadic { panic("cli: no argument can follow the variadic argument " + last.name + " (" + c.path() + ")") }
+    if last.is_optional && !a.is_optional && !a.is_variadic { panic("cli: a required argument cannot follow an optional one (" + c.path() + ")") }
+  }
+  c.pos = append(c.pos, a)
+  return a
+}
+
+# a required positional argument
+export fn (c: *Command) arg(name: str, help: str) -> *Arg {
+  return c.add_arg(&Arg{name: name, help_text: help})
+}
+
+# an optional positional argument (m.arg gives "" when it is missing)
+export fn (c: *Command) arg_opt(name: str, help: str) -> *Arg {
+  return c.add_arg(&Arg{name: name, help_text: help, is_optional: true})
+}
+
+# the remaining positional arguments (zero or more; see min)
+export fn (c: *Command) args(name: str, help: str) -> *Arg {
+  return c.add_arg(&Arg{name: name, help_text: help, is_optional: true, is_variadic: true})
+}
+
+# a variadic argument needs at least n values
+export fn (a: *Arg) min(n: int) -> *Arg {
+  a.min_count = n
+  if n > 0 { a.is_optional = false }
+  return a
+}
+
+# a variadic argument takes everything after its first value as it is, flags included: for
+# commands that pass arguments on to another program (`run file.caju -x`)
+export fn (a: *Arg) raw() -> *Arg {
+  a.is_raw = true
+  return a
+}
+
+# ---------------------------------------------------------------- the result
+
+export struct Match {
+  command: *Command          # the command that was chosen (the deepest subcommand)
+  values: map[str]str        # str and int flags, with the defaults
+  bools: map[str]bool
+  lists: map[str][]str
+  given: map[str]bool        # flags given on the command line or by the environment
+  pos: map[str][]str         # positional arguments
+  help: bool                 # -h/--help was given
+  show_version: bool         # --version was given
+}
+
+fn (m: *Match) find(name: str, kind: str) -> *Flag {
+  c := m.command
+  while c != nil {
+    for _, f := range c.flags {
+      if f.name == name {
+        if kind != "" && f.kind != kind { panic("cli: --" + name + " is a " + f.kind + " flag, not " + kind) }
+        return f
+      }
+    }
+    c = c.parent
+  }
+  panic("cli: no flag --" + name + " in " + m.command.path())
+  return nil
+}
+
+# the value of a str flag (its default when it was not given)
+export fn (m: *Match) str(name: str) -> str {
+  m.find(name, "str")
+  return m.values[name]
+}
+
+# the value of an int flag
+export fn (m: *Match) int(name: str) -> int {
+  m.find(name, "int")
+  n, _ := strconv.atoi(m.values[name])
+  return n
+}
+
+# whether a bool flag is on
+export fn (m: *Match) bool(name: str) -> bool {
+  m.find(name, "bool")
+  return m.bools[name]
+}
+
+# every value of a list flag
+export fn (m: *Match) list(name: str) -> []str {
+  m.find(name, "list")
+  v := m.lists[name]
+  if v == nil { return []str{} }
+  return v
+}
+
+# whether a flag was given (on the command line or by its environment variable)
+export fn (m: *Match) has(name: str) -> bool {
+  m.find(name, "")
+  return m.given[name]
+}
+
+fn (m: *Match) find_arg(name: str) -> *Arg {
+  for _, a := range m.command.pos { if a.name == name { return a } }
+  panic("cli: no argument " + name + " in " + m.command.path())
+  return nil
+}
+
+# a positional argument ("" for a missing optional one)
+export fn (m: *Match) arg(name: str) -> str {
+  m.find_arg(name)
+  v := m.pos[name]
+  if len(v) == 0 { return "" }
+  return v[0]
+}
+
+# the values of a variadic argument
+export fn (m: *Match) args(name: str) -> []str {
+  m.find_arg(name)
+  v := m.pos[name]
+  if v == nil { return []str{} }
+  return v
+}
+
+# the names from the root to the chosen command: "caju pkg add"
+export fn (m: *Match) path() -> str { return m.command.path() }
+
+# ---------------------------------------------------------------- parsing
+
+export fn (c: *Command) path() -> str {
+  if c.parent == nil { return c.name }
+  return c.parent.path() + " " + c.name
+}
+
+fn (c: *Command) root() -> *Command {
+  r := c
+  while r.parent != nil { r = r.parent }
+  return r
+}
+
+fn (c: *Command) find_sub(name: str) -> *Command {
+  for _, s := range c.subs {
+    if s.name == name { return s }
+    for _, a := range s.aliases { if a == name { return s } }
+  }
+  return nil
+}
+
+# the flag called name (long) or letter (short) in c or a command above it
+fn (c: *Command) lookup(name: str, short: bool) -> *Flag {
+  x := c
+  while x != nil {
+    for _, f := range x.flags {
+      if (!short && f.name == name) || (short && f.short != "" && f.short == name) { return f }
+    }
+    x = x.parent
+  }
+  return nil
+}
+
+fn (c: *Command) usage_error(msg: str) -> error {
+  return errors.New(c.path() + ": " + msg + "\nRun \"" + c.path() + " --help\" for usage.")
+}
+
+fn (c: *Command) all_flag_names() -> []str {
+  out := []str{}
+  x := c
+  while x != nil {
+    for _, f := range x.flags { out = append(out, "--" + f.name) }
+    x = x.parent
+  }
+  out = append(out, "--help")
+  return out
+}
+
+# " (did you mean x?)" when a candidate is close enough to what was typed
+fn suggest(typed: str, candidates: []str) -> str {
+  best := ""
+  best_d := 1 << 30
+  for _, cand := range candidates {
+    d := distance(typed, cand)
+    if d < best_d {
+      best_d = d
+      best = cand
+    }
+  }
+  # at most 2 edits, and fewer than half the word
+  if best == "" || best_d > 2 || best_d * 2 >= len(best) { return "" }
+  return " (did you mean " + best + "?)"
+}
+
+# the edit distance between two words (Levenshtein)
+fn distance(a: str, b: str) -> int {
+  prev := []int{}
+  for j := 0; j <= len(b); j++ { prev = append(prev, j) }
+  for i := 1; i <= len(a); i++ {
+    cur := []int{i}
+    for j := 1; j <= len(b); j++ {
+      cost := 1
+      if a[i - 1] == b[j - 1] { cost = 0 }
+      v := prev[j] + 1
+      if cur[j - 1] + 1 < v { v = cur[j - 1] + 1 }
+      if prev[j - 1] + cost < v { v = prev[j - 1] + cost }
+      cur = append(cur, v)
+    }
+    prev = cur
+  }
+  return prev[len(b)]
+}
+
+fn (m: *Match) set(c: *Command, f: *Flag, value: str, has_value: bool, how: str) -> error {
+  if f.kind == "bool" {
+    on := true
+    if has_value {
+      if value == "true" { on = true } else if value == "false" { on = false } else { return c.usage_error("invalid value \"" + value + "\" for " + how + ": expected true or false") }
+    }
+    m.bools[f.name] = on
+    m.given[f.name] = true
+    return nil
+  }
+  if f.kind == "int" {
+    _, err := strconv.atoi(value)
+    if err != nil { return c.usage_error("invalid value \"" + value + "\" for " + how + ": expected an integer") }
+  }
+  if len(f.choice_list) > 0 {
+    ok := false
+    for _, ch := range f.choice_list { if ch == value { ok = true } }
+    if !ok { return c.usage_error("invalid value \"" + value + "\" for " + how + ": expected " + or_list(f.choice_list) + suggest(value, f.choice_list)) }
+  }
+  if f.kind == "list" { m.lists[f.name] = append(m.lists[f.name], value) } else { m.values[f.name] = value }
+  m.given[f.name] = true
+  return nil
+}
+
+# "a, b or c"
+fn or_list(xs: []str) -> str {
+  if len(xs) == 1 { return xs[0] }
+  return strings.join(xs[0:len(xs) - 1], ", ") + " or " + xs[len(xs) - 1]
+}
+
+# parses argv (without the program name): the chosen command and its flags and arguments. -h and
+# --version only set m.help / m.show_version; nothing is printed and nothing exits.
+export fn (c: *Command) parse(argv: []str) -> (*Match, error) {
+  m := &Match{command: c, values: map[str]str{}, bools: map[str]bool{}, lists: map[str][]str{}, given: map[str]bool{}, pos: map[str][]str{}}
+  cur := c
+  positional := []str{}
+  raw_from := -1            # where a raw variadic argument started taking everything
+  only_args := false
+  i := 0
+  while i < len(argv) {
+    a := argv[i]
+    i++
+    if raw_from >= 0 || only_args || a == "-" || !strings.has_prefix(a, "-") {
+      # a subcommand, before any positional argument
+      if !only_args && raw_from < 0 && len(positional) == 0 && len(cur.subs) > 0 {
+        if a == "help" && cur.find_sub("help") == nil {
+          # help [command...]
+          target := cur
+          for _, n := range argv[i:] {
+            s := target.find_sub(n)
+            if s == nil {
+              names := []str{}
+              for _, x := range target.subs { names = append(names, x.name) }
+              return nil, target.usage_error("unknown command \"" + n + "\"" + suggest(n, names))
+            }
+            target = s
+          }
+          m.command = target
+          m.help = true
+          return m, nil
+        }
+        s := cur.find_sub(a)
+        if s != nil {
+          cur = s
+          m.command = s
+          continue
+        }
+        if len(cur.pos) == 0 {
+          names := []str{}
+          for _, x := range cur.subs { names = append(names, x.name) }
+          return nil, cur.usage_error("unknown command \"" + a + "\"" + suggest(a, names))
+        }
+      }
+      positional = append(positional, a)
+      # once the arguments before a raw variadic one are there, the rest is taken as it is
+      if raw_from < 0 && !only_args && len(cur.pos) > 0 {
+        last := cur.pos[len(cur.pos) - 1]
+        if last.is_variadic && last.is_raw && len(positional) >= len(cur.pos) - 1 { raw_from = len(positional) }
+      }
+      continue
+    }
+    if a == "--" {
+      only_args = true
+      continue
+    }
+    if a == "-h" || a == "--help" {
+      m.help = true
+      continue
+    }
+    if a == "--version" && cur.root().ver != "" && cur.lookup("version", false) == nil {
+      m.show_version = true
+      continue
+    }
+    if strings.has_prefix(a, "--") {
+      name := a[2:]
+      value := ""
+      has_value := false
+      if k := strings.index(name, "="); k >= 0 {
+        value = name[k + 1:]
+        name = name[0:k]
+        has_value = true
+      }
+      f := cur.lookup(name, false)
+      if f == nil { return nil, cur.usage_error("unknown flag --" + name + suggest("--" + name, cur.all_flag_names())) }
+      if f.kind != "bool" && !has_value {
+        if i >= len(argv) { return nil, cur.usage_error("--" + name + " needs a value") }
+        value = argv[i]
+        i++
+      }
+      err := m.set(cur, f, value, has_value, "--" + name)
+      if err != nil { return nil, err }
+      continue
+    }
+    # short flags: -v, -abc (bools together), -o value, -ovalue
+    j := 1
+    while j < len(a) {
+      letter := a[j:j + 1]
+      f := cur.lookup(letter, true)
+      if f == nil { return nil, cur.usage_error("unknown flag -" + letter) }
+      if f.kind == "bool" {
+        m.set(cur, f, "", false, "-" + letter)
+        j++
+        continue
+      }
+      value := a[j + 1:]
+      if value == "" {
+        if i >= len(argv) { return nil, cur.usage_error("-" + letter + " needs a value") }
+        value = argv[i]
+        i++
+      }
+      err := m.set(cur, f, value, false, "-" + letter)
+      if err != nil { return nil, err }
+      break
+    }
+  }
+  if m.help || m.show_version { return m, nil }
+  # environment variables and defaults, for this command and the ones above it
+  x := cur
+  while x != nil {
+    for _, f := range x.flags {
+      if !m.given[f.name] && f.env_var != "" {
+        v := os.getenv(f.env_var)
+        if v != "" {
+          err := m.set(cur, f, v, true, "$" + f.env_var)
+          if err != nil { return nil, err }
+        }
+      }
+      if !m.given[f.name] {
+        if f.is_required { return nil, cur.usage_error("--" + f.name + " is required") }
+        if f.kind == "str" || f.kind == "int" { m.values[f.name] = f.def }
+      }
+    }
+    x = x.parent
+  }
+  # positional arguments
+  k := 0
+  for _, p := range cur.pos {
+    if p.is_variadic {
+      rest := []str{}
+      if k < len(positional) { rest = positional[k:] }
+      if len(rest) < p.min_count { return nil, cur.usage_error("missing argument <" + p.name + ">" + plural_note(p.min_count)) }
+      m.pos[p.name] = rest
+      k = len(positional)
+      continue
+    }
+    if k < len(positional) {
+      m.pos[p.name] = []str{positional[k]}
+      k++
+    } else if !p.is_optional {
+      return nil, cur.usage_error("missing argument <" + p.name + ">")
+    }
+  }
+  if k < len(positional) {
+    if len(cur.subs) > 0 && len(cur.pos) == 0 {
+      names := []str{}
+      for _, s := range cur.subs { names = append(names, s.name) }
+      return nil, cur.usage_error("unknown command \"" + positional[k] + "\"" + suggest(positional[k], names))
+    }
+    return nil, cur.usage_error("unexpected argument \"" + positional[k] + "\"")
+  }
+  return m, nil
+}
+
+fn plural_note(n: int) -> str {
+  if n <= 1 { return "" }
+  return " (at least " + str(n) + ")"
+}
+
+# ---------------------------------------------------------------- running
+
+# parses argv and runs the chosen command's action. Prints the help for -h/--help (and for a
+# command with subcommands but no action), the version for --version, and errors to stderr.
+# Returns the exit code: 0, or 2 for a usage error. The action may call os.exit itself.
+export fn (c: *Command) execute(argv: []str) -> int {
+  m, err := c.parse(argv)
+  if err != nil {
+    os.eprintln(err.Error())
+    return 2
+  }
+  if m.help {
+    os.stdout(m.command.help())
+    return 0
+  }
+  if m.show_version {
+    print(c.root().name + " " + c.root().ver)
+    return 0
+  }
+  if !m.command.has_action {
+    if len(m.command.subs) > 0 {
+      os.stderr(m.command.help())
+      return 2
+    }
+    return 0
+  }
+  m.command.act(m)
+  return 0
+}
+
+# execute, then exits with its code when it is not 0
+export fn (c: *Command) run(argv: []str) {
+  code := c.execute(argv)
+  if code != 0 { os.exit(code) }
+}
+
+# ---------------------------------------------------------------- help
+
+fn (f: *Flag) left() -> str {
+  s := "    "
+  if f.short != "" { s = "-" + f.short + ", " }
+  s += "--" + f.name
+  if f.kind != "bool" {
+    vn := f.value_name
+    if vn == "" { vn = "value" }
+    s += " <" + vn + ">"
+  }
+  return s
+}
+
+fn (f: *Flag) right() -> str {
+  s := f.help_text
+  notes := []str{}
+  if len(f.choice_list) > 0 { notes = append(notes, "one of: " + strings.join(f.choice_list, ", ")) }
+  if f.def_text != "" { notes = append(notes, "default: " + f.def_text) } else if f.def != "" && f.kind != "bool" { notes = append(notes, "default: " + f.def) }
+  if f.env_var != "" { notes = append(notes, "env: " + f.env_var) }
+  if f.is_required { notes = append(notes, "required") }
+  if f.kind == "list" { notes = append(notes, "repeatable") }
+  if len(notes) > 0 {
+    if s != "" { s += " " }
+    s += "(" + strings.join(notes, "; ") + ")"
+  }
+  return s
+}
+
+fn (a: *Arg) usage() -> str {
+  n := "<" + a.name + ">"
+  if a.is_variadic { n = "<" + a.name + "...>" }
+  if a.is_optional { n = "[" + n + "]" }
+  return n
+}
+
+# two aligned columns
+fn table(rows: [][]str) -> str {
+  w := 0
+  for _, r := range rows { if len(r[0]) > w { w = len(r[0]) } }
+  if w > 30 { w = 30 }
+  b := strings.Builder{}
+  for _, r := range rows {
+    b.write("  ")
+    b.write(r[0])
+    if r[1] != "" {
+      if len(r[0]) > w {
+        b.write("\n  ")
+        b.write(strings.repeat(" ", w))
+      } else { b.write(strings.repeat(" ", w - len(r[0]))) }
+      b.write("  ")
+      b.write(r[1])
+    }
+    b.write("\n")
+  }
+  return b.string()
+}
+
+# the help of the subcommand at path (names from this command down), for tests and docs
+export fn (c: *Command) find_help(path: []str) -> str {
+  x := c
+  for _, n := range path {
+    s := x.find_sub(n)
+    if s == nil { return "" }
+    x = s
+  }
+  return x.help()
+}
+
+# the usage line: "caju build [options] <file>"
+export fn (c: *Command) usage() -> str {
+  parts := []str{c.path()}
+  if len(c.subs) > 0 && len(c.pos) == 0 { parts = append(parts, "<command>") }
+  has_flags := false
+  x := c
+  while x != nil {
+    for _, f := range x.flags { if !f.is_hidden { has_flags = true } }
+    x = x.parent
+  }
+  if has_flags { parts = append(parts, "[options]") }
+  for _, a := range c.pos { parts = append(parts, a.usage()) }
+  return strings.join(parts, " ")
+}
+
+# the whole help of the command
+export fn (c: *Command) help() -> str {
+  b := strings.Builder{}
+  if c.summary != "" {
+    b.write(c.path() + ": " + c.summary + "\n\n")
+  }
+  if c.long != "" { b.write(c.long + "\n\n") }
+  b.write("Usage:\n  " + c.usage() + "\n")
+  if len(c.subs) > 0 && len(c.pos) > 0 {
+    sub := c.path() + " <command>"
+    if len(c.flags) > 0 { sub += " [options]" }
+    b.write("  " + sub + " ...\n")
+  }
+  if len(c.subs) > 0 {
+    rows := [][]str{}
+    for _, s := range c.subs {
+      if s.is_hidden { continue }
+      name := s.name
+      if len(s.aliases) > 0 { name += ", " + strings.join(s.aliases, ", ") }
+      rows = append(rows, []str{name, s.summary})
+    }
+    b.write("\nCommands:\n" + table(rows))
+  }
+  if len(c.pos) > 0 {
+    rows := [][]str{}
+    for _, a := range c.pos { rows = append(rows, []str{a.name, a.help_text}) }
+    b.write("\nArguments:\n" + table(rows))
+  }
+  rows := [][]str{}
+  for _, f := range c.flags { if !f.is_hidden { rows = append(rows, []str{f.left(), f.right()}) } }
+  rows = append(rows, []str{"-h, --help", "show this help"})
+  if c.parent == nil && c.ver != "" && c.lookup("version", false) == nil { rows = append(rows, []str{"    --version", "show the version"}) }
+  b.write("\nOptions:\n" + table(rows))
+  # the flags of the commands above, which work here too
+  x := c.parent
+  while x != nil {
+    inherited := [][]str{}
+    for _, f := range x.flags { if !f.is_hidden { inherited = append(inherited, []str{f.left(), f.right()}) } }
+    if len(inherited) > 0 { b.write("\nOptions of " + x.path() + ":\n" + table(inherited)) }
+    x = x.parent
+  }
+  if len(c.examples) > 0 {
+    rows2 := [][]str{}
+    for _, e := range c.examples { rows2 = append(rows2, []str{e.cmdline, e.what}) }
+    b.write("\nExamples:\n" + table(rows2))
+  }
+  if len(c.subs) > 0 { b.write("\nRun \"" + c.path() + " help <command>\" for more about a command.\n") }
+  return b.string()
+}

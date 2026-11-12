@@ -1,0 +1,184 @@
+import "std/cli"
+import "std/strings"
+import "std/os"
+import { describe, it, expect } from "std/testing"
+
+# a small program like the caju command: build, run, pkg add
+fn app() -> *cli.Command {
+  a := cli.app("tool", "Builds and runs things").version("1.2.3")
+  a.flag_bool("verbose", "v", "say more")
+  b := a.sub("build", "Compile a program").alias("b")
+  b.flag_str("output", "o", "file", "", "where to write it").default_text("the file's name")
+  b.flag_str("target", "", "os", "linux", "what to build for").choices([]str{"linux", "windows", "wasm"})
+  b.flag_int("jobs", "j", "n", 1, "how many at once")
+  b.flag_list("define", "D", "name=value", "set a constant")
+  b.flag_bool("strip", "s", "leave the symbols out")
+  b.arg("file", "the entry file")
+  r := a.sub("run", "Compile and run")
+  r.arg("file", "the entry file")
+  r.args("arguments", "passed to the program").raw()
+  p := a.sub("pkg", "Manage packages")
+  add := p.sub("add", "Add a dependency")
+  add.arg("name", "github.com/owner/repo[@version]")
+  add.flag_str("token", "", "text", "", "access token").env("CLI_TEST_TOKEN")
+  return a
+}
+
+fn parse(args: []str) -> *cli.Match {
+  m, err := app().parse(args)
+  expect(err).to_be_nil()
+  return m
+}
+
+fn fails(args: []str) -> str {
+  _, err := app().parse(args)
+  expect(err).not_().to_be_nil()
+  return err.Error()
+}
+
+describe("cli flags", fn() {
+  it("read long, long=value, short and joined short forms", fn() {
+    m := parse([]str{"build", "--output", "a.out", "--target=wasm", "-j", "4", "main.caju"})
+    expect(m.path()).to_equal("tool build")
+    expect(m.str("output")).to_equal("a.out")
+    expect(m.str("target")).to_equal("wasm")
+    expect(m.int("jobs")).to_equal(4)
+    expect(m.arg("file")).to_equal("main.caju")
+    m2 := parse([]str{"build", "main.caju", "-oapp", "-j8"})
+    expect(m2.str("output")).to_equal("app")
+    expect(m2.int("jobs")).to_equal(8)
+  })
+  it("give the defaults when a flag is missing, and say what was given", fn() {
+    m := parse([]str{"build", "x.caju"})
+    expect(m.str("target")).to_equal("linux")
+    expect(m.int("jobs")).to_equal(1)
+    expect(m.str("output")).to_equal("")
+    expect(m.has("target")).to_be_false()
+    expect(m.bool("strip")).to_be_false()
+  })
+  it("group bool flags and accept a value at the end of the group", fn() {
+    m := parse([]str{"build", "-vsj", "3", "x.caju"})
+    expect(m.bool("verbose")).to_be_true()
+    expect(m.bool("strip")).to_be_true()
+    expect(m.int("jobs")).to_equal(3)
+  })
+  it("turn a bool off with =false", fn() {
+    expect(parse([]str{"build", "--strip=false", "x"}).bool("strip")).to_be_false()
+  })
+  it("collect a list flag given many times", fn() {
+    m := parse([]str{"build", "-D", "a=1", "--define", "b=2", "x"})
+    expect(m.list("define")).to_equal([]str{"a=1", "b=2"})
+  })
+  it("let a subcommand use the flags of the commands above it", fn() {
+    expect(parse([]str{"pkg", "add", "--verbose", "x"}).bool("verbose")).to_be_true()
+    expect(parse([]str{"-v", "pkg", "add", "x"}).bool("verbose")).to_be_true()
+  })
+  it("read a flag from its environment variable", fn() {
+    m := parse([]str{"pkg", "add", "x"})
+    expect(m.str("token")).to_equal("")
+  })
+  it("stop at -- and take the rest as arguments", fn() {
+    m := parse([]str{"build", "--", "-weird.caju"})
+    expect(m.arg("file")).to_equal("-weird.caju")
+  })
+})
+
+describe("cli arguments", fn() {
+  it("find subcommands by name and alias", fn() {
+    expect(parse([]str{"b", "x"}).path()).to_equal("tool build")
+    expect(parse([]str{"pkg", "add", "github.com/a/b"}).arg("name")).to_equal("github.com/a/b")
+  })
+  it("pass everything after a raw argument as it is", fn() {
+    m := parse([]str{"run", "-v", "main.caju", "-x", "--y=1", "z"})
+    expect(m.bool("verbose")).to_be_true()
+    expect(m.arg("file")).to_equal("main.caju")
+    expect(m.args("arguments")).to_equal([]str{"-x", "--y=1", "z"})
+  })
+  it("keep the flags before the raw arguments for the command", fn() {
+    m := parse([]str{"run", "main.caju"})
+    expect(len(m.args("arguments"))).to_equal(0)
+  })
+})
+
+describe("cli errors", fn() {
+  it("suggest a flag close to a misspelled one", fn() {
+    expect(fails([]str{"build", "--targt", "wasm", "x"})).to_equal("tool build: unknown flag --targt (did you mean --target?)\nRun \"tool build --help\" for usage.")
+  })
+  it("suggest a command close to a misspelled one", fn() {
+    expect(fails([]str{"biuld", "x"})).to_start_with("tool: unknown command \"biuld\" (did you mean build?)")
+  })
+  it("refuse a value outside the choices", fn() {
+    expect(fails([]str{"build", "--target", "mac", "x"})).to_start_with("tool build: invalid value \"mac\" for --target: expected linux, windows or wasm")
+  })
+  it("refuse a number that is not a number", fn() {
+    expect(fails([]str{"build", "-j", "many", "x"})).to_start_with("tool build: invalid value \"many\" for -j: expected an integer")
+  })
+  it("report a missing argument, a missing value and an extra argument", fn() {
+    expect(fails([]str{"build"})).to_start_with("tool build: missing argument <file>")
+    expect(fails([]str{"build", "x", "--output"})).to_start_with("tool build: --output needs a value")
+    expect(fails([]str{"build", "x", "y"})).to_start_with("tool build: unexpected argument \"y\"")
+  })
+})
+
+describe("cli help", fn() {
+  it("is asked for with -h, --help or help <command>", fn() {
+    expect(parse([]str{"build", "-h"}).help).to_be_true()
+    m := parse([]str{"help", "pkg", "add"})
+    expect(m.help).to_be_true()
+    expect(m.path()).to_equal("tool pkg add")
+    expect(parse([]str{"--version"}).show_version).to_be_true()
+  })
+  it("shows the usage, arguments and options with their defaults", fn() {
+    h := app().find_help([]str{"build"})
+    expect(h).to_start_with("tool build: Compile a program\n\nUsage:\n  tool build [options] <file>\n")
+    expect(h).to_contain("\nArguments:\n  file  the entry file\n")
+    expect(h).to_contain("  -o, --output <file>        where to write it (default: the file's name)\n")
+    expect(h).to_contain("      --target <os>          what to build for (one of: linux, windows, wasm; default: linux)\n")
+    expect(h).to_contain("\nOptions of tool:\n  -v, --verbose  say more\n")
+  })
+  it("lists the commands of a command with subcommands", fn() {
+    h := app().find_help([]str{})
+    expect(h).to_contain("Usage:\n  tool <command> [options]\n")
+    expect(h).to_contain("\nCommands:\n  build, b  Compile a program\n  run       Compile and run\n  pkg       Manage packages\n")
+    expect(h).to_contain("  -h, --help     show this help\n      --version  show the version\n")
+    expect(h).to_end_with("Run \"tool help <command>\" for more about a command.\n")
+  })
+  it("shows a variadic argument in the usage line", fn() {
+    expect(strings.contains(app().find_help([]str{"run"}), "tool run [options] <file> [<arguments...>]")).to_be_true()
+  })
+})
+
+# runs testdata/cli_app.caju with args; its output (stdout and stderr) and exit code
+fn greet(args: []str, env: []str) -> (str, int) {
+  argv := []str{os.getenv("CAJU_BIN"), "run", "testdata/cli_app.caju"}
+  for _, a := range args { argv = append(argv, a) }
+  e := os.environ()
+  for _, x := range env { e = append(e, x) }
+  p, err := os.run(argv, e, true)
+  expect(err).to_be_nil()
+  return strings.trim_suffix(p.output, "\n"), p.code
+}
+
+describe("a program with std/cli", fn() {
+  it("runs its action with the parsed flags and arguments", fn() {
+    out, code := greet([]str{"-l", "Ana", "Bia"}, []str{})
+    expect(out).to_equal("Hello, Ana!\nHello, Bia!")
+    expect(code).to_equal(0)
+  })
+  it("takes a flag from its environment variable", fn() {
+    out, _ := greet([]str{"Ana"}, []str{"GREET_WORD=Oi"})
+    expect(out).to_equal("Oi, Ana")
+  })
+  it("prints its help and version and exits with 0", fn() {
+    out, code := greet([]str{"--help"}, []str{})
+    expect(out).to_start_with("greet: Greets people\n\nUsage:\n  greet [options] <names...>\n")
+    expect(code).to_equal(0)
+    out2, _ := greet([]str{"--version"}, []str{})
+    expect(out2).to_equal("greet 1.0.0")
+  })
+  it("exits with 2 on a usage error", fn() {
+    out, code := greet([]str{}, []str{})
+    expect(out).to_equal("greet: missing argument <names>\nRun \"greet --help\" for usage.")
+    expect(code).to_equal(2)
+  })
+})

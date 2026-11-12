@@ -1,0 +1,16 @@
+# a program built with std/cli, for lib/cli_test.caju
+import "std/cli"
+import "std/os"
+
+app := cli.app("greet", "Greets people").version("1.0.0")
+app.flag_bool("loud", "l", "shout")
+app.flag_str("greeting", "g", "text", "Hello", "the word to greet with").env("GREET_WORD")
+app.args("names", "who to greet").min(1)
+app.action(fn(m: *cli.Match) {
+  for _, n := range m.args("names") {
+    s := m.str("greeting") + ", " + n
+    if m.bool("loud") { s += "!" }
+    print(s)
+  }
+})
+app.run(os.args()[1:])

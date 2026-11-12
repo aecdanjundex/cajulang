@@ -70,7 +70,8 @@ Details in `docs/wasm.md`.
 ## Standard library
 
 `import "std/x"`: `strings`, `strconv`, `math`, `bytes`, `os`, `fs`, `path`, `net`, `http`, `json`,
-`toml`, `crypto`, `hash`, `hex`, `base64`, `testing`.
+`toml`, `crypto`, `hash`, `hex`, `base64`, `cli` (command line programs: commands, flags, arguments
+and generated help, `docs/cli.md`), `testing`.
 
 - `std/json`: `json.marshal(v)` / `json.unmarshal(text, &v)` for structs, lists, maps and `any`,
   in the style of Go's `encoding/json` (the key is the field name), and `json.parse` for a tree.
@@ -125,6 +126,7 @@ describe("strings.split", fn() {
 - `CLAUDE.md`: project map, how to work on it, current state and pitfalls.
 - `docs/packages.md`: the package manager (caju.toml, caju.lock, hashes).
 - `docs/testing.md`: testing with `caju test` and `std/testing`.
+- `docs/cli.md`: command line programs with `std/cli`.
 - `docs/compiler-port.md`: how the compiler was ported from JavaScript to Caju.
 - `docs/native-architecture.md`: how the native compiler works internally.
 - `docs/language.md`: the language reference.
