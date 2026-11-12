@@ -1,36 +1,49 @@
-# Publicando uma versão
+# Publishing a version
 
-A distribuição é um pacote para Linux x86-64 publicado nas Releases do GitHub:
+The distribution is a Linux x86-64 package published in GitHub Releases:
 
 ```
-caju-linux-x86_64.tar.gz          caju-<versão>/bin/caju, lib/, rt/, examples/, README.md
+caju-linux-x86_64.tar.gz          caju-<version>/bin/caju, lib/, rt/, examples/, README.md
 caju-linux-x86_64.tar.gz.sha256
+caju-wasm.tar.gz                  the compiler in WebAssembly (tools/wasm/package.sh, docs/wasm.md)
+caju-wasm.tar.gz.sha256
 ```
 
-O `caju` acha `lib/` e `rt/` no diretório acima do binário (ou em `CAJU_ROOT`). O link
-simbólico em `~/.local/bin` funciona porque `os.executable()` lê `/proc/self/exe`, que resolve o link.
+`caju` finds `lib/` and `rt/` in the directory above the binary (or in `CAJU_ROOT`). The symbolic
+link in `~/.local/bin` works because `os.executable()` reads `/proc/self/exe`, which resolves the link.
 
-## Passos
+## Changelog
 
-1. Atualize `VERSION` em `compiler/pkg.caju` (é o que `caju version` mostra) e faça o commit.
-2. Rode localmente: `TAG=v0.2.0 tools/release.sh`. O script faz a cadeia JS → estágio 1 → 2 → 3,
-   exige estágio 2 == estágio 3, monta `dist/` e testa o pacote fora do repositório.
+Every user-visible change adds a line under `## [Unreleased]` in `CHANGELOG.md` (format: [Keep a
+Changelog](https://keepachangelog.com/en/1.1.0/), sections Added, Changed, Fixed, Removed). To
+release, move those lines to a new `## [X.Y.Z] - date` section and add its compare link at the
+bottom. The release workflow publishes that section as the notes of the GitHub release
+(`tools/changelog.sh vX.Y.Z` prints it) and stops if the section is missing.
+
+## Steps
+
+1. Update `VERSION` in `compiler/pkg.caju` (it is what `caju version` shows), move the
+   `[Unreleased]` lines of `CHANGELOG.md` to the new version, and commit
+   (`chore(release): vX.Y.Z`).
+2. Run locally: `TAG=v0.2.0 tools/release.sh`. The script runs the JS → stage 1 → 2 → 3 chain,
+   requires stage 2 == stage 3, assembles `dist/` and tests the package outside the repository.
 3. `git tag v0.2.0 && git push origin main v0.2.0`.
-4. O workflow `.github/workflows/release.yml` refaz tudo, roda a suíte e o instalador, e cria a
-   release com as notas geradas pelos commits.
+4. The `.github/workflows/release.yml` workflow rebuilds everything, runs the suite and the installer,
+   builds `caju-wasm.tar.gz` (the compiler in wasm must compile itself to the same bytes) and
+   creates the release with the notes of `CHANGELOG.md`.
 
-A tag precisa bater com `VERSION`, senão o workflow falha. O instalador (`install.sh`, na raiz)
-usa `releases/latest`, então a release nova vira a padrão assim que é publicada.
+The tag must match `VERSION`, or the workflow fails. The installer (`install.sh`, at the root) uses
+`releases/latest`, so the new release becomes the default as soon as it is published.
 
-Testar o instalador sem baixar nada:
+To test the installer without downloading anything:
 
 ```sh
 CAJU_PACKAGE=dist/caju-linux-x86_64.tar.gz CAJU_HOME=/tmp/c/.caju CAJU_BIN_DIR=/tmp/c/bin sh install.sh
 ```
 
-## Limites atuais
+## Current limitations
 
-- Só Linux x86-64. O compilador gerado para Windows (`--target windows compiler/main.caju`) ainda
-  não roda lá (sai com código 5 logo no início; falta portar o que o próprio compilador usa do sistema).
-  Os programas gerados para Windows funcionam.
-- `caju bench` e os testes da linguagem só existem no repositório, não no pacote.
+- Linux x86-64 only. The compiler built for Windows (`--target windows compiler/main.caju`) does not
+  run there yet (it exits with code 5 right at startup; what the compiler itself uses from the system
+  still has to be ported). Programs built for Windows work.
+- `caju bench` and the language tests exist only in the repository, not in the package.
