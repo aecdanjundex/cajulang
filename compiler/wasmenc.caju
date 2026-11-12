@@ -26,6 +26,7 @@ struct Import {
   module: str
   field: str
   type_idx: int
+  name: str
 }
 
 struct Fixup {
@@ -124,7 +125,7 @@ export fn (m: *Module) func_type(params: []int, results: []int) -> int {
 # ---- functions ----
 export fn (m: *Module) import_func(module: str, field: str, name: str, type_idx: int) {
   if len(m.funcs) > 0 { panic("wasm: imports must come before the functions") }
-  m.imports = append(m.imports, &Import{module: module, field: field, type_idx: type_idx})
+  m.imports = append(m.imports, &Import{module: module, field: field, type_idx: type_idx, name: name})
   m.by_name[name] = &Func{name: name, index: len(m.imports) - 1, type_idx: type_idx, defined: true}
 }
 # the function called name (created on first use; its body comes later with define)
@@ -356,5 +357,23 @@ export fn (m: *Module) finish() -> *bytes.Buffer {
   uleb(b, m.data.len())
   b.append(m.data)
   section(out, 11, b)
+
+  # the "name" custom section: function names, for stack traces, profilers and disassemblers
+  fnames := bytes.new_buffer(1 << 16)
+  uleb(fnames, len(m.imports) + len(m.funcs))
+  for i, im := range m.imports {
+    uleb(fnames, i)
+    name_bytes(fnames, im.name)
+  }
+  for _, f := range m.funcs {
+    uleb(fnames, f.index)
+    name_bytes(fnames, f.name)
+  }
+  b = bytes.new_buffer(fnames.len() + 16)
+  name_bytes(b, "name")
+  b.byte(1)
+  uleb(b, fnames.len())
+  b.append(fnames)
+  section(out, 0, b)
   return out
 }
