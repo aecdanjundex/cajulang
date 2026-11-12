@@ -2,8 +2,10 @@
 #
 #   build_main [-o out] [--target linux|windows] file.caju
 #
-# The standard library comes from $CAJU_LIB (default /home/aecio/caju/lib) and the runtime
-# sources from $CAJU_RT (default /home/aecio/caju/rt).
+# The standard library comes from $CAJU_LIB (default $CAJU_ROOT/lib) and the runtime sources
+# from $CAJU_RT (default $CAJU_ROOT/rt; $CAJU_ROOT defaults to the current directory). The
+# release chain starts here: the JavaScript compiler builds this driver, which needs nothing it
+# lacks, and the driver builds the whole compiler (tools/release.sh).
 
 import "std/os"
 import "std/strings"
@@ -83,8 +85,10 @@ if out == "" {
   out = strings.trim_suffix(base_name(entry), ".caju")
   if target == "windows" { out += ".exe" }
 }
+root_dir := os.getenv("CAJU_ROOT")
+if root_dir == "" { root_dir = os.getwd() }
 lib_dir := os.getenv("CAJU_LIB")
-if lib_dir == "" { lib_dir = "/home/aecio/caju/lib" }
+if lib_dir == "" { lib_dir = root_dir + "/lib" }
 rt_dir := os.getenv("CAJU_RT")
-if rt_dir == "" { rt_dir = "/home/aecio/caju/rt" }
+if rt_dir == "" { rt_dir = root_dir + "/rt" }
 build(entry, out, target, lib_dir, rt_dir)

@@ -58,7 +58,8 @@ build/, dist/        generated (do not commit)
 ## How to work
 
 ```sh
-node bootstrap/caju.js build -o build/caju compiler/main.caju   # stage 1 (compiled by the JS)
+node bootstrap/caju.js build -o build/s0 compiler/build_main.caju   # stage 0: the JS builds the small driver
+CAJU_ROOT=$PWD build/s0 -o build/caju compiler/main.caju        # stage 1 (the JS can't build main.caju: std/json intrinsics)
 build/caju build -o build/caju2 compiler/main.caju              # stage 2 (compiled by itself)
 build/caju2 build -o build/caju3 compiler/main.caju && cmp build/caju2 build/caju3   # must be equal
 
@@ -84,7 +85,7 @@ programs from phases 6 and 7, and 3 known bugs in `tests/lang`: a variable read 
 assigned gives garbage; a dynamic method call on `any` neither converts an untyped argument nor
 checks the argument count).
 
-**The JS compiler is only stage 0.** Since the optimizations (bench/compare/OPTIMIZATION.md), the
+**The JS compiler is only stage 0**, and only for `compiler/build_main.caju` (tools/release.sh). Since the optimizations (bench/compare/OPTIMIZATION.md), the
 Caju compiler generates better code than the JS one; the JS only compiles the first stage and
 uses a frozen copy of the runtime (`bootstrap/rt/`). Correctness is guaranteed by the suite and by
 self-compilation (stage 2 == stage 3). `tools/compare-compilers.sh` remains as history.

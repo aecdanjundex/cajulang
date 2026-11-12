@@ -4,7 +4,8 @@
 #   dist/caju-linux-x86_64.tar.gz.sha256
 #
 #   tools/release.sh              the compiler comes from the bootstrap chain (needs Node 22+):
-#                                 JS -> stage 1 -> stage 2 -> stage 3, and stage 2 must equal stage 3
+#                                 JS -> stage 0 (build_main, only `build`) -> stage 1 -> 2 -> 3,
+#                                 and stage 2 must equal stage 3
 #   CAJU=build/caju tools/release.sh   package an existing compiler (skips the chain)
 #   TAG=v0.1.0 tools/release.sh   also checks that the tag matches the compiler's version
 set -euo pipefail
@@ -17,8 +18,12 @@ rm -rf "$work" && mkdir -p "$work" "$out"
 if [ -n "${CAJU:-}" ]; then
   cp "$CAJU" "$work/caju"
 else
-  echo "== stage 1 (JavaScript)"
-  node bootstrap/caju.js build -o "$work/s1" compiler/main.caju
+  # the JavaScript compiler lacks what the whole compiler uses now (std/json's reflection
+  # intrinsics), so it builds the small driver first, and the driver builds the compiler
+  echo "== stage 0 (JavaScript builds build_main)"
+  node bootstrap/caju.js build -o "$work/s0" compiler/build_main.caju
+  echo "== stage 1"
+  "$work/s0" -o "$work/s1" compiler/main.caju
   echo "== stage 2"
   "$work/s1" build -o "$work/s2" compiler/main.caju
   echo "== stage 3"
