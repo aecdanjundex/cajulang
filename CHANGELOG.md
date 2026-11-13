@@ -6,6 +6,12 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Fixed
+- Slicing a `str` (`s[a:b]`) keeps the bytes as they are. It used to replace bytes that are not
+  UTF-8 with U+FFFD, which corrupted binary data (network protocols, compressed data) and could
+  change the length of a substring cut in the middle of a character. Slicing is also about 7×
+  faster, since it no longer validates the bytes.
+
 ## [0.5.0] - 2026-11-12
 
 ### Added

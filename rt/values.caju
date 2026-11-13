@@ -340,12 +340,15 @@ fn rt_sub_array(where: str, a: int, n: int, lo: int, hi: int, es: int) -> int {
   if lo < 0 or hi < lo or hi > n { rt_slice_fail(where, lo, hi, n, n, false) }
   return rt_hdr(a + es * lo, hi - lo, n - lo)
 }
+# s[lo:hi] of a string: the bytes as they are (a str is bytes, as s[i] and len(s) are; binary data,
+# such as a network protocol's, must come out unchanged)
 fn rt_sub_str(where: str, s: str, lo: int, hi: int) -> str {
   p := __strp(s)
   n := __load64(p)
   if hi == -1 { hi = n }
   if lo < 0 or hi < lo or hi > n { rt_slice_fail(where, lo, hi, n, n, false) }
-  return rt_utf8_fix(p + 8 + lo, hi - lo)
+  if lo == 0 and hi == n { return s }
+  return rt_mkstr(p + 8 + lo, hi - lo)
 }
 
 # ---------------------------------------------------------------- UTF-8

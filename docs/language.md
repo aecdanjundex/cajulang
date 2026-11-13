@@ -75,7 +75,7 @@ Types are optional in declarations: without an annotation, the compiler infers t
 | `uint` `uint8` `uint16` `uint32` `uint64` | Unsigned integers |
 | `num` | 64-bit floating-point number. Accepts `int` values |
 | `float32` | 32-bit floating point |
-| `str` | UTF-8 text. `s[i]` is a `uint8` and `len(s)` counts bytes |
+| `str` | UTF-8 text. `s[i]` is a `uint8`, `s[a:b]` the bytes from `a` to `b` (as they are, even if not UTF-8) and `len(s)` counts bytes |
 | `bool` | `true` or `false` |
 | `any` | Any value. Use a type assertion or type switch to recover the type |
 | `error` | Interface with the method `Error() -> str` |
