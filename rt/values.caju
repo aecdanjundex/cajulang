@@ -352,64 +352,6 @@ fn rt_sub_str(where: str, s: str, lo: int, hi: int) -> str {
 }
 
 # ---------------------------------------------------------------- UTF-8
-# bytes → string, replacing invalid sequences with U+FFFD (like TextDecoder)
-fn rt_utf8_fix(p: int, n: int) -> str {
-  out := rt_alloc_ns(3 * n + 8)
-  o := 0
-  i := 0
-  while i < n {
-    b := __load8(p + i)
-    if b < 128 {
-      __store8(out + o, b)
-      o++
-      i++
-      continue
-    }
-    need := 0
-    lo := 128
-    hi := 191
-    if b >= 194 and b <= 223 { need = 1 }
-    if b >= 224 and b <= 239 { need = 2 }
-    if b >= 240 and b <= 244 { need = 3 }
-    if b == 224 { lo = 160 }
-    if b == 237 { hi = 159 }
-    if b == 240 { lo = 144 }
-    if b == 244 { hi = 143 }
-    if need == 0 {
-      o = rt_put_fffd(out, o)
-      i++
-      continue
-    }
-    j := 1
-    good := true
-    while j <= need {
-      if i + j >= n {
-        good = false
-        break
-      }
-      c := __load8(p + i + j)
-      if j == 1 {
-        if c < lo or c > hi {
-          good = false
-          break
-        }
-      } else if c < 128 or c > 191 {
-        good = false
-        break
-      }
-      j++
-    }
-    if good {
-      rt_copy(out + o, p + i, need + 1)
-      o = o + need + 1
-      i = i + need + 1
-    } else {
-      o = rt_put_fffd(out, o)
-      i = i + j
-    }
-  }
-  return rt_mkstr(out, o)
-}
 fn rt_put_fffd(out: int, o: int) -> int {
   __store8(out + o, 239)
   __store8(out + o + 1, 191)
@@ -486,16 +428,17 @@ fn rt_str_runes(s: str) -> int {
   }
   return rt_hdr(data, k, k)
 }
+# string(bytes): the bytes as they are, like s[a:b] (a str is bytes; binary data must round-trip)
 fn rt_bytes_str(s: int) -> str {
   n := rt_slen(s)
   d := rt_sdata(s)
-  tmp := rt_alloc_ns(n + 8)
+  p := rt_newstr(n)
   i := 0
   while i < n {
-    __store8(tmp + i, __load64(d + 8 * i) & 255)
+    __store8(p + 8 + i, __load64(d + 8 * i) & 255)
     i++
   }
-  return rt_utf8_fix(tmp, n)
+  return __pstr(p)
 }
 fn rt_runes_str(s: int) -> str {
   n := rt_slen(s)

@@ -11,6 +11,8 @@ notes from the section of its version here (`tools/changelog.sh`).
   UTF-8 with U+FFFD, which corrupted binary data (network protocols, compressed data) and could
   change the length of a substring cut in the middle of a character. Slicing is also about 7×
   faster, since it no longer validates the bytes.
+- `string([]byte)` keeps the bytes as they are too, instead of replacing the ones that are not
+  UTF-8 with U+FFFD: binary data converted to bytes and back comes out unchanged.
 
 ## [0.5.0] - 2026-11-12
 

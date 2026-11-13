@@ -51,6 +51,12 @@ describe("texts", fn() {
     expect([]byte("café"[3:4])).to_equal([]int{0xc3})
     expect(s[0:len(s)] == s).to_be_true()
   })
+  it("string([]byte) keeps the exact bytes, even when they are not UTF-8", fn() {
+    s := string([]byte{0x41, 0x80, 0xff, 0x00, 0xc3})
+    expect(len(s)).to_equal(5)
+    expect([]byte(s)).to_equal([]int{0x41, 0x80, 0xff, 0x00, 0xc3})
+    expect(string([]byte("café"))).to_equal("café")
+  })
   it("rune literals and string(rune)", fn() {
     r := 'é'
     expect(r).to_equal(233)
