@@ -1,6 +1,6 @@
 # Caju
 
-A Go-inspired programming language that compiles straight to x86-64 machine code (Linux and
+A simple, statically typed programming language that compiles straight to x86-64 machine code (Linux and
 Windows) and to WebAssembly. The compiler and the runtime are written in Caju itself, and the
 compiler compiles itself, to WebAssembly too: that is what runs in the
 [playground](https://cajulang.vercel.app/en/playground), inside the browser.

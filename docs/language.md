@@ -6,7 +6,7 @@ How Caju works: syntax, types, statements, functions, errors and modules. The ex
 
 ## Overview
 
-Caju is a compiled, statically typed programming language with type inference, inspired by Go. The compiler generates x86-64 machine code: ELF executables for Linux and PE for Windows. It also generates WebAssembly modules, which run in Node and in the browser. The compiler and runtime are written in Caju itself.
+Caju is a compiled, statically typed programming language with type inference. The compiler generates x86-64 machine code: ELF executables for Linux and PE for Windows. It also generates WebAssembly modules, which run in Node and in the browser. The compiler and runtime are written in Caju itself.
 
 The language comes with everything you need to work: a compiler, a test runner (`caju test`) and a package manager (`caju pkg`), all in a single `caju` command.
 

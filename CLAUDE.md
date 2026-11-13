@@ -1,6 +1,6 @@
 # Caju: instructions for Claude Code
 
-Caju is a Go-inspired programming language with a native compiler for x86-64 (ELF on Linux, PE on
+Caju is a simple, statically typed programming language with a native compiler for x86-64 (ELF on Linux, PE on
 Windows) and a runtime written in Caju itself. **The compiler is already written in Caju and
 compiles itself**: stages 1, 2 and 3 come out byte-for-byte identical. The JavaScript compiler
 (`bootstrap/`) remains only as a reference and to build the first stage.
