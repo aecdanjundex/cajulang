@@ -76,7 +76,7 @@ notes from the section of its version here (`tools/changelog.sh`).
 - Faster maps with text keys (index up to 3/4 full, 8-byte text hashing and equality), `std/json`
   (flat structs by leaf functions, one-pass checks, reused tables) and `std/http` routing (no
   hashing). The benchmarks were measured again (`bench/compare/RESULTS.md`).
-- The repository moved to github.com/aecdanjundex/cajulang.
+- The repository moved to github.com/cajulang/cajulang.
 
 ### Fixed
 - `lib/http_test.caju` waits for the test server by time (20 s) instead of by a number of tries.
@@ -114,9 +114,9 @@ notes from the section of its version here (`tools/changelog.sh`).
 - Benchmark against Go, Rust and Python (`bench/compare`).
 - Release package, installer (`install.sh`) and GitHub workflows. MIT license.
 
-[Unreleased]: https://github.com/aecdanjundex/cajulang/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/aecdanjundex/cajulang/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/aecdanjundex/cajulang/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/aecdanjundex/cajulang/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/aecdanjundex/cajulang/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/aecdanjundex/cajulang/releases/tag/v0.1.0
+[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cajulang/cajulang/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/cajulang/cajulang/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/cajulang/cajulang/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/cajulang/cajulang/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/cajulang/cajulang/releases/tag/v0.1.0

@@ -51,8 +51,8 @@ fn round_trip(v: *toml.Value) -> bool {
 }
 
 let docs: []str = []str{
-  "# manifest\n[package]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndescription = \"JSON for Caju\"\nauthors = [\"Aecio\"]\nlicense = \"MIT\"\nentry = \"json.caju\"\n\n[dependencies]\n\"github.com/aecdanjundex/strutil\" = \"0.3.1\"\n",
-  "version = 1\n[[package]]\nname = \"github.com/aecdanjundex/strutil\"\nversion = \"0.3.1\"\ncommit = \"0123abcd\"\nhash = \"sha256-abc\"\ndependencies = []\n\n[[package]]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndependencies = [\"github.com/aecdanjundex/strutil\"]\n",
+  "# manifest\n[package]\nname = \"github.com/cajulang/json\"\nversion = \"1.2.0\"\ndescription = \"JSON for Caju\"\nauthors = [\"Aecio\"]\nlicense = \"MIT\"\nentry = \"json.caju\"\n\n[dependencies]\n\"github.com/cajulang/strutil\" = \"0.3.1\"\n",
+  "version = 1\n[[package]]\nname = \"github.com/cajulang/strutil\"\nversion = \"0.3.1\"\ncommit = \"0123abcd\"\nhash = \"sha256-abc\"\ndependencies = []\n\n[[package]]\nname = \"github.com/cajulang/json\"\nversion = \"1.2.0\"\ndependencies = [\"github.com/cajulang/strutil\"]\n",
   "bare_key-1 = 1\n\"quoted key\" = 2\n'literal.key' = 3\na.b.c = 4\na . b . d = 5\n\"\" = 6\nsite.\"google.com\" = true\n",
   "s1 = \"tab\\there \\\"q\\\" back\\\\slash \\u00e9 \\U0001F600 \\b\\f\"\ns2 = 'C:\\Users\\nodejs'\ns3 = \"\"\"\nroses\nare \"red\"\"\"\"\ns4 = \"\"\"\\\n    The quick \\\n    brown fox.\"\"\"\ns5 = '''\nfirst line\n  'quoted' line'''\ns6 = \"\"\"two quotes at the end\"\"\"\"\"\ns7 = \"olá 世界\"\n",
   "i1 = +99\ni2 = -17\ni3 = 0\ni4 = 1_000_000\nh = 0xDEAD_beef\no = 0o755\nb = 0b1101\nmax = 9223372036854775807\nmin = -9223372036854775808\nf1 = 3.1415\nf2 = -0.01\nf3 = 5e+22\nf4 = 1e06\nf5 = -2E-2\nf6 = 6.626e-34\nf7 = 224_617.445_991\nf8 = inf\nf9 = -inf\nf10 = nan\nf11 = -0.0\nf12 = 0.1\n",
@@ -66,12 +66,12 @@ describe("toml.parse", fn() {
   it("reads a caju.toml manifest", fn() {
     doc, err := toml.parse(docs[0])
     expect(err).to_be_nil()
-    expect(dump(doc)).to_equal("{\"package\": {\"name\": \"github.com/aecdanjundex/json\", \"version\": \"1.2.0\", \"description\": \"JSON for Caju\", \"authors\": [\"Aecio\"], \"license\": \"MIT\", \"entry\": \"json.caju\"}, \"dependencies\": {\"github.com/aecdanjundex/strutil\": \"0.3.1\"}}")
+    expect(dump(doc)).to_equal("{\"package\": {\"name\": \"github.com/cajulang/json\", \"version\": \"1.2.0\", \"description\": \"JSON for Caju\", \"authors\": [\"Aecio\"], \"license\": \"MIT\", \"entry\": \"json.caju\"}, \"dependencies\": {\"github.com/cajulang/strutil\": \"0.3.1\"}}")
   })
   it("reads a caju.lock with arrays of tables", fn() {
     doc, err := toml.parse(docs[1])
     expect(err).to_be_nil()
-    expect(dump(doc)).to_equal("{\"version\": i:1, \"package\": [{\"name\": \"github.com/aecdanjundex/strutil\", \"version\": \"0.3.1\", \"commit\": \"0123abcd\", \"hash\": \"sha256-abc\", \"dependencies\": []}, {\"name\": \"github.com/aecdanjundex/json\", \"version\": \"1.2.0\", \"dependencies\": [\"github.com/aecdanjundex/strutil\"]}]}")
+    expect(dump(doc)).to_equal("{\"version\": i:1, \"package\": [{\"name\": \"github.com/cajulang/strutil\", \"version\": \"0.3.1\", \"commit\": \"0123abcd\", \"hash\": \"sha256-abc\", \"dependencies\": []}, {\"name\": \"github.com/cajulang/json\", \"version\": \"1.2.0\", \"dependencies\": [\"github.com/cajulang/strutil\"]}]}")
   })
   it("reads bare, quoted, literal and dotted keys", fn() {
     doc, err := toml.parse(docs[2])
@@ -113,11 +113,11 @@ describe("toml.parse", fn() {
 describe("toml.encode", fn() {
   it("writes a manifest back in the same shape", fn() {
     doc, _ := toml.parse(docs[0])
-    expect(toml.encode(doc)).to_equal("[package]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndescription = \"JSON for Caju\"\nauthors = [\"Aecio\"]\nlicense = \"MIT\"\nentry = \"json.caju\"\n\n[dependencies]\n\"github.com/aecdanjundex/strutil\" = \"0.3.1\"\n")
+    expect(toml.encode(doc)).to_equal("[package]\nname = \"github.com/cajulang/json\"\nversion = \"1.2.0\"\ndescription = \"JSON for Caju\"\nauthors = [\"Aecio\"]\nlicense = \"MIT\"\nentry = \"json.caju\"\n\n[dependencies]\n\"github.com/cajulang/strutil\" = \"0.3.1\"\n")
   })
   it("writes arrays of tables as [[name]]", fn() {
     doc, _ := toml.parse(docs[1])
-    expect(toml.encode(doc)).to_equal("version = 1\n\n[[package]]\nname = \"github.com/aecdanjundex/strutil\"\nversion = \"0.3.1\"\ncommit = \"0123abcd\"\nhash = \"sha256-abc\"\ndependencies = []\n\n[[package]]\nname = \"github.com/aecdanjundex/json\"\nversion = \"1.2.0\"\ndependencies = [\"github.com/aecdanjundex/strutil\"]\n")
+    expect(toml.encode(doc)).to_equal("version = 1\n\n[[package]]\nname = \"github.com/cajulang/strutil\"\nversion = \"0.3.1\"\ncommit = \"0123abcd\"\nhash = \"sha256-abc\"\ndependencies = []\n\n[[package]]\nname = \"github.com/cajulang/json\"\nversion = \"1.2.0\"\ndependencies = [\"github.com/cajulang/strutil\"]\n")
   })
   it("writes plain values before subtables", fn() {
     doc, _ := toml.parse(docs[6])
@@ -144,7 +144,7 @@ describe("toml.encode", fn() {
 describe("reading values", fn() {
   it("gets a text by its dotted path, with a default", fn() {
     m, _ := toml.parse(docs[0])
-    expect(m.get_str("package.name", "?")).to_equal("github.com/aecdanjundex/json")
+    expect(m.get_str("package.name", "?")).to_equal("github.com/cajulang/json")
     expect(m.get_str("package.nothing", "default")).to_equal("default")
   })
   it("returns the default when the value has another type", fn() {
@@ -155,7 +155,7 @@ describe("reading values", fn() {
   it("gets lists of texts and the keys of a table", fn() {
     m, _ := toml.parse(docs[0])
     expect(m.get_strs("package.authors")).to_equal([]str{"Aecio"})
-    expect(m.table_keys("dependencies")).to_equal([]str{"github.com/aecdanjundex/strutil"})
+    expect(m.table_keys("dependencies")).to_equal([]str{"github.com/cajulang/strutil"})
     expect(m.table_keys("package.name")).to_equal([]str{})
   })
   it("returns nil for a path that does not exist, and the value itself for an empty path", fn() {
@@ -166,7 +166,7 @@ describe("reading values", fn() {
   })
   it("reaches keys that contain dots with field", fn() {
     m, _ := toml.parse(docs[0])
-    expect(m.field("dependencies").field("github.com/aecdanjundex/strutil").s).to_equal("0.3.1")
+    expect(m.field("dependencies").field("github.com/cajulang/strutil").s).to_equal("0.3.1")
   })
   it("reads an integer as a float with get_float", fn() {
     n, _ := toml.parse("a = 2\nb = 2.5\nc = true\n")

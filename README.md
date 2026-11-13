@@ -18,13 +18,13 @@ print(greet("world"))
 Linux x86-64 (on Windows, use WSL; the Linux `caju` can also build `.exe` files with `--target windows`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/aecdanjundex/cajulang/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh
 ```
 
 The installer downloads the latest release, checks its SHA-256, installs it in `~/.caju` and creates
 the `~/.local/bin/caju` command. Variables: `CAJU_VERSION=0.1.0` (a specific version), `CAJU_HOME`,
 `CAJU_BIN_DIR`. To install by hand, download `caju-linux-x86_64.tar.gz` from
-[Releases](https://github.com/aecdanjundex/cajulang/releases), extract it and put `caju-<version>/bin`
+[Releases](https://github.com/cajulang/cajulang/releases), extract it and put `caju-<version>/bin`
 on your `PATH`. To uninstall: `rm -rf ~/.caju ~/.local/bin/caju`.
 
 ```sh
@@ -78,10 +78,10 @@ and generated help, `docs/cli.md`), `testing`.
 - `std/http`: an HTTP/1.1 server with keep-alive and an event loop (epoll); several processes on the
   same port with `http.listen_and_serve_workers(host, port, n)`.
 
-For REST APIs there is a Gin-style framework, [`github.com/aecdanjundex/web`](https://github.com/aecdanjundex/web):
+For REST APIs there is a Gin-style framework, [`github.com/cajulang/web`](https://github.com/cajulang/web):
 
 ```sh
-caju pkg add github.com/aecdanjundex/web
+caju pkg add github.com/cajulang/web
 ```
 
 ## Performance

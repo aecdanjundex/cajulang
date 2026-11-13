@@ -997,7 +997,7 @@ export fn register(app: *cli.Command) {
 
   c_add := p.sub("add", "Add a dependency and install it")
   c_add.arg("package", "github.com/owner/repo, optionally @version (default: the latest release)")
-  c_add.example("caju pkg add github.com/aecdanjundex/web", "the latest release")
+  c_add.example("caju pkg add github.com/cajulang/web", "the latest release")
   c_add.example("caju pkg add github.com/acme/greet@0.2.0", "a given version")
   c_add.action(fn(m: *cli.Match) {
     out, err := add(project_root(), m.arg("package"))

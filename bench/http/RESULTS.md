@@ -1,6 +1,6 @@
 # HTTP server: Caju × Go
 
-The same API in all three versions: `caju/main.caju` (framework github.com/aecdanjundex/web; copy
+The same API in all three versions: `caju/main.caju` (framework github.com/cajulang/web; copy
 the package's `web.caju` next to `main.caju`), `gin/` (Gin) and `nethttp/` (standard library only).
 Routes: `GET /users/:id` (small map as JSON), `GET /users` (list of 50 structs), `POST /users`
 (reads JSON into a struct and returns it). Load from `hey -n 20000 -c 50` (with and without
